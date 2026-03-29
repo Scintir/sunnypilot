@@ -302,6 +302,22 @@
     "title": "Experimental Mode Confirmed",
     "description": ""
   },
+  "EvPowerLimitKw": {
+    "title": "EV Power Limit",
+    "description": "Maximum EV motor power limit used by the EV Power Limiter.",
+    "min": 10,
+    "max": 67,
+    "step": 1,
+    "unit": "kW"
+  },
+  "EvPowerLimiter": {
+    "title": "EV Power Limiter",
+    "description": "Limit EV motor power output to improve regenerative braking and energy efficiency."
+  },
+  "EvPowerLimiterDebug": {
+    "title": "EV Power Limiter Debug",
+    "description": "Enable debug logging for the EV Power Limiter."
+  },
   "FirmwareQueryDone": {
     "title": "Firmware Query Done",
     "description": ""
@@ -395,6 +411,10 @@
   "InstallDate": {
     "title": "Install Date",
     "description": ""
+  },
+  "ImprovedStoppedApproach": {
+    "title": "Improved Stopped Approach",
+    "description": "Enable improved longitudinal behavior when approaching a stopped vehicle or stop line."
   },
   "IntelligentCruiseButtonManagement": {
     "title": "Intelligent Cruise Button Management",

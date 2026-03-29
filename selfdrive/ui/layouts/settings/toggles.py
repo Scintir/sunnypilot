@@ -12,6 +12,7 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 if gui_app.sunnypilot_ui():
   from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp as toggle_item
   from openpilot.system.ui.sunnypilot.widgets.list_view import multiple_button_item_sp as multiple_button_item
+  from openpilot.system.ui.sunnypilot.widgets.list_view import option_item_sp
 
 PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
 
@@ -35,6 +36,9 @@ DESCRIPTIONS = {
   'RecordFront': tr_noop("Upload data from the driver facing camera and help improve the driver monitoring algorithm."),
   "IsMetric": tr_noop("Display speed in km/h instead of mph."),
   "RecordAudio": tr_noop("Record and store microphone audio while driving. The audio will be included in the dashcam video in comma connect."),
+  "ImprovedStoppedApproach": tr_noop("Enable improved longitudinal behavior when approaching a stopped vehicle or stop line."),
+  "EvPowerLimiter": tr_noop("Limit EV motor power output to improve regenerative braking and energy efficiency."),
+  "EvPowerLimiterDebug": tr_noop("Enable debug logging for the EV Power Limiter."),
 }
 
 
@@ -94,6 +98,24 @@ class TogglesLayout(Widget):
         "metric.png",
         False,
       ),
+      "ImprovedStoppedApproach": (
+        lambda: tr("Improved Stopped Approach"),
+        DESCRIPTIONS["ImprovedStoppedApproach"],
+        "speed_limit.png",
+        False,
+      ),
+      "EvPowerLimiter": (
+        lambda: tr("EV Power Limiter"),
+        DESCRIPTIONS["EvPowerLimiter"],
+        "speed_limit.png",
+        False,
+      ),
+      "EvPowerLimiterDebug": (
+        lambda: tr("EV Power Limiter Debug"),
+        DESCRIPTIONS["EvPowerLimiterDebug"],
+        "speed_limit.png",
+        False,
+      ),
     }
 
     self._long_personality_setting = multiple_button_item(
@@ -105,6 +127,14 @@ class TogglesLayout(Widget):
       selected_index=self._params.get("LongitudinalPersonality", return_default=True),
       icon="speed_limit.png"
     )
+
+    self._ev_power_limit_option = None
+    if gui_app.sunnypilot_ui():
+      self._ev_power_limit_option = option_item_sp(
+        title=lambda: tr("EV Power Limit (kW)"),
+        param="EvPowerLimitKw",
+        min_value=10, max_value=67, value_change_step=1,
+        inline=True)
 
     self._toggles = {}
     self._locked_toggles = set()
@@ -139,8 +169,17 @@ class TogglesLayout(Widget):
       if param == "DisengageOnAccelerator":
         self._toggles["LongitudinalPersonality"] = self._long_personality_setting
 
+      # insert EV power limit kW option after EvPowerLimiter toggle
+      if param == "EvPowerLimiter" and self._ev_power_limit_option is not None:
+        self._toggles["EvPowerLimitKw"] = self._ev_power_limit_option
+
     self._update_experimental_mode_icon()
     self._scroller = Scroller(list(self._toggles.values()), line_separator=True, spacing=0)
+
+    ev_enabled = self._params.get_bool("EvPowerLimiter")
+    self._toggles["EvPowerLimiterDebug"].set_visible(ev_enabled)
+    if self._ev_power_limit_option is not None:
+      self._ev_power_limit_option.set_visible(ev_enabled)
 
     ui_state.add_engaged_transition_callback(self._update_toggles)
 
@@ -204,6 +243,11 @@ class TogglesLayout(Widget):
     for param in self._toggle_defs:
       self._toggles[param].action_item.set_state(self._params.get_bool(param))
 
+    ev_enabled = self._params.get_bool("EvPowerLimiter")
+    self._toggles["EvPowerLimiterDebug"].set_visible(ev_enabled)
+    if self._ev_power_limit_option is not None:
+      self._ev_power_limit_option.set_visible(ev_enabled)
+
     # these toggles need restart, block while engaged
     for toggle_def in self._toggle_defs:
       if self._toggle_defs[toggle_def][3] and toggle_def not in self._locked_toggles:
@@ -244,6 +288,11 @@ class TogglesLayout(Widget):
     self._params.put_bool(param, state)
     if self._toggle_defs[param][3]:
       self._params.put_bool("OnroadCycleRequested", True)
+
+    if param == "EvPowerLimiter":
+      self._toggles["EvPowerLimiterDebug"].set_visible(state)
+      if self._ev_power_limit_option is not None:
+        self._ev_power_limit_option.set_visible(state)
 
   def _set_longitudinal_personality(self, button_index: int):
     self._params.put("LongitudinalPersonality", button_index)

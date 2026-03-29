@@ -9,7 +9,8 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
+from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc_sp import LongitudinalMpcSP as LongitudinalMpc
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalPlanSource
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
@@ -133,6 +134,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # Get new v_cruise and a_desired from Smart Cruise Control and Speed Limit Assist
     v_cruise, self.a_desired = LongitudinalPlannerSP.update_targets(self, sm, self.v_desired_filter.x, self.a_desired, v_cruise)
 
+    # EV Power Limiter: clamp upper accel to keep power demand within EV-only range
+    if self.ev_power_limiter.is_enabled:
+      accel_clip[1] = min(accel_clip[1], self.ev_power_limiter.max_accel)
+
     if force_slow_decel:
       v_cruise = 0.0
 
@@ -173,6 +178,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       accel_clip[idx] = np.clip(accel_clip[idx], self.prev_accel_clip[idx] - 0.05, self.prev_accel_clip[idx] + 0.05)
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
     self.prev_accel_clip = accel_clip
+
+    self.ev_power_limiter.debug.log_planner_output(
+      float(self.output_a_target), self.source, accel_clip[0], accel_clip[1],
+      self.output_should_stop, sm['radarState'].leadOne.status)
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')
