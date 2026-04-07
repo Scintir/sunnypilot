@@ -220,6 +220,10 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"EVPowerLimitKW", {PERSISTENT | BACKUP, INT, "35"}},
     {"EVPowerLimitLogging", {PERSISTENT | BACKUP, BOOL, "0"}},
 
+    // Stopped Vehicle Approach params
+    {"StoppedVehicleApproachEnabled", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"StoppedVehicleApproachLogging", {PERSISTENT | BACKUP, BOOL, "0"}},
+
     // sunnypilot car specific params
     {"HyundaiLongitudinalTuning", {PERSISTENT | BACKUP, INT, "0"}},
     {"SubaruStopAndGo", {PERSISTENT | BACKUP, BOOL, "0"}},

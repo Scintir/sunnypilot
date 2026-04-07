@@ -55,6 +55,11 @@ class TogglesLayoutMici(NavScroller):
     self._ev_kw_btn = EVPowerLimitKWButton()
     self._ev_power_limit_logging = BigParamControl("EV power limit logging", "EVPowerLimitLogging")
 
+    # Stopped Vehicle Approach
+    self._sva_toggle = BigParamControl("stopped vehicle approach", "StoppedVehicleApproachEnabled",
+                                        toggle_callback=self._on_sva_toggle)
+    self._sva_logging = BigParamControl("SVA logging", "StoppedVehicleApproachLogging")
+
     self._scroller.add_widgets([
       self._personality_toggle,
       self._experimental_btn,
@@ -67,6 +72,8 @@ class TogglesLayoutMici(NavScroller):
       self._ev_power_limit_toggle,
       self._ev_kw_btn,
       self._ev_power_limit_logging,
+      self._sva_toggle,
+      self._sva_logging,
     ])
 
     # Toggle lists
@@ -103,6 +110,9 @@ class TogglesLayoutMici(NavScroller):
     self._ev_kw_btn.set_visible(checked)
     self._ev_power_limit_logging.set_visible(checked)
 
+  def _on_sva_toggle(self, checked):
+    self._sva_logging.set_visible(checked)
+
   def show_event(self):
     super().show_event()
     self._update_toggles()
@@ -132,3 +142,8 @@ class TogglesLayoutMici(NavScroller):
     self._ev_kw_btn.set_visible(ev_enabled)
     self._ev_power_limit_logging.set_visible(ev_enabled)
     self._ev_kw_btn._load_value()
+
+    # Sync SVA visibility
+    sva_enabled = ui_state.params.get_bool("StoppedVehicleApproachEnabled")
+    self._sva_toggle.set_checked(sva_enabled)
+    self._sva_logging.set_visible(sva_enabled)

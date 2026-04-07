@@ -305,6 +305,14 @@
     "title": "EV Power Limit Logging",
     "description": "Enable detailed logging of EV power limiter activity to /data/logs/"
   },
+  "StoppedVehicleApproachEnabled": {
+    "title": "Stopped Vehicle Approach",
+    "description": "More aggressive braking when approaching stopped vehicles. Prioritizes safe stopping distance over ride comfort."
+  },
+  "StoppedVehicleApproachLogging": {
+    "title": "Stopped Vehicle Approach Logging",
+    "description": "Enable detailed logging of stopped vehicle approach events to /data/logs/"
+  },
   "EnforceTorqueControl": {
     "title": "Enforce Torque Control",
     "description": "Enable this to enforce sunnypilot to steer with Torque lateral control."

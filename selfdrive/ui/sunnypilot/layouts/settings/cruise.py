@@ -98,6 +98,19 @@ class CruiseLayout(Widget):
       description=tr("Log power limiter activity to /data/logs/ for diagnostics."),
       param="EVPowerLimitLogging")
 
+    # Stopped Vehicle Approach
+    self.sva_toggle = toggle_item_sp(
+      title=tr("Stopped Vehicle Approach"),
+      description=tr("More aggressive braking when approaching stopped vehicles. "
+                     "Prioritizes safe 5ft stopping distance over ride comfort."),
+      param="StoppedVehicleApproachEnabled",
+      callback=self._on_sva_toggle)
+
+    self.sva_logging = toggle_item_sp(
+      title=tr("SVA Logging"),
+      description=tr("Log stopped vehicle approach events to /data/logs/ for diagnostics."),
+      param="StoppedVehicleApproachLogging")
+
     self.sla_settings_button = simple_button_item_sp(
       button_text=lambda: tr("Speed Limit"),
       button_width=800,
@@ -120,6 +133,8 @@ class CruiseLayout(Widget):
       self.ev_power_limit_toggle,
       self.ev_power_limit_kw,
       self.ev_power_limit_logging,
+      self.sva_toggle,
+      self.sva_logging,
       self.sla_settings_button,
     ]
     return items
@@ -136,6 +151,7 @@ class CruiseLayout(Widget):
     self.icbm_toggle.show_description(True)
     self.custom_acc_toggle.show_description(True)
     self._on_ev_power_limit_toggle(Params().get_bool("EVPowerLimitEnabled"))
+    self._on_sva_toggle(Params().get_bool("StoppedVehicleApproachEnabled"))
 
   def _set_current_panel(self, panel: PanelType):
     self._current_panel = panel
@@ -217,6 +233,11 @@ class CruiseLayout(Widget):
     self.ev_power_limit_toggle.action_item.set_state(ev_enabled)
     self._on_ev_power_limit_toggle(ev_enabled)
 
+    # Keep SVA sub-items in sync
+    sva_enabled = ui_state.params.get_bool("StoppedVehicleApproachEnabled")
+    self.sva_toggle.action_item.set_state(sva_enabled)
+    self._on_sva_toggle(sva_enabled)
+
   def _on_custom_acc_toggle(self, state):
     self.custom_acc_short_increment.set_visible(state)
     self.custom_acc_long_increment.set_visible(state)
@@ -228,6 +249,10 @@ class CruiseLayout(Widget):
     self.ev_power_limit_logging.set_visible(state)
     self.ev_power_limit_kw.action_item.set_enabled(state)
     self.ev_power_limit_logging.action_item.set_enabled(state)
+
+  def _on_sva_toggle(self, state):
+    self.sva_logging.set_visible(state)
+    self.sva_logging.action_item.set_enabled(state)
 
   def _on_ev_kw_changed(self, value):
     # Cycle back to 20 kW when exceeding 55 kW (user pressed + at 55)

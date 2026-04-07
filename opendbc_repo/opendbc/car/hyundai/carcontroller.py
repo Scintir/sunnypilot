@@ -68,7 +68,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     self.car_fingerprint = CP.carFingerprint
     self.last_button_frame = 0
 
-    # EV Power Limiter param reading (throttled to avoid filesystem overhead)
+    # Feature param reading (throttled to avoid filesystem overhead)
     self._ev_params = Params()
     self._ev_param_read_counter = 0
     self._ev_param_read_interval = 100  # read every 100 frames = 1 second at 100Hz

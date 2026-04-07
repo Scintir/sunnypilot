@@ -200,6 +200,19 @@ class SunnylinkLayout(Widget):
       description=tr("Log power limiter activity to /data/logs/ for diagnostics."),
       param="EVPowerLimitLogging")
 
+    # Stopped Vehicle Approach
+    self._sva_toggle = toggle_item_sp(
+      title=tr("Stopped Vehicle Approach"),
+      description=tr("More aggressive braking when approaching stopped vehicles. "
+                     "Synced with Cruise settings."),
+      param="StoppedVehicleApproachEnabled",
+      callback=self._on_sva_toggle
+    )
+    self._sva_logging = toggle_item_sp(
+      title=tr("SVA Logging"),
+      description=tr("Log stopped vehicle approach events to /data/logs/ for diagnostics."),
+      param="StoppedVehicleApproachLogging")
+
     self._sunnylink_backup_restore_buttons = dual_button_item(
       description="",
       left_text=tr("Backup Settings"),
@@ -227,6 +240,9 @@ class SunnylinkLayout(Widget):
       self._ev_power_limit_toggle,
       self._ev_power_limit_kw,
       self._ev_power_limit_logging,
+      LineSeparator(),
+      self._sva_toggle,
+      self._sva_logging,
       LineSeparator(),
       self._sunnylink_backup_restore_buttons
     ]
@@ -335,6 +351,11 @@ class SunnylinkLayout(Widget):
     self._ev_power_limit_kw.action_item.set_enabled(sub_enabled)
     self._ev_power_limit_logging.action_item.set_enabled(sub_enabled)
 
+  def _on_sva_toggle(self, state: bool):
+    self._sva_logging.set_visible(state)
+    sub_enabled = state and self._sunnylink_enabled
+    self._sva_logging.action_item.set_enabled(sub_enabled)
+
   def _on_ev_kw_changed(self, value):
     # Cycle back to 20 kW when exceeding 55 kW
     if value > 55:
@@ -381,6 +402,10 @@ class SunnylinkLayout(Widget):
     ev_enabled = ui_state.params.get_bool("EVPowerLimitEnabled")
     self._ev_power_limit_toggle.action_item.set_state(ev_enabled)
     self._on_ev_power_limit_toggle(ev_enabled)
+    # SVA: sync state from shared param
+    sva_enabled = ui_state.params.get_bool("StoppedVehicleApproachEnabled")
+    self._sva_toggle.action_item.set_state(sva_enabled)
+    self._on_sva_toggle(sva_enabled)
     self.handle_backup_restore_progress()
 
     sponsor_btn_text = tr("THANKS ♥") if ui_state.sunnylink_state.is_sponsor() else tr("SPONSOR")
