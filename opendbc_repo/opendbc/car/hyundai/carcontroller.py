@@ -84,7 +84,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       self._ev_param_read_counter = 0
       try:
         ev_enabled = self._ev_params.get_bool("EVPowerLimitEnabled")
-        ev_kw = max(20, min(int(self._ev_params.get("EVPowerLimitKW") or "35"), 55))
+        ev_kw = max(20, min(self._ev_params.get("EVPowerLimitKW", return_default=True), 55))
         ev_logging = self._ev_params.get_bool("EVPowerLimitLogging")
         self.ev_power_limiter.update_params(ev_enabled, ev_kw, ev_logging)
       except (ValueError, TypeError):
