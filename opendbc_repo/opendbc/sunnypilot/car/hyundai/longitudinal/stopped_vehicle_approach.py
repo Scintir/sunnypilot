@@ -419,10 +419,9 @@ class StoppedVehicleApproach:
 
     if self.state == SVAState.FINAL_STOP:
       if v_ego < 0.1:
-        # Vehicle at standstill: hold brakes to resist PHEV creep torque.
-        # The ESC/ABS handles actual brake application - this command keeps
-        # the system actively holding rather than releasing.
-        return -0.5
+        # Vehicle at standstill: neutral command, force_should_stop keeps
+        # long control in STOPPING state which handles brake hold.
+        return 0.0
       else:
         # Still moving: firm decel to come to a complete stop
         return max(FINAL_STOP_DECEL, self.a_required)
