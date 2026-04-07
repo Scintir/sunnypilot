@@ -12,6 +12,7 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 if gui_app.sunnypilot_ui():
   from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp as toggle_item
   from openpilot.system.ui.sunnypilot.widgets.list_view import multiple_button_item_sp as multiple_button_item
+  from openpilot.system.ui.sunnypilot.widgets.list_view import option_item_sp
 
 PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
 
@@ -139,6 +140,40 @@ class TogglesLayout(Widget):
       if param == "DisengageOnAccelerator":
         self._toggles["LongitudinalPersonality"] = self._long_personality_setting
 
+    # EV Power Limit toggles
+    self._ev_power_limit_toggle = toggle_item(
+      lambda: tr("EV Power Limit"),
+      tr("Limit positive longitudinal power to keep the vehicle in EV mode. "
+         "The vehicle may slow down on grades to stay within the power limit."),
+      self._params.get_bool("EVPowerLimitEnabled"),
+      callback=self._on_ev_power_limit_toggle,
+      icon="speed_limit.png",
+    )
+    self._toggles["EVPowerLimitEnabled"] = self._ev_power_limit_toggle
+
+    if gui_app.sunnypilot_ui():
+      self._ev_power_limit_kw = option_item_sp(
+        title=tr("Power Limit (kW)"),
+        param="EVPowerLimitKW",
+        min_value=20, max_value=60, value_change_step=5,
+        label_callback=lambda v: f"{v} kW",
+        on_value_changed=self._on_ev_kw_changed,
+        inline=True)
+      self._toggles["EVPowerLimitKW"] = self._ev_power_limit_kw
+
+    self._ev_power_limit_logging = toggle_item(
+      lambda: tr("EV Power Limit Logging"),
+      tr("Log power limiter activity to /data/logs/ for diagnostics."),
+      self._params.get_bool("EVPowerLimitLogging"),
+      callback=lambda state: self._params.put_bool("EVPowerLimitLogging", state),
+      icon="speed_limit.png",
+    )
+    self._toggles["EVPowerLimitLogging"] = self._ev_power_limit_logging
+
+    # Initialize visibility of EV sub-items
+    ev_enabled = self._params.get_bool("EVPowerLimitEnabled")
+    self._set_ev_sub_visibility(ev_enabled)
+
     self._update_experimental_mode_icon()
     self._scroller = Scroller(list(self._toggles.values()), line_separator=True, spacing=0)
 
@@ -204,6 +239,11 @@ class TogglesLayout(Widget):
     for param in self._toggle_defs:
       self._toggles[param].action_item.set_state(self._params.get_bool(param))
 
+    # Sync EV power limit toggle state (may be changed from SunnyLink)
+    ev_enabled = self._params.get_bool("EVPowerLimitEnabled")
+    self._ev_power_limit_toggle.action_item.set_state(ev_enabled)
+    self._set_ev_sub_visibility(ev_enabled)
+
     # these toggles need restart, block while engaged
     for toggle_def in self._toggle_defs:
       if self._toggle_defs[toggle_def][3] and toggle_def not in self._locked_toggles:
@@ -247,3 +287,19 @@ class TogglesLayout(Widget):
 
   def _set_longitudinal_personality(self, button_index: int):
     self._params.put("LongitudinalPersonality", button_index)
+
+  def _on_ev_power_limit_toggle(self, state: bool):
+    self._params.put_bool("EVPowerLimitEnabled", state)
+    self._set_ev_sub_visibility(state)
+
+  def _set_ev_sub_visibility(self, state: bool):
+    if gui_app.sunnypilot_ui() and hasattr(self, '_ev_power_limit_kw'):
+      self._ev_power_limit_kw.set_visible(state)
+      self._ev_power_limit_kw.action_item.set_enabled(state)
+    if hasattr(self, '_ev_power_limit_logging'):
+      self._ev_power_limit_logging.set_visible(state)
+      self._ev_power_limit_logging.action_item.set_enabled(state)
+
+  def _on_ev_kw_changed(self, value):
+    if value > 55:
+      self._ev_power_limit_kw.action_item.set_value(20)
