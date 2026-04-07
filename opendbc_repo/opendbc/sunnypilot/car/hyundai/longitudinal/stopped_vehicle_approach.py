@@ -52,7 +52,12 @@ CONFIDENCE_HARD = 0.75           # enter HARD_APPROACH above this
 CONFIDENCE_EXIT_HARD = 0.55      # drop from HARD to SOFT below this
 
 # --- Stopping distance ---
-MIN_STOP_GAP = 1.9               # m - planner target gap (yields ~1.5m/5ft real-world)
+# dRel is measured from camera (mesh frame), NOT bumper-to-bumper.
+# Real-world bumper gap ≈ dRel - DREL_TO_BUMPER_OFFSET
+# Offset accounts for: ego front-bumper-to-camera (~1.8m) + lead rear-bumper-to-reflector (~1.0m)
+DREL_TO_BUMPER_OFFSET = 2.8      # m - empirically calibrated from drive logs vs actual gap
+MIN_STOP_GAP_BUMPER = 1.5        # m - desired bumper-to-bumper gap (5 ft)
+MIN_STOP_GAP = MIN_STOP_GAP_BUMPER + DREL_TO_BUMPER_OFFSET  # 4.3m in dRel coordinates
 SYSTEM_DELAY = 0.55              # s - total perception + planner + actuator delay
 DELAY_SAFETY_FACTOR = 1.15       # multiply delay distance by this for margin
 
@@ -68,9 +73,10 @@ EMERGENCY_DECEL = -3.8           # m/s^2 - absolute max (brief)
 ACCEL_MIN_HW = -3.5              # m/s^2 - hardware limit for Hyundai SCC
 
 # --- Final stop approach ---
-FINAL_STOP_SPEED = 1.5          # m/s - enter FINAL_STOP below this speed
-FINAL_STOP_DIST = 5.0           # m - enter FINAL_STOP when lead within this distance
-FINAL_STOP_DECEL = -1.5         # m/s^2 - gentle final braking to avoid harsh stop
+FINAL_STOP_SPEED = 3.0          # m/s - enter FINAL_STOP below this speed (~7mph)
+FINAL_STOP_DIST = 8.0           # m - enter FINAL_STOP when lead within this (dRel coordinates)
+FINAL_STOP_DECEL = -2.0         # m/s^2 - firm final braking to prevent creep
+CREEP_HOLD_DECEL = -0.5         # m/s^2 - sustained hold after stop to resist PHEV creep torque
 
 # --- Rate limiting (per planner cycle, ~50ms/20Hz) ---
 SOFT_ACCEL_RATE = 0.15           # m/s^2 per cycle - 3.0 m/s^2/s ramp rate
@@ -364,13 +370,16 @@ class StoppedVehicleApproach:
         self.state = SVAState.MONITORING
 
     elif self.state == SVAState.HARD_APPROACH:
-      if v_ego < FINAL_STOP_SPEED and self.lead_d < FINAL_STOP_DIST:
+      if v_ego < FINAL_STOP_SPEED and self.lead_d < FINAL_STOP_DIST + 2.0:
         self.state = SVAState.FINAL_STOP
       elif self.confidence < CONFIDENCE_EXIT_HARD and self.a_required > -1.5:
         self.state = SVAState.SOFT_APPROACH
 
     elif self.state == SVAState.FINAL_STOP:
-      if v_ego > FINAL_STOP_SPEED + 0.5:  # hysteresis
+      # Only exit FINAL_STOP if lead moves away or ego accelerates significantly
+      # (e.g., driver resumes or lead departs). Generous hysteresis prevents
+      # bouncing back to HARD_APPROACH from minor creep.
+      if v_ego > FINAL_STOP_SPEED + 2.0 or self.lead_d > FINAL_STOP_DIST + 5.0:
         self.state = SVAState.HARD_APPROACH
 
   def _reset_tracking(self) -> None:
@@ -389,8 +398,12 @@ class StoppedVehicleApproach:
       return 0.0  # No override
 
     if self.state == SVAState.FINAL_STOP:
-      # Gentle final stop - avoid harsh dip
-      return max(FINAL_STOP_DECEL, self.a_required)
+      if v_ego < 0.3:
+        # Vehicle nearly stopped: hold brakes to resist PHEV creep torque
+        return CREEP_HOLD_DECEL
+      else:
+        # Still moving: firm decel to come to a complete stop
+        return max(FINAL_STOP_DECEL, self.a_required)
 
     if self.state == SVAState.SOFT_APPROACH:
       # Speed-dependent soft deceleration limit
@@ -509,11 +522,13 @@ class StoppedVehicleApproach:
       a_target = min(mpc_a_target, a_sva)
       self.a_target = a_target
 
-      # Force should_stop when in final stop and very close
+      # Force should_stop to keep long control in STOPPING state.
+      # This prevents the MPC from releasing brakes and allowing creep.
+      # Active whenever SVA is in FINAL_STOP, regardless of exact speed/distance.
       self.force_should_stop = (
         self.state == SVAState.FINAL_STOP and
-        v_ego < FINAL_STOP_SPEED and
-        self.lead_d < FINAL_STOP_DIST
+        self.lead_status and
+        self.lead_d < FINAL_STOP_DIST + 3.0  # generous margin in dRel coordinates
       )
       should_stop = mpc_should_stop or self.force_should_stop
     else:
@@ -604,6 +619,7 @@ class StoppedVehicleApproach:
       # Lead data
       "lead": self.lead_status,
       "d_rel": round(self.lead_d, 2),
+      "gap_ft": round(max(self.lead_d - DREL_TO_BUMPER_OFFSET, 0) * 3.28084, 1),
       "v_lead": round(self.lead_v, 3),
       "y_rel": round(self.lead_y, 3),
       "a_lead": round(self.lead_a, 3),
