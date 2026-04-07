@@ -138,10 +138,18 @@ class StoppedVehicleApproach:
     """Update feature parameters from UI toggles."""
     prev_enabled = self.enabled
     self.enabled = enabled
-    self.logging_enabled = logging_enabled
 
-    if not self.logging_enabled and self._log_file is not None:
-      self._close_log()
+    # Debounce logging toggle: only close log after sustained disable
+    # to avoid filesystem read glitches creating empty files every second
+    if logging_enabled:
+      self.logging_enabled = True
+      self._logging_off_count = 0
+    else:
+      self._logging_off_count = getattr(self, '_logging_off_count', 0) + 1
+      if self._logging_off_count >= 5:  # 5 consecutive reads = 5 seconds off
+        if self.logging_enabled and self._log_file is not None:
+          self._close_log()
+        self.logging_enabled = False
 
     # Reset state when feature is toggled off
     if prev_enabled and not enabled:
@@ -573,15 +581,19 @@ class StoppedVehicleApproach:
     if self._log_cycle_counter % cycles_per_log != 0:
       return
 
+    # Open log file once per session (not per entry)
     if self._log_file is None:
       self._open_log()
     if self._log_file is None:
       return
 
+    # Rotate after max entries, but reuse handle until then
     self._log_counter += 1
     if self._log_counter > LOG_BUFFER_SIZE:
       self._close_log()
       self._open_log()
+      if self._log_file is None:
+        return
 
     entry = {
       "t": round(time.monotonic() - self._session_start, 4),
