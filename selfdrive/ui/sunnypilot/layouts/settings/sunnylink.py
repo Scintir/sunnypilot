@@ -12,7 +12,7 @@ from openpilot.sunnypilot.sunnylink.api import UNREGISTERED_SUNNYLINK_DONGLE_ID
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.widgets.list_view import button_item_sp
-from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp
+from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp, option_item_sp
 from openpilot.system.ui.sunnypilot.widgets.sunnylink_pairing_dialog import SunnylinkPairingDialog
 from openpilot.system.ui.widgets import Widget, DialogResult
 from openpilot.system.ui.widgets.button import ButtonStyle, Button
@@ -180,6 +180,26 @@ class SunnylinkLayout(Widget):
                   tr("(Only for highest tiers, and does NOT bring ANY benefit to you yet. We are just testing data volume.)"),
       param="EnableSunnylinkUploader"
     )
+    # EV Power Limit (synced with Cruise settings)
+    self._ev_power_limit_toggle = toggle_item_sp(
+      title=tr("EV Power Limit"),
+      description=tr("Limit positive longitudinal power to keep the vehicle in EV mode. "
+                     "Synced with Cruise settings."),
+      param="EVPowerLimitEnabled",
+      callback=self._on_ev_power_limit_toggle
+    )
+    self._ev_power_limit_kw = option_item_sp(
+      title=tr("Power Limit (kW)"),
+      param="EVPowerLimitKW",
+      min_value=20, max_value=60, value_change_step=5,
+      label_callback=lambda v: f"{v} kW",
+      on_value_changed=self._on_ev_kw_changed,
+      inline=True)
+    self._ev_power_limit_logging = toggle_item_sp(
+      title=tr("EV Power Limit Logging"),
+      description=tr("Log power limiter activity to /data/logs/ for diagnostics."),
+      param="EVPowerLimitLogging")
+
     self._sunnylink_backup_restore_buttons = dual_button_item(
       description="",
       left_text=tr("Backup Settings"),
@@ -203,6 +223,10 @@ class SunnylinkLayout(Widget):
       self._pair_btn,
       LineSeparator(),
       self._sunnylink_uploader_toggle,
+      LineSeparator(),
+      self._ev_power_limit_toggle,
+      self._ev_power_limit_kw,
+      self._ev_power_limit_logging,
       LineSeparator(),
       self._sunnylink_backup_restore_buttons
     ]
@@ -303,6 +327,19 @@ class SunnylinkLayout(Widget):
       self._restore_btn.set_enabled(can_enable)
       self._restore_btn.set_text(tr("Restore Settings"))
 
+  def _on_ev_power_limit_toggle(self, state: bool):
+    self._ev_power_limit_kw.set_visible(state)
+    self._ev_power_limit_logging.set_visible(state)
+    # Sub-items gated on both EV toggle AND SunnyLink master; main toggle always accessible
+    sub_enabled = state and self._sunnylink_enabled
+    self._ev_power_limit_kw.action_item.set_enabled(sub_enabled)
+    self._ev_power_limit_logging.action_item.set_enabled(sub_enabled)
+
+  def _on_ev_kw_changed(self, value):
+    # Cycle back to 20 kW when exceeding 55 kW
+    if value > 55:
+      self._ev_power_limit_kw.action_item.set_value(20)
+
   def _sunnylink_toggle_callback(self, state: bool):
     sl_consent: bool = ui_state.params.get("CompletedSunnylinkConsentVersion") == sunnylink_consent_version
     sl_enabled: bool = ui_state.params.get_bool("SunnylinkEnabled")
@@ -340,6 +377,10 @@ class SunnylinkLayout(Widget):
     self._sunnylink_toggle.action_item.set_enabled(not ui_state.is_onroad())
     self._sunnylink_toggle.action_item.set_state(self._sunnylink_enabled)
     self._sunnylink_uploader_toggle.action_item.set_enabled(self._sunnylink_enabled)
+    # EV power limit: main toggle always interactive, sync state from shared param
+    ev_enabled = ui_state.params.get_bool("EVPowerLimitEnabled")
+    self._ev_power_limit_toggle.action_item.set_state(ev_enabled)
+    self._on_ev_power_limit_toggle(ev_enabled)
     self.handle_backup_restore_progress()
 
     sponsor_btn_text = tr("THANKS ♥") if ui_state.sunnylink_state.is_sponsor() else tr("SPONSOR")

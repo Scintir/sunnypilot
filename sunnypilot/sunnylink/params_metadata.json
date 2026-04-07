@@ -290,6 +290,21 @@
     "title": "Enable sunnylink Uploader",
     "description": ""
   },
+  "EVPowerLimitEnabled": {
+    "title": "EV Power Limit",
+    "description": "Limit positive longitudinal power to keep the vehicle in EV mode"
+  },
+  "EVPowerLimitKW": {
+    "title": "EV Power Limit (kW)",
+    "description": "Maximum positive propulsion power allowed before limiting acceleration",
+    "min": 20,
+    "max": 60,
+    "step": 5
+  },
+  "EVPowerLimitLogging": {
+    "title": "EV Power Limit Logging",
+    "description": "Enable detailed logging of EV power limiter activity to /data/logs/"
+  },
   "EnforceTorqueControl": {
     "title": "Enforce Torque Control",
     "description": "Enable this to enforce sunnypilot to steer with Torque lateral control."

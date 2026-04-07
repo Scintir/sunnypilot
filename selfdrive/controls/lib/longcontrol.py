@@ -60,10 +60,11 @@ class LongControl:
   def reset(self):
     self.pid.reset()
 
-  def update(self, active, CS, a_target, should_stop, accel_limits):
+  def update(self, active, CS, a_target, should_stop, accel_limits, ev_power_saturated=False):
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
+    self._ev_power_saturated = ev_power_saturated
 
     self.long_control_state = long_control_state_trans(self.CP, self.CP_SP, active, self.long_control_state, CS.vEgo,
                                                        should_stop, CS.brakePressed,
@@ -85,8 +86,12 @@ class LongControl:
 
     else:  # LongCtrlState.pid
       error = a_target - CS.aEgo
+      # Freeze positive integrator when downstream EV power limiter is saturating
+      # to prevent windup against a limit the PID can't overcome
+      freeze_integrator = self._ev_power_saturated and error > 0
       output_accel = self.pid.update(error, speed=CS.vEgo,
-                                     feedforward=a_target)
+                                     feedforward=a_target,
+                                     freeze_integrator=freeze_integrator)
 
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel

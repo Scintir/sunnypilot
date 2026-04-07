@@ -9,6 +9,7 @@ from enum import IntEnum
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.cruise_sub_layouts.speed_limit_settings import SpeedLimitSettingsLayout
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.multilang import tr, tr_noop
+from openpilot.common.params import Params
 from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp, option_item_sp, simple_button_item_sp
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.scroller_tici import Scroller
@@ -76,6 +77,27 @@ class CruiseLayout(Widget):
       min_value=1, max_value=3, value_change_step=1,
       inline=True)
 
+    # EV Power Limit
+    self.ev_power_limit_toggle = toggle_item_sp(
+      title=tr("EV Power Limit"),
+      description=tr("Limit positive longitudinal power to keep the vehicle in EV mode. "
+                     "The vehicle may slow down on grades to stay within the power limit."),
+      param="EVPowerLimitEnabled",
+      callback=self._on_ev_power_limit_toggle)
+
+    self.ev_power_limit_kw = option_item_sp(
+      title=tr("Power Limit (kW)"),
+      param="EVPowerLimitKW",
+      min_value=20, max_value=60, value_change_step=5,
+      label_callback=lambda v: f"{v} kW",
+      on_value_changed=self._on_ev_kw_changed,
+      inline=True)
+
+    self.ev_power_limit_logging = toggle_item_sp(
+      title=tr("EV Power Limit Logging"),
+      description=tr("Log power limiter activity to /data/logs/ for diagnostics."),
+      param="EVPowerLimitLogging")
+
     self.sla_settings_button = simple_button_item_sp(
       button_text=lambda: tr("Speed Limit"),
       button_width=800,
@@ -95,6 +117,9 @@ class CruiseLayout(Widget):
       self.custom_acc_toggle,
       self.custom_acc_short_increment,
       self.custom_acc_long_increment,
+      self.ev_power_limit_toggle,
+      self.ev_power_limit_kw,
+      self.ev_power_limit_logging,
       self.sla_settings_button,
     ]
     return items
@@ -110,6 +135,7 @@ class CruiseLayout(Widget):
     self._scroller.show_event()
     self.icbm_toggle.show_description(True)
     self.custom_acc_toggle.show_description(True)
+    self._on_ev_power_limit_toggle(Params().get_bool("EVPowerLimitEnabled"))
 
   def _set_current_panel(self, panel: PanelType):
     self._current_panel = panel
@@ -186,8 +212,24 @@ class CruiseLayout(Widget):
 
     self._on_custom_acc_toggle(self.custom_acc_toggle.action_item.get_state())
 
+    # Keep EV power limit sub-items in sync with the toggle state
+    ev_enabled = ui_state.params.get_bool("EVPowerLimitEnabled")
+    self.ev_power_limit_toggle.action_item.set_state(ev_enabled)
+    self._on_ev_power_limit_toggle(ev_enabled)
+
   def _on_custom_acc_toggle(self, state):
     self.custom_acc_short_increment.set_visible(state)
     self.custom_acc_long_increment.set_visible(state)
     self.custom_acc_short_increment.action_item.set_enabled(self.custom_acc_toggle.action_item.enabled)
     self.custom_acc_long_increment.action_item.set_enabled(self.custom_acc_toggle.action_item.enabled)
+
+  def _on_ev_power_limit_toggle(self, state):
+    self.ev_power_limit_kw.set_visible(state)
+    self.ev_power_limit_logging.set_visible(state)
+    self.ev_power_limit_kw.action_item.set_enabled(state)
+    self.ev_power_limit_logging.action_item.set_enabled(state)
+
+  def _on_ev_kw_changed(self, value):
+    # Cycle back to 20 kW when exceeding 55 kW (user pressed + at 55)
+    if value > 55:
+      self.ev_power_limit_kw.action_item.set_value(20)
