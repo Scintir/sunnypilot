@@ -21,7 +21,7 @@ class EVPowerLimitKWButton(BigButton):
     kw = self._params.get("EVPowerLimitKW", return_default=True)
     if kw not in self.KW_VALUES:
       kw = 35
-    self.set_subtitle(f"{kw} kW")
+    self.set_value(f"{kw} kW")
 
   def _handle_mouse_release(self, mouse_pos):
     super()._handle_mouse_release(mouse_pos)
@@ -31,7 +31,7 @@ class EVPowerLimitKWButton(BigButton):
     idx = self.KW_VALUES.index(kw)
     next_kw = self.KW_VALUES[(idx + 1) % len(self.KW_VALUES)]
     self._params.put("EVPowerLimitKW", next_kw)
-    self.set_subtitle(f"{next_kw} kW")
+    self.set_value(f"{next_kw} kW")
 
 PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
 
