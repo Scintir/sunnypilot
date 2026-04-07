@@ -68,6 +68,15 @@ SOFT_DECEL_V  = [-1.2, -1.5, -2.0, -2.3]      # m/s^2 max decel in soft mode
 HARD_DECEL_BP = [0., 3., 8., 15., 22., 35.]    # m/s ego speed breakpoints
 HARD_DECEL_V  = [-1.2, -1.8, -2.8, -3.1, -3.4, -3.4]  # m/s^2 max decel in hard mode
 
+# --- Progressive braking profile (margin-based) ---
+# Instead of using minimum-required physics decel (which feels like coasting),
+# use a progressive profile that increases decel as distance margin shrinks.
+# This provides a consistent, confidence-building braking feel.
+# margin = distance to stop point using comfort decel; negative = need harder braking
+# np.interp requires increasing x, so BP is low→high (tight→comfortable)
+MARGIN_DECEL_BP = [-5., 0., 3., 8., 15., 25., 40.]    # meters of margin (ascending)
+MARGIN_DECEL_V  = [-3.5, -3.2, -2.8, -2.3, -1.8, -1.2, -0.8]  # m/s^2 (aggressive→gentle)
+
 # Emergency fallback if physics requires more than hard profile
 EMERGENCY_DECEL = -3.8           # m/s^2 - absolute max (brief)
 ACCEL_MIN_HW = -3.5              # m/s^2 - hardware limit for Hyundai SCC
@@ -75,8 +84,7 @@ ACCEL_MIN_HW = -3.5              # m/s^2 - hardware limit for Hyundai SCC
 # --- Final stop approach ---
 FINAL_STOP_SPEED = 3.0          # m/s - enter FINAL_STOP below this speed (~7mph)
 FINAL_STOP_DIST = 8.0           # m - enter FINAL_STOP when lead within this (dRel coordinates)
-FINAL_STOP_DECEL = -2.0         # m/s^2 - firm final braking to prevent creep
-CREEP_HOLD_DECEL = -0.5         # m/s^2 - sustained hold after stop to resist PHEV creep torque
+FINAL_STOP_DECEL = -2.0         # m/s^2 - firm final braking to stop
 
 # --- Rate limiting (per planner cycle, ~50ms/20Hz) ---
 SOFT_ACCEL_RATE = 0.15           # m/s^2 per cycle - 3.0 m/s^2/s ramp rate
@@ -118,6 +126,7 @@ class StoppedVehicleApproach:
     self.a_target = 0.0                # SVA acceleration target output
     self.a_required = 0.0              # physics-required deceleration
     self.a_sva_last = 0.0              # previous SVA output (for rate limiting)
+    self.a_decel_floor = 0.0           # monotonic floor: decel never eases during approach
     self.d_margin = 0.0                # distance margin to stop point
     self.ttc = 999.0                   # time to collision
 
@@ -172,6 +181,7 @@ class StoppedVehicleApproach:
     self.a_target = 0.0
     self.a_required = 0.0
     self.a_sva_last = 0.0
+    self.a_decel_floor = 0.0
     self.d_margin = 0.0
     self.ttc = 999.0
     self.active = False
@@ -392,15 +402,27 @@ class StoppedVehicleApproach:
   # --- Acceleration Target Computation ---
 
   def _compute_sva_accel(self, v_ego: float) -> float:
-    """Compute the SVA acceleration target based on current state."""
+    """Compute the SVA acceleration target based on current state.
+
+    Uses a progressive margin-based profile for HARD_APPROACH that provides
+    steadily increasing deceleration as distance margin shrinks. This avoids
+    the "coast then brake hard" pattern where only minimum-required physics
+    decel is used (which feels like coasting at mid-range distances).
+
+    The key insight: commanding MORE decel than physics requires early on
+    builds driver confidence by providing a clear "I'm stopping" signal
+    throughout the entire approach.
+    """
 
     if self.state == SVAState.INACTIVE or self.state == SVAState.MONITORING:
       return 0.0  # No override
 
     if self.state == SVAState.FINAL_STOP:
-      if v_ego < 0.3:
-        # Vehicle nearly stopped: hold brakes to resist PHEV creep torque
-        return CREEP_HOLD_DECEL
+      if v_ego < 0.1:
+        # Vehicle at standstill: let long control STOPPING state handle brake hold.
+        # Don't command negative accel here - PHEV regen could cause backward roll.
+        # force_should_stop keeps the vehicle in STOPPING state which holds brakes.
+        return 0.0
       else:
         # Still moving: firm decel to come to a complete stop
         return max(FINAL_STOP_DECEL, self.a_required)
@@ -408,18 +430,35 @@ class StoppedVehicleApproach:
     if self.state == SVAState.SOFT_APPROACH:
       # Speed-dependent soft deceleration limit
       a_soft_limit = float(np.interp(v_ego, SOFT_DECEL_BP, SOFT_DECEL_V))
-      # Use required decel scaled by 0.85 (don't use full authority in soft mode)
-      a_target = max(self.a_required * 0.85, a_soft_limit)
+      # Physics-required with mild aggression factor (10% harder than minimum)
+      a_target = max(self.a_required * 1.1, a_soft_limit)
       return a_target
 
     if self.state == SVAState.HARD_APPROACH:
-      # Speed-dependent hard deceleration limit
+      # Speed-dependent hard deceleration limit (absolute cap)
       a_hard_limit = float(np.interp(v_ego, HARD_DECEL_BP, HARD_DECEL_V))
-      # Use full required decel, bounded by the speed-dependent limit
-      a_target = max(self.a_required, a_hard_limit)
-      # Allow emergency overshoot if physics really demands it
+
+      # Speed-dependent minimum approach decel floor.
+      # The MPC naturally eases braking at low speeds (-1.3 → -0.7 → -0.2)
+      # which feels like "coasting then late braking." This floor stays just
+      # above MPC's natural profile to maintain perceptible braking without
+      # causing large overshoot. The floor is ~0.1-0.2 above what MPC commands
+      # at each speed, enough to feel the difference but not enough to stop
+      # dramatically early.
+      min_approach_decel = float(np.interp(v_ego,
+        [1., 3., 6., 10., 15., 25.],         # m/s
+        [-1.5, -1.5, -1.5, -1.45, -1.4, -1.3]))  # m/s^2
+
+      # Use physics-required OR speed-dependent floor, whichever is more aggressive.
+      a_target = min(self.a_required, min_approach_decel)
+
+      # Bound by speed-dependent hardware limit
+      a_target = max(a_target, a_hard_limit)
+
+      # Emergency overshoot if TTC is critical
       if self.a_required < a_hard_limit and self.ttc < 2.0:
         a_target = max(self.a_required, ACCEL_MIN_HW)
+
       return a_target
 
     return 0.0
