@@ -422,6 +422,11 @@ class StoppedVehicleApproach:
         # Vehicle at standstill: neutral command, force_should_stop keeps
         # long control in STOPPING state which handles brake hold.
         return 0.0
+      elif v_ego < 1.0:
+        # Last ~2 mph: taper braking to ease the rolling-to-stopped transition.
+        # Linearly blend from FINAL_STOP_DECEL at 1.0 m/s down to -0.3 at 0.1 m/s.
+        # Prevents the abrupt nose-dip-and-rebound rock at the moment of stop.
+        return float(np.interp(v_ego, [0.1, 1.0], [-0.3, FINAL_STOP_DECEL]))
       else:
         # Still moving: firm decel to come to a complete stop
         return max(FINAL_STOP_DECEL, self.a_required)
