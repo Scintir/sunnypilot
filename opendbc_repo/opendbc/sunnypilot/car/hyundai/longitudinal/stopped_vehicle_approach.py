@@ -419,10 +419,10 @@ class StoppedVehicleApproach:
 
     if self.state == SVAState.FINAL_STOP:
       if v_ego < 0.1:
-        # Vehicle at standstill: let long control STOPPING state handle brake hold.
-        # Don't command negative accel here - PHEV regen could cause backward roll.
-        # force_should_stop keeps the vehicle in STOPPING state which holds brakes.
-        return 0.0
+        # Vehicle at standstill: hold brakes to resist PHEV creep torque.
+        # The ESC/ABS handles actual brake application - this command keeps
+        # the system actively holding rather than releasing.
+        return -0.5
       else:
         # Still moving: firm decel to come to a complete stop
         return max(FINAL_STOP_DECEL, self.a_required)
