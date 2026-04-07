@@ -39,9 +39,11 @@ V_BLEND_LOW = 3.0            # speed below which low-speed cap dominates (m/s)
 V_BLEND_HIGH = 8.0           # speed above which power-based limit dominates (m/s)
 
 # --- Low-speed acceleration cap (prevents engine start from high torque at low RPM) ---
-# Calibrated conservatively; actual values should be tuned from ICE-start logs
+# Tuned from drive logs: old values (0.5 at standstill) were far too conservative,
+# causing sluggish take-off and large gap growth behind lead vehicles.
+# Power at these accels is well within budget: 1.0 m/s^2 @ 3 m/s = ~6 kW (vs 29+ kW budget)
 EV_LOWSPEED_ACCEL_BP = [0.0, 1.0, 2.0, 3.0, 5.0, 8.0]    # m/s
-EV_LOWSPEED_ACCEL_V  = [0.5, 0.5, 0.6, 0.7, 0.9, 2.0]    # m/s^2
+EV_LOWSPEED_ACCEL_V  = [1.3, 1.3, 1.4, 1.5, 1.6, 2.0]    # m/s^2
 
 # --- Filter time constants (controller runs at 20Hz) ---
 # Pitch: asymmetric - fast for increasing uphill (safety-conservative), slow for decreasing
