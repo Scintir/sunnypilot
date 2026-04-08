@@ -84,7 +84,7 @@ ACCEL_MIN_HW = -3.5              # m/s^2 - hardware limit for Hyundai SCC
 # --- Final stop approach ---
 FINAL_STOP_SPEED = 3.0          # m/s - enter FINAL_STOP below this speed (~7mph)
 FINAL_STOP_DIST = 8.0           # m - enter FINAL_STOP when lead within this (dRel coordinates)
-FINAL_STOP_DECEL = -2.0         # m/s^2 - firm final braking to stop
+FINAL_STOP_DECEL = -1.8         # m/s^2 - moderate final braking to stop
 
 # --- Rate limiting (per planner cycle, ~50ms/20Hz) ---
 SOFT_ACCEL_RATE = 0.15           # m/s^2 per cycle - 3.0 m/s^2/s ramp rate
@@ -426,14 +426,14 @@ class StoppedVehicleApproach:
         # Vehicle at standstill: neutral command, force_should_stop keeps
         # long control in STOPPING state which handles brake hold.
         return 0.0
-      elif v_ego < 1.0:
-        # Last ~2 mph: taper braking to ease the rolling-to-stopped transition.
-        # Linearly blend from FINAL_STOP_DECEL at 1.0 m/s down to -0.3 at 0.1 m/s.
-        # Prevents the abrupt nose-dip-and-rebound rock at the moment of stop.
-        return float(np.interp(v_ego, [0.1, 1.0], [-0.3, FINAL_STOP_DECEL]))
-      else:
-        # Still moving: firm decel to come to a complete stop
-        return max(FINAL_STOP_DECEL, self.a_required)
+      # Comfort braking profile shaped like a bathtub:
+      #   1. Firm entry (3.0 m/s): carry over braking authority from approach
+      #   2. Ease off (2.0→1.2 m/s): semi-linear reduction, signals "slowing nicely"
+      #   3. Re-commit (1.2→0.5 m/s): ramp back up to ensure committed stop
+      #   4. Final taper (0.5→0.1 m/s): gentle ease-off for smooth standstill
+      return float(np.interp(v_ego,
+        [0.1,  0.5,  1.2,  2.0,  3.0],       # m/s breakpoints
+        [-0.2, -1.0, -0.7, -1.2, FINAL_STOP_DECEL]))  # m/s^2 decel profile
 
     if self.state == SVAState.SOFT_APPROACH:
       # Speed-dependent soft deceleration limit
@@ -492,6 +492,11 @@ class StoppedVehicleApproach:
     if a_target < self.a_sva_last:
       # Braking ramp-in: use full rate
       a_limited = max(a_target, self.a_sva_last - max_change)
+    elif self.state == SVAState.FINAL_STOP:
+      # FINAL_STOP brake release: use full rate so the taper profile can
+      # actually take effect before the vehicle reaches standstill.
+      # The halved rate can't ease from -1.2 to -0.2 fast enough at <2.5 m/s.
+      a_limited = min(a_target, self.a_sva_last + max_change)
     else:
       # Brake release: slower rate (half speed)
       a_limited = min(a_target, self.a_sva_last + max_change * 0.5)
