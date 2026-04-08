@@ -347,7 +347,11 @@ class StoppedVehicleApproach:
           self.state = SVAState.FINAL_STOP
         # Stay in current state otherwise
       elif self.state == SVAState.FINAL_STOP:
-        pass  # stay
+        # Exit FINAL_STOP when lead is departing (moving away from stopped)
+        # This prevents holding force_should_stop after a stop-to-go event
+        if self.lead_v > STOPPED_V_THRESHOLD:
+          self.state = SVAState.INACTIVE
+          self._reset_tracking()
       else:
         self.state = SVAState.INACTIVE
       return

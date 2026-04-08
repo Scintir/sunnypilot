@@ -80,6 +80,18 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
   else:
     raise NotImplementedError("Longitudinal personality not supported")
 
+# Speed-dependent T_FOLLOW: responsive stop-to-go, comfortable at cruise
+T_FOLLOW_MIN = 1.0   # seconds, used near standstill for quick departure
+T_FOLLOW_BP = [0.0, 10.0]  # m/s breakpoints for interpolation
+
+def get_t_follow_array(t_follow, v_solution):
+  """Compute per-node T_FOLLOW based on planned velocity profile.
+
+  At low speeds, uses T_FOLLOW_MIN for responsive stop-to-go acceleration.
+  Ramps linearly to the full t_follow by 10 m/s (~22 mph).
+  """
+  return np.interp(v_solution, T_FOLLOW_BP, [T_FOLLOW_MIN, t_follow])
+
 def get_stopped_equivalence_factor(v_lead):
   return (v_lead**2) / (2 * COMFORT_BRAKE)
 
@@ -347,7 +359,9 @@ class LongitudinalMpc:
     self.params[:,1] = ACCEL_MAX
     self.params[:,2] = np.min(x_obstacles, axis=1)
     self.params[:,3] = np.copy(self.a_prev)
-    self.params[:,4] = t_follow
+    # Per-node T_FOLLOW: short at low speeds for responsive stop-to-go,
+    # ramping to full t_follow at cruise speed
+    self.params[:,4] = get_t_follow_array(t_follow, self.v_solution)
     self.params[:,5] = LEAD_DANGER_FACTOR
 
     self.run()
