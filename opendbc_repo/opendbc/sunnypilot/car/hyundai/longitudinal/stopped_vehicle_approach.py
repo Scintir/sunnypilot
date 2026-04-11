@@ -66,7 +66,9 @@ SOFT_DECEL_BP = [0., 10., 20., 30.]            # m/s ego speed breakpoints
 SOFT_DECEL_V  = [-1.2, -1.5, -2.0, -2.3]      # m/s^2 max decel in soft mode
 
 HARD_DECEL_BP = [0., 3., 8., 15., 22., 35.]    # m/s ego speed breakpoints
-HARD_DECEL_V  = [-1.2, -1.8, -2.8, -3.1, -3.4, -3.4]  # m/s^2 max decel in hard mode
+HARD_DECEL_V  = [-1.2, -1.8, -2.8, -3.2, -3.5, -3.5]  # m/s^2 max decel in hard mode
+                                                       # uses full -3.5 envelope at high speed
+                                                       # (Hyundai SCC hardware limit)
 
 # --- Progressive braking profile (margin-based) ---
 # Instead of using minimum-required physics decel (which feels like coasting),
@@ -90,6 +92,36 @@ FINAL_STOP_DECEL = -1.8         # m/s^2 - moderate final braking to stop
 SOFT_ACCEL_RATE = 0.15           # m/s^2 per cycle - 3.0 m/s^2/s ramp rate
 HARD_ACCEL_RATE = 0.25           # m/s^2 per cycle - 5.0 m/s^2/s ramp rate
 URGENT_TTC = 3.0                 # s - bypass rate limiting when TTC below this
+
+# --- Brake-response awareness (PHEV authority adaptation) ---
+# Drive logs show ~70% of commanded decel is achieved under sustained heavy
+# braking. We track achieved decel via v_ego derivative and detect when the
+# brake is underdelivering, so SOFT/HARD/FINAL_STOP transitions can compensate.
+BRAKE_GAP_LPF_TAU = 0.4          # s - low-pass filter on measured a_ego
+BRAKE_GAP_THRESHOLD = 0.6        # m/s^2 - gap that triggers compensation
+BRAKE_GAP_PERSIST_S = 0.2        # s - sustained gap before flagging
+BRAKE_GAP_MIN_VEGO = 3.0         # m/s - only evaluate above this speed
+BRAKE_GAP_MIN_CMD = -1.0         # m/s^2 - only evaluate when meaningfully braking
+HW_ACCEL_FLOOR = -3.5            # m/s^2 - matches CarControllerParams.ACCEL_MIN
+
+# --- SOFT_APPROACH escalation thresholds (item 2) ---
+# Speed-dependent SOFT->HARD escalation: at higher speeds require more severe
+# physics-required decel before escalating, giving SOFT more runway. Currently
+# the flat -2.2 m/s^2 threshold means high-speed approaches skip SOFT entirely.
+# Threshold values are kept moderate so SOFT phase is meaningful (~0.5-0.8s on
+# highway approaches) but doesn't burn safety margin — PHEV's 70% brake
+# authority means we have less stopping distance than commanded suggests.
+SOFT_HARD_THRESH_BP = [0., 5., 10., 15., 25.]      # m/s
+SOFT_HARD_THRESH_V  = [-1.5, -1.7, -2.1, -2.4, -2.7]  # m/s^2
+
+# Geometry guards: even at low confidence/threshold, force HARD when distance
+# is short or TTC is critical. This is the primary close-range collision
+# protection (open-loop, doesn't depend on the brake-gap estimator's lag).
+# Distance values account for PHEV brake authority (~2.45 m/s^2 achievable),
+# so they're larger than a vehicle with full -3.5 m/s^2 authority would need.
+SOFT_MIN_DIST_BP = [0., 5., 10., 15., 25.]         # m/s
+SOFT_MIN_DIST_V  = [10., 18., 32., 50., 90.]       # m - if lead_d below this, exit SOFT
+SOFT_MAX_TTC = 2.4                                  # s - if TTC below this, exit SOFT
 
 # --- Logging ---
 LOG_DIR = "/data/logs/stopped_vehicle_approach"
@@ -142,6 +174,12 @@ class StoppedVehicleApproach:
     self.active = False                # True when SVA is overriding MPC target
     self.force_should_stop = False     # True when SVA wants to force stopping state
 
+    # Brake-response awareness (item 1)
+    self.a_achieved_filt = 0.0         # low-pass filtered measured longitudinal accel
+    self.brake_authority_gap = 0.0     # current confirmed gap (commanded vs achieved)
+    self._v_ego_prev: float | None = None
+    self._gap_persist = 0.0            # seconds the raw gap has been above threshold
+
     # Logging
     self._log_file = None
     self._log_counter = 0
@@ -186,6 +224,10 @@ class StoppedVehicleApproach:
     self.ttc = 999.0
     self.active = False
     self.force_should_stop = False
+    self.a_achieved_filt = 0.0
+    self.brake_authority_gap = 0.0
+    self._v_ego_prev = None
+    self._gap_persist = 0.0
 
   # --- Confidence Scoring ---
 
@@ -374,17 +416,45 @@ class StoppedVehicleApproach:
         self.state = SVAState.INACTIVE
 
     elif self.state == SVAState.SOFT_APPROACH:
-      # Require minimum confidence even for urgency-based escalation
-      # This prevents off-path false positives from escalating to hard braking
-      if self.confidence >= CONFIDENCE_HARD:
+      # SOFT->HARD escalation is gated on GEOMETRY or PHYSICS only, not on
+      # confidence alone and not on brake-authority gap. The gap is a
+      # constant property of the PHEV (~30% authority deficit during sustained
+      # braking) so it cannot serve as a "something is wrong" signal — it
+      # would fire on every event and defeat the comfort phase. Instead the
+      # gap is used only to bias FINAL_STOP entry distance (HARD branch below).
+
+      # 1) Open-loop geometry guards (item 2 + primary close-range safety):
+      #    force HARD when distance is short or TTC is critical. This is the
+      #    primary close-range collision protection. Does NOT depend on the
+      #    brake-gap estimator's lag.
+      ttc_now = self.lead_d / max(v_ego, 0.1) if v_ego > 0.1 else 999.0
+      soft_min_dist = float(np.interp(v_ego, SOFT_MIN_DIST_BP, SOFT_MIN_DIST_V))
+      if self.lead_d < soft_min_dist or ttc_now < SOFT_MAX_TTC:
         self.state = SVAState.HARD_APPROACH
-      elif self.confidence >= CONFIDENCE_SOFT and self.a_required < -2.2:
+        return
+
+      # 2) Speed-dependent physics threshold (item 2): only escalate when
+      #    physics-required decel exceeds the speed-scaled threshold. At
+      #    higher speeds we require more severe a_required, giving SOFT a
+      #    meaningful runway for the comfort phase.
+      hard_thresh = float(np.interp(v_ego, SOFT_HARD_THRESH_BP, SOFT_HARD_THRESH_V))
+      if self.a_required < hard_thresh:
         self.state = SVAState.HARD_APPROACH
-      elif self.confidence < CONFIDENCE_SOFT * 0.5:
+        return
+
+      # 3) Drop back to MONITORING if confidence collapses
+      if self.confidence < CONFIDENCE_SOFT * 0.5:
         self.state = SVAState.MONITORING
 
     elif self.state == SVAState.HARD_APPROACH:
-      if v_ego < FINAL_STOP_SPEED and self.lead_d < FINAL_STOP_DIST + 2.0:
+      # Item 3: extend FINAL_STOP entry distance when brake authority is
+      # gapped, so we commit to the final stop earlier and don't run out
+      # of stopping distance before reaching standstill.
+      final_stop_dist_eff = FINAL_STOP_DIST + 2.0
+      if self.brake_authority_gap > 0.0:
+        final_stop_dist_eff += float(np.interp(v_ego, [0., 5., 10., 15.], [1.0, 2.0, 3.0, 4.0]))
+
+      if v_ego < FINAL_STOP_SPEED and self.lead_d < final_stop_dist_eff:
         self.state = SVAState.FINAL_STOP
       elif self.confidence < CONFIDENCE_EXIT_HARD and self.a_required > -1.5:
         self.state = SVAState.SOFT_APPROACH
@@ -523,6 +593,26 @@ class StoppedVehicleApproach:
         - should_stop: final should_stop flag
     """
     self._log_cycle_counter += 1
+
+    # --- Brake-response awareness (item 1) ---
+    # Estimate achieved decel from v_ego derivative and compare against the
+    # *clipped* commanded value (since hardware caps at HW_ACCEL_FLOOR, raw
+    # commands deeper than that wouldn't reach the SCC anyway).
+    if self._v_ego_prev is not None:
+      a_meas = (v_ego - self._v_ego_prev) / self.dt
+      alpha = self.dt / (BRAKE_GAP_LPF_TAU + self.dt)
+      self.a_achieved_filt = (1.0 - alpha) * self.a_achieved_filt + alpha * a_meas
+    self._v_ego_prev = v_ego
+
+    a_cmd_eff = max(self.a_target, HW_ACCEL_FLOOR)
+    raw_gap = 0.0
+    if v_ego > BRAKE_GAP_MIN_VEGO and a_cmd_eff < BRAKE_GAP_MIN_CMD:
+      raw_gap = max(0.0, abs(a_cmd_eff) - abs(self.a_achieved_filt))
+    if raw_gap > BRAKE_GAP_THRESHOLD:
+      self._gap_persist += self.dt
+    else:
+      self._gap_persist = 0.0
+    self.brake_authority_gap = raw_gap if self._gap_persist > BRAKE_GAP_PERSIST_S else 0.0
 
     if not self.enabled:
       self.active = False
