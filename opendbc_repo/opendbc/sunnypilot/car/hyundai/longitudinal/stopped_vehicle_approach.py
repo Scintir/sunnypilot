@@ -426,14 +426,17 @@ class StoppedVehicleApproach:
         # Vehicle at standstill: neutral command, force_should_stop keeps
         # long control in STOPPING state which handles brake hold.
         return 0.0
-      # Comfort braking profile shaped like a bathtub:
-      #   1. Firm entry (3.0 m/s): carry over braking authority from approach
-      #   2. Ease off (2.0→1.2 m/s): semi-linear reduction, signals "slowing nicely"
-      #   3. Re-commit (1.2→0.5 m/s): ramp back up to ensure committed stop
-      #   4. Final taper (0.5→0.1 m/s): gentle ease-off for smooth standstill
+      # Pure monotonic ease-off for the last few mph: brake force only ever
+      # decreases in magnitude as v_ego → 0. The "ramp back in for confidence"
+      # phase happens earlier in HARD_APPROACH, NOT here. The cabin-feel
+      # window for "harsh stop" is exactly the 0.5-1.5 m/s band, so any brake
+      # reversal in that range feels like the car is about to slam — opposite
+      # of the confidence we want to communicate.
+      # Non-uniform breakpoints: denser at low speed where perception is
+      # most sensitive to small decel changes.
       return float(np.interp(v_ego,
-        [0.1,  0.5,  1.2,  2.0,  3.0],       # m/s breakpoints
-        [-0.2, -1.0, -0.7, -1.2, FINAL_STOP_DECEL]))  # m/s^2 decel profile
+        [0.1,   0.4,   0.8,   1.4,   2.2,   3.0],    # m/s breakpoints
+        [-0.20, -0.42, -0.65, -1.00, -1.45, FINAL_STOP_DECEL]))  # m/s^2
 
     if self.state == SVAState.SOFT_APPROACH:
       # Speed-dependent soft deceleration limit
