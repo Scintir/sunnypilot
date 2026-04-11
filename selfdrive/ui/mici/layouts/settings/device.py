@@ -304,6 +304,10 @@ class DeviceLayoutMici(NavScroller):
       params.remove("LiveParameters")
       params.remove("LiveParametersV2")
       params.remove("LiveDelay")
+      # Fix C: signal calibrationd that this is a user-requested reset so it
+      # initializes with cal_status = recalibrating (shown as "Recalibrating: X%"
+      # instead of "Calibrating: X%"). Flag is consumed by calibrationd on startup.
+      params.put_bool("CalibrationResetRequested", True)
       params.put_bool("OnroadCycleRequested", True)
 
     def uninstall_openpilot_callback():

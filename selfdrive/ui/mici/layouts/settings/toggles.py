@@ -60,6 +60,12 @@ class TogglesLayoutMici(NavScroller):
                                         toggle_callback=self._on_sva_toggle)
     self._sva_logging = BigParamControl("SVA logging", "StoppedVehicleApproachLogging")
 
+    # Calibration box-check bypass (Fix C).
+    # Off by default: the box check runs normally. Toggling on disables the
+    # pitch/yaw limit check so openpilot won't soft-disengage on transient
+    # calibration bias (e.g. the bumpy commute stretch). Spread check still runs.
+    self._calib_bypass_toggle = BigParamControl("disable calibration box check", "CalibrationBoxCheckDisabled")
+
     self._scroller.add_widgets([
       self._personality_toggle,
       self._experimental_btn,
@@ -74,6 +80,7 @@ class TogglesLayoutMici(NavScroller):
       self._ev_power_limit_logging,
       self._sva_toggle,
       self._sva_logging,
+      self._calib_bypass_toggle,
     ])
 
     # Toggle lists
@@ -85,6 +92,7 @@ class TogglesLayoutMici(NavScroller):
       ("RecordFront", record_front),
       ("RecordAudio", record_mic),
       ("OpenpilotEnabledToggle", enable_openpilot),
+      ("CalibrationBoxCheckDisabled", self._calib_bypass_toggle),
     )
 
     enable_openpilot.set_enabled(lambda: not ui_state.engaged)

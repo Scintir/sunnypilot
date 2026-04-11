@@ -224,6 +224,14 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"StoppedVehicleApproachEnabled", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"StoppedVehicleApproachLogging", {PERSISTENT | BACKUP, BOOL, "0"}},
 
+    // Calibration box-check bypass (Fix C)
+    // CalibrationBoxCheckDisabled: when true, is_calibration_valid() returns True unconditionally.
+    //   Spread check still runs; recalibrating on mount shift is preserved.
+    // CalibrationResetRequested: one-shot flag set by UI reset calibration button.
+    //   Consumed by calibrationd on startup to initialize cal_status = recalibrating.
+    {"CalibrationBoxCheckDisabled", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"CalibrationResetRequested", {PERSISTENT, BOOL, "0"}},
+
     // sunnypilot car specific params
     {"HyundaiLongitudinalTuning", {PERSISTENT | BACKUP, INT, "0"}},
     {"SubaruStopAndGo", {PERSISTENT | BACKUP, BOOL, "0"}},
