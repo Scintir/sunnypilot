@@ -93,6 +93,10 @@ class CarStateExt:
       ret_sp.scintirBatteryCurrent = cp.vl["BAT11"]["BAT_SNSR_I"]
       ret_sp.scintirHcu1Status = int(cp.vl["P_STS"]["HCU1_STS"])
       ret_sp.scintirHcu5Status = int(cp.vl["P_STS"]["HCU5_STS"])
+      # Expose on self so CarController (which doesn't receive ret_sp) can
+      # read the same values via CS.scintir_battery_soc / scintir_battery_current.
+      self.scintir_battery_soc = float(ret_sp.scintirBatterySoc)
+      self.scintir_battery_current = float(ret_sp.scintirBatteryCurrent)
     except KeyError:
       pass
 

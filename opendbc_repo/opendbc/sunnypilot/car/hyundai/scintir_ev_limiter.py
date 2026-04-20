@@ -1,0 +1,183 @@
+"""
+Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
+
+This file is part of sunnypilot and is licensed under the MIT License.
+See the LICENSE.md file in the root directory for more details.
+
+Scintir EV power limiter — classic-CAN Hyundai HYBRID, stock-long only.
+
+Decides whether to press CLU11 SET_DECEL or RES_ACCEL to bias the stock
+SCC set speed down when the vehicle looks about to leave EV mode, or back
+up toward the driver's last observed target when demand has eased.
+
+Engagement gates:
+  * sunnypilot is engaged (CC.enabled — panda controls_allowed == True);
+  * driver has not touched accelerator, brake, or own cruise buttons for
+    DRIVER_OVERRIDE_BACKOFF_FRAMES;
+  * battery SOC above the configured floor;
+  * ego speed above the configured minimum.
+
+Driver always overrides via brake or accelerator pedal (stock SCC
+disengages on either); the limiter additionally backs off on any observed
+cruise-button press.
+"""
+from opendbc.car.hyundai.values import Buttons, HyundaiFlags
+
+
+try:
+  from openpilot.common.params import Params as _Params
+  _PARAMS_AVAILABLE = True
+except Exception:  # opendbc may run outside openpilot (tests, standalone)
+  _Params = None
+  _PARAMS_AVAILABLE = False
+
+
+PRESS_COOLDOWN_FRAMES = 20             # 200 ms at 100 Hz between commanded presses
+PRESS_BURST_COPIES = 5                  # duplicate presses sent per commanded frame so SCC reliably sees it
+POWER_HYSTERESIS_A = 10.0               # stop limiting when current drops this far below threshold
+DRIVER_OVERRIDE_BACKOFF_FRAMES = 300    # 3 s back off after driver pedal/button interaction
+STUCK_LOOP_MAX_FRAMES = 6000            # 60 s continuous active -> safety reset to IDLE
+
+MPH_TO_MS = 0.44704
+KPH_TO_MS = 1.0 / 3.6
+
+
+class ScintirEVLimiter:
+  def __init__(self, CP, CP_SP):
+    self.CP = CP
+    self.CP_SP = CP_SP
+
+    # Only meaningful on classic-CAN Hyundai HYBRID with stock longitudinal.
+    # On any other config self.update() is a no-op.
+    self.supported = (
+      not bool(CP.flags & HyundaiFlags.CANFD)
+      and bool(CP.flags & HyundaiFlags.HYBRID)
+      and not CP.openpilotLongitudinalControl
+    )
+
+    self._params = _Params() if _PARAMS_AVAILABLE else None
+
+    self.last_press_frame = -10000
+    self.driver_interacted_frame = -10000
+    self.active_frames = 0
+    self.active = False
+    self.user_target_speed = 0.0
+
+  # ----- Params helpers ---------------------------------------------------
+
+  def _read_bool(self, key: str, default: bool) -> bool:
+    if self._params is None:
+      return default
+    try:
+      return bool(self._params.get_bool(key))
+    except Exception:
+      return default
+
+  def _read_int(self, key: str, default: int) -> int:
+    if self._params is None:
+      return default
+    try:
+      raw = self._params.get(key)
+      if raw is None:
+        return default
+      return int(raw)
+    except (ValueError, TypeError):
+      return default
+
+  # ----- Main update ------------------------------------------------------
+
+  def update(self, CC, CS, frame: int) -> tuple[int, bool]:
+    """Advance the limiter and return (button, active).
+
+    button -- Buttons.NONE / Buttons.RES_ACCEL / Buttons.SET_DECEL. NONE means
+              do not TX CLU11 this frame.
+    active -- True while the limiter is commanding a set-speed offset
+              (including frames in cooldown between presses).
+    """
+    if not self.supported:
+      self._hard_reset()
+      return Buttons.NONE, False
+
+    if not self._read_bool("ScintirEVLimiterEnabled", False):
+      self._hard_reset()
+      return Buttons.NONE, False
+
+    # Tunables (bounded at the UI level; read every frame so changes take
+    # effect without restart)
+    power_threshold = float(self._read_int("ScintirEVLimiterPowerThreshold", 40))
+    soc_floor = float(self._read_int("ScintirEVLimiterSOCFloor", 25))
+    min_speed_setting = float(self._read_int("ScintirEVLimiterMinSpeed", 15))
+
+    # Inputs from CarState / CarControl
+    cc_enabled = bool(CC.enabled)
+    battery_soc = float(getattr(CS, "scintir_battery_soc", 0.0))
+    battery_current = float(getattr(CS, "scintir_battery_current", 0.0))
+    observed_set_speed = float(CS.out.cruiseState.speed)
+    v_ego = float(CS.out.vEgo)
+    is_metric = bool(getattr(CS, "is_metric", False))
+    gas_pressed = bool(CS.out.gasPressed)
+    brake_pressed = bool(CS.out.brakePressed)
+
+    # Detect driver's own cruise-button press on CLU11 (RES/SET/CANCEL).
+    own_button_pressed = any(b in (Buttons.RES_ACCEL, Buttons.SET_DECEL, Buttons.CANCEL)
+                             for b in getattr(CS, "cruise_buttons", ()))
+
+    # Track user-target while we're not actively commanding
+    if not self.active:
+      self.user_target_speed = observed_set_speed
+
+    # Driver override: pedal or explicit cruise button -> back off
+    if gas_pressed or brake_pressed or own_button_pressed:
+      self.driver_interacted_frame = frame
+      if own_button_pressed:
+        # user just restated their target via the wheel
+        self.user_target_speed = observed_set_speed
+    driver_active = (frame - self.driver_interacted_frame) < DRIVER_OVERRIDE_BACKOFF_FRAMES
+
+    # Speed gate: setting is in the user's display units, convert to m/s
+    min_speed_ms = min_speed_setting * (KPH_TO_MS if is_metric else MPH_TO_MS)
+
+    gates_ok = (
+      cc_enabled
+      and not driver_active
+      and battery_soc > soc_floor
+      and v_ego >= min_speed_ms
+    )
+
+    if not gates_ok:
+      self.active = False
+      self.active_frames = 0
+      return Buttons.NONE, False
+
+    over = battery_current > power_threshold
+    under = battery_current < (power_threshold - POWER_HYSTERESIS_A)
+
+    can_press = (frame - self.last_press_frame) >= PRESS_COOLDOWN_FRAMES
+    button = Buttons.NONE
+    self.active = False
+
+    if over:
+      self.active = True
+      if can_press:
+        button = Buttons.SET_DECEL
+        self.last_press_frame = frame
+    elif under and observed_set_speed < self.user_target_speed:
+      self.active = True
+      if can_press:
+        button = Buttons.RES_ACCEL
+        self.last_press_frame = frame
+
+    # Stuck-loop safety: hard reset if we've been "active" way too long
+    if self.active:
+      self.active_frames += 1
+      if self.active_frames > STUCK_LOOP_MAX_FRAMES:
+        self._hard_reset()
+        return Buttons.NONE, False
+    else:
+      self.active_frames = 0
+
+    return button, self.active
+
+  def _hard_reset(self) -> None:
+    self.active = False
+    self.active_frames = 0
