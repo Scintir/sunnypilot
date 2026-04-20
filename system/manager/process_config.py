@@ -100,6 +100,15 @@ def uploader_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
 
   return always_run(started, params, CP)
 
+def scintir_rsync_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
+  if started:
+    return False
+  if not params.get_bool("ScintirRsyncEnabled"):
+    return False
+  if not params.get("ScintirRsyncDestination"):
+    return False
+  return True
+
 def or_(*fns):
   return lambda *args: operator.or_(*(fn(*args) for fn in fns))
 
@@ -181,6 +190,11 @@ procs += [
 
   # locationd
   NativeProcess("locationd_llk", "sunnypilot/selfdrive/locationd", ["./locationd"], only_onroad),
+]
+
+# Scintir research
+procs += [
+  PythonProcess("scintir_rsync_uploader", "sunnypilot.scintir.rsync_uploader", scintir_rsync_ready),
 ]
 
 if os.path.exists("./github_runner.sh"):
