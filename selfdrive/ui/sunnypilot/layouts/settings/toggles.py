@@ -38,7 +38,7 @@ class TogglesLayoutSP(TogglesLayout):
     self._scintir_power_threshold = option_item_sp(
       title=tr("Scintir: EV Limiter power threshold (A)"),
       param="ScintirEVLimiterPowerThreshold",
-      min_value=10, max_value=80, value_change_step=5, inline=True,
+      min_value=10, max_value=200, value_change_step=10, inline=True,
     )
 
     self._scintir_soc_floor = option_item_sp(

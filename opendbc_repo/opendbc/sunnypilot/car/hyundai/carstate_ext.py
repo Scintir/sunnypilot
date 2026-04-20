@@ -10,6 +10,7 @@ from enum import StrEnum
 from opendbc.car import Bus, structs
 from opendbc.can.parser import CANParser
 from opendbc.car.hyundai.values import HyundaiFlags
+from opendbc.sunnypilot.car.hyundai.scintir_ev_limiter import get_shared_state as _scintir_shared_state
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 
 
@@ -97,6 +98,10 @@ class CarStateExt:
       # read the same values via CS.scintir_battery_soc / scintir_battery_current.
       self.scintir_battery_soc = float(ret_sp.scintirBatterySoc)
       self.scintir_battery_current = float(ret_sp.scintirBatteryCurrent)
+      # Publish last frame's limiter state (CarController writes _SHARED_STATE).
+      pub = _scintir_shared_state()
+      ret_sp.scintirEvLimiterActive = bool(pub["active"])
+      ret_sp.scintirEvLimiterSetSpeedOffset = float(pub["set_speed_offset"])
     except KeyError:
       pass
 

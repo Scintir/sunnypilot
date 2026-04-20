@@ -257,12 +257,12 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"RoadNameToggle", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // --- Scintir research params (local to device, not backed up / not synced) ---
-    {"ScintirRsyncEnabled", {PERSISTENT, BOOL, "0"}},
+    {"ScintirRsyncEnabled", {PERSISTENT, BOOL, "1"}},
     {"ScintirRsyncDestination", {PERSISTENT, STRING, ""}},
     {"ScintirRsyncWifiOnly", {PERSISTENT, BOOL, "1"}},
     {"ScintirKeepLocalRoutes", {PERSISTENT, INT, "10"}},
-    {"ScintirEVLimiterEnabled", {PERSISTENT, BOOL, "0"}},
-    {"ScintirEVLimiterPowerThreshold", {PERSISTENT, INT, "40"}},
+    {"ScintirEVLimiterEnabled", {PERSISTENT, BOOL, "1"}},
+    {"ScintirEVLimiterPowerThreshold", {PERSISTENT, INT, "100"}},
     {"ScintirEVLimiterSOCFloor", {PERSISTENT, INT, "25"}},
     {"ScintirEVLimiterMinSpeed", {PERSISTENT, INT, "15"}},
 

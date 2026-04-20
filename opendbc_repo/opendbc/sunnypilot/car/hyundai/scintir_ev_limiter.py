@@ -42,6 +42,22 @@ MPH_TO_MS = 0.44704
 KPH_TO_MS = 1.0 / 3.6
 
 
+# Module-level singleton so the CarController-side limiter can share state
+# with the CarState-side publisher (CarStateExt) without passing references.
+# One CarController per process -> one limiter -> one reader. CarState consumes
+# these values on the *next* frame, so there is always a one-frame lag between
+# the CLU11 TX and the UI indicator; that is well below human perception.
+_SHARED_STATE: dict = {
+  "active": False,
+  "set_speed_offset": 0.0,
+}
+
+
+def get_shared_state() -> dict:
+  """Return the latest limiter state for UI-side consumers (read-only)."""
+  return _SHARED_STATE
+
+
 class ScintirEVLimiter:
   def __init__(self, CP, CP_SP):
     self.CP = CP
@@ -176,8 +192,14 @@ class ScintirEVLimiter:
     else:
       self.active_frames = 0
 
+    # Publish state for UI-side consumer (CarStateExt); one-frame lag acceptable.
+    _SHARED_STATE["active"] = bool(self.active)
+    _SHARED_STATE["set_speed_offset"] = max(0.0, self.user_target_speed - observed_set_speed)
+
     return button, self.active
 
   def _hard_reset(self) -> None:
     self.active = False
     self.active_frames = 0
+    _SHARED_STATE["active"] = False
+    _SHARED_STATE["set_speed_offset"] = 0.0
