@@ -435,6 +435,14 @@ struct BackupManagerSP @0xf98d843bfd7004a3 {
 
 struct CarStateSP @0xb86e6369214c01c8 {
   speedLimit @0 :Float32;
+
+  # Scintir research (populated only on supported Hyundai PHEV fingerprints)
+  scintirBatterySoc @1 :Float32;                  # %, 0..100
+  scintirBatteryCurrent @2 :Float32;              # A, signed (+ discharge / - regen)
+  scintirHcu1Status @3 :UInt8;                    # raw P_STS.HCU1_STS (0..3)
+  scintirHcu5Status @4 :UInt8;                    # raw P_STS.HCU5_STS (0..3)
+  scintirEvLimiterActive @5 :Bool;                # true while limiter is commanding lower set speed
+  scintirEvLimiterSetSpeedOffset @6 :Float32;     # user target minus effective set speed, in carstate units
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

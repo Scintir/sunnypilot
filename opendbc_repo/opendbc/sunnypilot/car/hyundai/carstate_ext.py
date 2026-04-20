@@ -76,6 +76,26 @@ class CarStateExt:
 
     ret_sp.speedLimit = self.update_speed_limit(cp, cp_cam) * speed_conv
 
+    self._update_scintir_ev_signals(ret_sp, cp)
+
+  def _update_scintir_ev_signals(self, ret_sp: structs.CarStateSP, cp: CANParser) -> None:
+    """Parse raw EV/hybrid telemetry used by the Scintir EV power limiter.
+
+    Only meaningful for Hyundai classic-CAN HYBRID cars; on other platforms
+    the BAT11 / P_STS messages may be absent or interpreted differently, so
+    we gate on the HYBRID flag and silently skip if the DBC doesn't provide
+    these signals.
+    """
+    if not (self.CP.flags & HyundaiFlags.HYBRID):
+      return
+    try:
+      ret_sp.scintirBatterySoc = cp.vl["BAT11"]["BAT_SOC"]
+      ret_sp.scintirBatteryCurrent = cp.vl["BAT11"]["BAT_SNSR_I"]
+      ret_sp.scintirHcu1Status = int(cp.vl["P_STS"]["HCU1_STS"])
+      ret_sp.scintirHcu5Status = int(cp.vl["P_STS"]["HCU5_STS"])
+    except KeyError:
+      pass
+
   def update_canfd_ext(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser],
                        speed_factor: float) -> None:
     cp = can_parsers[Bus.pt]
