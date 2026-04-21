@@ -1,5 +1,6 @@
 from cereal import log
 
+from openpilot.common.params import UnknownKeyName
 from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.mici.widgets.button import BigParamControl, BigMultiParamToggle
 from openpilot.system.ui.lib.application import gui_app
@@ -43,6 +44,22 @@ class TogglesLayoutMici(NavScroller):
       ("RecordAudio", record_mic),
       ("OpenpilotEnabledToggle", enable_openpilot),
     )
+
+    # Scintir research — only rendered if params_pyx.so has been rebuilt to
+    # know about the Scintir* keys. On a stock prebuilt release library the
+    # probe raises UnknownKeyName and we simply skip the widgets so the rest
+    # of the Toggles panel keeps working.
+    try:
+      ui_state.params.get_bool("ScintirEVLimiterEnabled")
+      scintir_rsync = BigParamControl("scintir: upload can logs", "ScintirRsyncEnabled")
+      scintir_limiter = BigParamControl("scintir: ev power limiter", "ScintirEVLimiterEnabled")
+      self._scroller.add_widgets([scintir_rsync, scintir_limiter])
+      self._refresh_toggles = self._refresh_toggles + (
+        ("ScintirRsyncEnabled", scintir_rsync),
+        ("ScintirEVLimiterEnabled", scintir_limiter),
+      )
+    except UnknownKeyName:
+      pass
 
     enable_openpilot.set_enabled(lambda: not ui_state.engaged)
     record_front.set_enabled(False if ui_state.params.get_bool("RecordFrontLock") else (lambda: not ui_state.engaged))
