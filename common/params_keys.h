@@ -262,7 +262,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ScintirRsyncWifiOnly", {PERSISTENT, BOOL, "1"}},
     {"ScintirKeepLocalRoutes", {PERSISTENT, INT, "10"}},
     {"ScintirEVLimiterEnabled", {PERSISTENT, BOOL, "1"}},
-    {"ScintirEVLimiterPowerThresholdKW", {PERSISTENT, INT, "30"}},
+    {"ScintirEVLimiterPowerThresholdKW", {PERSISTENT, INT, "40"}},
     {"ScintirEVLimiterDTEFloor", {PERSISTENT, INT, "5"}},
     {"ScintirEVLimiterMinSpeed", {PERSISTENT, INT, "15"}},
 

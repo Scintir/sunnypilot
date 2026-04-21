@@ -46,14 +46,27 @@ except Exception:  # opendbc may run outside openpilot (tests, standalone)
   _PARAMS_AVAILABLE = False
 
 
-PRESS_COOLDOWN_FRAMES = 20             # 200 ms at 100 Hz between commanded presses
+PRESS_COOLDOWN_FRAMES = 20             # 200 ms at 100 Hz between SET_DECEL presses (or fast-recovery RES_ACCEL)
 PRESS_BURST_COPIES = 5                  # duplicate presses sent per commanded frame so SCC reliably sees it
-POWER_HYSTERESIS_W = 5000.0             # 5 kW — stop limiting once P_est drops this far below threshold
+POWER_HYSTERESIS_W = 5000.0             # 5 kW — threshold band for "fast-recover" RES_ACCEL branch
 DRIVER_OVERRIDE_BACKOFF_FRAMES = 300    # 3 s back off after driver pedal/button interaction
 STUCK_LOOP_MAX_FRAMES = 6000            # 60 s continuous active -> safety reset to IDLE
 
+# Slow-recovery branch: when the limiter has pulled set speed below the user
+# target but power demand has settled into the hysteresis band (neither "over"
+# nor "well under"), walk the set speed back up at a much slower cadence than
+# the SET_DECEL rate so we don't bounce around the threshold.
+SLOW_RECOVERY_COOLDOWN_FRAMES = 300     # 3 s between RES_ACCEL presses while slow-recovering
+SLOW_RECOVERY_DWELL_FRAMES = 500        # 5 s of "not over threshold" before slow recovery begins
+
+# Hard cap on how far below the user's set-speed target the limiter is allowed
+# to pull: at most this many mph. Once reduction reaches the cap, SET_DECEL is
+# inhibited even if demand remains above the power threshold — avoids the
+# runaway "set speed keeps falling" behaviour the user flagged.
+MAX_REDUCTION_MPH = 5.0
 MPH_TO_MS = 0.44704
 KPH_TO_MS = 1.0 / 3.6
+MAX_REDUCTION_MS = MAX_REDUCTION_MPH * MPH_TO_MS   # cruiseState.speed is m/s, independent of is_metric
 
 
 # Module-level singleton so the CarController-side limiter can share state
@@ -90,6 +103,7 @@ class ScintirEVLimiter:
     self.last_press_frame = -10000
     self.driver_interacted_frame = -10000
     self.active_frames = 0
+    self.frames_below_threshold = 0   # counts how long est_power has been <= threshold (for slow recovery)
     self.active = False
     self.user_target_speed = 0.0
 
@@ -168,8 +182,10 @@ class ScintirEVLimiter:
     # Driver override: pedal or explicit cruise button -> back off
     if gas_pressed or brake_pressed or own_button_pressed:
       self.driver_interacted_frame = frame
-      if own_button_pressed:
-        # user just restated their target via the wheel
+      # Only treat an own-button press as a target restate when the limiter
+      # is NOT currently commanding. Otherwise the driver is just fighting our
+      # offset and taking their press as "the new target" erases the real one.
+      if own_button_pressed and not self.active:
         self.user_target_speed = observed_set_speed
     driver_active = (frame - self.driver_interacted_frame) < DRIVER_OVERRIDE_BACKOFF_FRAMES
 
@@ -186,23 +202,45 @@ class ScintirEVLimiter:
     if not gates_ok:
       self.active = False
       self.active_frames = 0
+      self.frames_below_threshold = 0
       return _publish_and_return(Buttons.NONE, False)
 
     over = est_power_w > power_threshold_w
     under = est_power_w < (power_threshold_w - POWER_HYSTERESIS_W)
 
-    can_press = (frame - self.last_press_frame) >= PRESS_COOLDOWN_FRAMES
+    # Track time since last "over threshold" event for the slow-recovery gate
+    if over:
+      self.frames_below_threshold = 0
+    else:
+      self.frames_below_threshold += 1
+
+    # How much we've already pulled set speed down from the user's target (m/s)
+    reduction = max(0.0, self.user_target_speed - observed_set_speed)
+    below_target = observed_set_speed < self.user_target_speed
+
+    can_press_fast = (frame - self.last_press_frame) >= PRESS_COOLDOWN_FRAMES
+    can_press_slow = (frame - self.last_press_frame) >= SLOW_RECOVERY_COOLDOWN_FRAMES
+
     button = Buttons.NONE
     self.active = False
 
-    if over:
+    if over and reduction < MAX_REDUCTION_MS:
+      # Demand over threshold AND we still have room within the 5 mph cap → pull down
       self.active = True
-      if can_press:
+      if can_press_fast:
         button = Buttons.SET_DECEL
         self.last_press_frame = frame
-    elif under and observed_set_speed < self.user_target_speed:
+    elif under and below_target:
+      # Power is well under threshold and set speed still below user target → fast recover
       self.active = True
-      if can_press:
+      if can_press_fast:
+        button = Buttons.RES_ACCEL
+        self.last_press_frame = frame
+    elif below_target and self.frames_below_threshold >= SLOW_RECOVERY_DWELL_FRAMES:
+      # We're in the hysteresis band, set speed still below target, and power has
+      # been settled for long enough → creep the set speed back up toward user target
+      self.active = True
+      if can_press_slow:
         button = Buttons.RES_ACCEL
         self.last_press_frame = frame
 
@@ -220,5 +258,6 @@ class ScintirEVLimiter:
   def _hard_reset(self) -> None:
     self.active = False
     self.active_frames = 0
+    self.frames_below_threshold = 0
     _SHARED_STATE["active"] = False
     _SHARED_STATE["set_speed_offset"] = 0.0

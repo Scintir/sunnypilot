@@ -438,7 +438,7 @@ struct CarStateSP @0xb86e6369214c01c8 {
 
   # Scintir research signals
   scintirEvLimiterActive @1 :Bool;                # limiter is commanding a set-speed offset
-  scintirEvLimiterSetSpeedOffset @2 :Float32;     # user target minus effective set speed (mph/kph)
+  scintirEvLimiterSetSpeedOffset @2 :Float32;     # user target minus effective set speed, m/s (UI converts to mph/kph)
   scintirAccelDemand @3 :Float32;                 # TCS13.aBasis, m/s^2 (aggregated: driver + SCC + control overlay)
   scintirDteRaw @4 :UInt16;                       # CLU13.CF_Clu_DTE, 10-bit raw cluster distance-to-empty
   scintirEstPowerW @5 :Float32;                   # mass * max(0, aBasis) * vEgo, W -- propulsion power demand proxy

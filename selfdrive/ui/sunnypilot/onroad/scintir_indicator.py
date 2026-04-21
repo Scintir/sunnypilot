@@ -45,9 +45,15 @@ class ScintirLimiterIndicator(Widget):
     if not active:
       return
 
-    offset = float(getattr(cs_sp, "scintirEvLimiterSetSpeedOffset", 0.0))
-    unit = "kph" if ui_state.is_metric else "mph"
-    label = f"EV LIMIT  -{int(round(offset))} {unit}" if offset >= 0.5 else "EV LIMIT"
+    # scintirEvLimiterSetSpeedOffset is in m/s (carstate units); convert here.
+    offset_ms = float(getattr(cs_sp, "scintirEvLimiterSetSpeedOffset", 0.0))
+    if ui_state.is_metric:
+      offset_display = offset_ms * 3.6          # m/s -> kph
+      unit = "kph"
+    else:
+      offset_display = offset_ms * 2.23693629   # m/s -> mph
+      unit = "mph"
+    label = f"EV LIMIT  -{int(round(offset_display))} {unit}" if offset_display >= 0.5 else "EV LIMIT"
     size = measure_text_cached(self._font, label, FONT_SIZE)
 
     box_w = size.x + PAD_X * 2
