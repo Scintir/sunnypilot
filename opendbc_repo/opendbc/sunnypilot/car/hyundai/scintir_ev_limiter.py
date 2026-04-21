@@ -134,6 +134,14 @@ class ScintirEVLimiter:
     gas_pressed = bool(CS.out.gasPressed)
     brake_pressed = bool(CS.out.brakePressed)
 
+    # Keep user_target_speed tracked and _SHARED_STATE fresh even on early exits
+    # so the UI indicator and any downstream consumer don't get stale values
+    # (gpt-5.4 review: stale shared UI state on gate drop).
+    def _publish_and_return(button: int, active: bool) -> tuple[int, bool]:
+      _SHARED_STATE["active"] = bool(active)
+      _SHARED_STATE["set_speed_offset"] = max(0.0, self.user_target_speed - observed_set_speed)
+      return button, active
+
     # Detect driver's own cruise-button press on CLU11 (RES/SET/CANCEL).
     own_button_pressed = any(b in (Buttons.RES_ACCEL, Buttons.SET_DECEL, Buttons.CANCEL)
                              for b in getattr(CS, "cruise_buttons", ()))
@@ -163,7 +171,7 @@ class ScintirEVLimiter:
     if not gates_ok:
       self.active = False
       self.active_frames = 0
-      return Buttons.NONE, False
+      return _publish_and_return(Buttons.NONE, False)
 
     over = battery_current > power_threshold
     under = battery_current < (power_threshold - POWER_HYSTERESIS_A)
@@ -192,11 +200,7 @@ class ScintirEVLimiter:
     else:
       self.active_frames = 0
 
-    # Publish state for UI-side consumer (CarStateExt); one-frame lag acceptable.
-    _SHARED_STATE["active"] = bool(self.active)
-    _SHARED_STATE["set_speed_offset"] = max(0.0, self.user_target_speed - observed_set_speed)
-
-    return button, self.active
+    return _publish_and_return(button, self.active)
 
   def _hard_reset(self) -> None:
     self.active = False

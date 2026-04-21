@@ -49,6 +49,8 @@ RSYNC_EXCLUDES = (
 
 IDLE_POLL_S = 30
 PER_ROUTE_TIMEOUT_S = 30 * 60
+FAILURE_BACKOFF_THRESHOLD = 5  # after N consecutive failures, sleep longer
+FAILURE_BACKOFF_MULT = 10       # idle poll multiplier applied after threshold
 
 
 def _ssh_command() -> str:
@@ -162,6 +164,7 @@ def main(exit_event: threading.Event | None = None) -> None:
   params = Params()
   sm = messaging.SubMaster(["deviceState"])
   root = Paths.log_root()
+  consecutive_failures = 0
 
   while not exit_event.is_set():
     sm.update(0)
@@ -178,11 +181,21 @@ def main(exit_event: threading.Event | None = None) -> None:
         break
       if _rsync_route(route_path, destination):
         _mark_uploaded(route_path)
+        consecutive_failures = 0
+      else:
+        consecutive_failures += 1
       ok, _ = _should_run(params, sm)
       if not ok:
         break
 
-    time.sleep(IDLE_POLL_S)
+    # After repeated failures (bad key/host/destination) back off hard so we
+    # don't thrash the logs and wake-ups. Recovers on the next successful run.
+    if consecutive_failures >= FAILURE_BACKOFF_THRESHOLD:
+      cloudlog.warning("scintir_rsync: %d consecutive failures, backing off", consecutive_failures)
+      time.sleep(IDLE_POLL_S * FAILURE_BACKOFF_MULT)
+      consecutive_failures = 0
+    else:
+      time.sleep(IDLE_POLL_S)
 
 
 if __name__ == "__main__":

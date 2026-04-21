@@ -145,18 +145,33 @@ def analyze_route(route_dir: Path) -> dict:
 
 
 def _build_limiter_events(active: list, offset: list) -> list:
-  """Collapse per-frame limiter_active flag into start/end windows."""
+  """Collapse per-frame limiter_active flag into start/end windows.
+
+  Uses a running index into the offset timeline (no exact-timestamp join,
+  which is fragile when active and offset streams are not sample-aligned).
+  Also flushes a final event if the route ends while the limiter is still
+  active.
+  """
   events: list = []
   prev = False
   start_t = 0.0
   peak_offset = 0.0
-  offset_by_t = {e.t: e.value for e in offset}
+  offset_idx = 0
+
+  def _offset_at(t: float) -> float:
+    nonlocal offset_idx
+    while offset_idx + 1 < len(offset) and offset[offset_idx + 1].t <= t:
+      offset_idx += 1
+    return float(offset[offset_idx].value) if offset else 0.0
+
   for entry in active:
+    cur_off = _offset_at(entry.t)
     if entry.value and not prev:
       start_t = entry.t
-      peak_offset = offset_by_t.get(entry.t, 0.0)
+      peak_offset = cur_off
     elif entry.value and prev:
-      peak_offset = max(peak_offset, offset_by_t.get(entry.t, 0.0))
+      if cur_off > peak_offset:
+        peak_offset = cur_off
     elif not entry.value and prev:
       events.append({
         "start": _format_ts(start_t),
@@ -165,6 +180,17 @@ def _build_limiter_events(active: list, offset: list) -> list:
         "peak_offset": round(peak_offset, 1),
       })
     prev = entry.value
+
+  # Flush tail if the route ended while still active
+  if prev:
+    end_t = active[-1].t if active else start_t
+    events.append({
+      "start": _format_ts(start_t),
+      "end": _format_ts(end_t),
+      "duration_s": round(end_t - start_t, 2),
+      "peak_offset": round(peak_offset, 1),
+      "truncated": True,
+    })
   return events
 
 

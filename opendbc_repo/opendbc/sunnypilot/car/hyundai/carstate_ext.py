@@ -7,11 +7,18 @@ See the LICENSE.md file in the root directory for more details.
 
 from enum import StrEnum
 
+import sys
+
 from opendbc.car import Bus, structs
 from opendbc.can.parser import CANParser
 from opendbc.car.hyundai.values import HyundaiFlags
 from opendbc.sunnypilot.car.hyundai.scintir_ev_limiter import get_shared_state as _scintir_shared_state
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+
+
+# Module-global: only warn once per process if the expected Scintir research
+# signals are absent on a car that otherwise claims HYBRID support.
+_SCINTIR_MISSING_WARNED = False
 
 
 class CarStateExt:
@@ -102,8 +109,14 @@ class CarStateExt:
       pub = _scintir_shared_state()
       ret_sp.scintirEvLimiterActive = bool(pub["active"])
       ret_sp.scintirEvLimiterSetSpeedOffset = float(pub["set_speed_offset"])
-    except KeyError:
-      pass
+    except KeyError as e:
+      global _SCINTIR_MISSING_WARNED
+      if not _SCINTIR_MISSING_WARNED:
+        print(
+          f"[scintir] HYBRID flag set but BAT11/P_STS not available from parser: {e}",
+          file=sys.stderr,
+        )
+        _SCINTIR_MISSING_WARNED = True
 
   def update_canfd_ext(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser],
                        speed_factor: float) -> None:

@@ -134,7 +134,14 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     # internally no-ops on any other fingerprint).
     if not self.CP.flags & HyundaiFlags.CANFD:
       scintir_button, _ = self.scintir_limiter.update(CC, CS, self.frame)
-      if scintir_button != Buttons.NONE:
+      # Defensive second gate: never TX our button on the same frame the
+      # driver is holding a cruise button, regardless of what the limiter
+      # state machine decided (covers parser-vs-controller timing lag).
+      driver_on_cruise_button = (
+        len(CS.cruise_buttons) > 0
+        and CS.cruise_buttons[-1] in (Buttons.RES_ACCEL, Buttons.SET_DECEL, Buttons.CANCEL)
+      )
+      if scintir_button != Buttons.NONE and not driver_on_cruise_button:
         can_sends.extend(
           [hyundaican.create_clu11(self.packer, self.frame, CS.clu11, scintir_button, self.CP)] * PRESS_BURST_COPIES
         )
