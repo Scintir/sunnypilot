@@ -102,10 +102,9 @@ def analyze_route(route_dir: Path) -> dict:
         sp = msg.carStateSP
         limiter_active.append(TimelineEntry(t, bool(getattr(sp, "evLimiterActive", False))))
         limiter_offset.append(TimelineEntry(t, float(getattr(sp, "evLimiterSetSpeedOffset", 0.0))))
-        soc.append(TimelineEntry(t, float(getattr(sp, "scintirBatterySoc", 0.0))))
-        current.append(TimelineEntry(t, float(getattr(sp, "scintirBatteryCurrent", 0.0))))
-        hcu1.append(TimelineEntry(t, int(getattr(sp, "scintirHcu1Status", 0))))
-        hcu5.append(TimelineEntry(t, int(getattr(sp, "scintirHcu5Status", 0))))
+        # Legacy SOC / current / HCU fields were removed from the schema —
+        # keep the lists empty so downstream reports still work but don't
+        # claim data we no longer publish.
 
   events = _build_limiter_events(limiter_active, limiter_offset)
   hcu1_transitions = _transitions(hcu1)

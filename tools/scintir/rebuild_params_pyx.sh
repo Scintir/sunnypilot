@@ -106,14 +106,14 @@ ls -la common/params_pyx.so
 echo
 
 # --- smoke test ---
-echo "[+] import + write/read test for ScintirEVLimiterEnabled"
+echo "[+] import + write/read test for EVLimiterEnabled"
 if PYTHONPATH=. python3 -c "
 import sys
 from openpilot.common.params import Params
 p = Params()
-p.put_bool('ScintirEVLimiterEnabled', True)
-v = p.get_bool('ScintirEVLimiterEnabled')
-print('  ScintirEVLimiterEnabled =', v)
+p.put_bool('EVLimiterEnabled', True)
+v = p.get_bool('EVLimiterEnabled')
+print('  EVLimiterEnabled =', v)
 sys.exit(0 if v is True else 1)
 "; then
   echo
