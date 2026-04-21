@@ -23,7 +23,7 @@ import time
 
 from cereal import log
 import cereal.messaging as messaging
-from openpilot.common.params import Params
+from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.realtime import set_core_affinity
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.hardware.hw import Paths
@@ -140,14 +140,20 @@ def _rsync_route(source_dir: str, destination: str) -> bool:
 def _should_run(params: Params, sm: messaging.SubMaster) -> tuple[bool, str]:
   if not params.get_bool("IsOffroad"):
     return False, "onroad"
-  if not params.get_bool("ScintirRsyncEnabled"):
-    return False, "disabled"
-  if not params.get("ScintirRsyncDestination"):
-    return False, "no destination"
+  # Scintir keys aren't in the prebuilt params_pyx.so allowlist on release
+  # branches; a read of any Scintir* param raises UnknownKeyName. Trap that
+  # so the daemon stays dormant rather than crashing.
+  try:
+    if not params.get_bool("ScintirRsyncEnabled"):
+      return False, "disabled"
+    if not params.get("ScintirRsyncDestination"):
+      return False, "no destination"
+    wifi_only = params.get_bool("ScintirRsyncWifiOnly")
+  except UnknownKeyName:
+    return False, "scintir params not yet registered (rebuild params_pyx.so to enable)"
   if not os.path.exists(SSH_KEY_PATH):
     return False, "missing ssh key"
-  if params.get_bool("ScintirRsyncWifiOnly") and \
-     sm["deviceState"].networkType != NetworkType.wifi:
+  if wifi_only and sm["deviceState"].networkType != NetworkType.wifi:
     return False, "not on wifi"
   return True, ""
 

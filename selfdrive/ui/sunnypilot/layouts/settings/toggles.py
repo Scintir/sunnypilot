@@ -4,6 +4,7 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+from openpilot.common.params import UnknownKeyName
 from openpilot.selfdrive.ui.layouts.settings.toggles import TogglesLayout
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp, option_item_sp
@@ -14,6 +15,17 @@ class TogglesLayoutSP(TogglesLayout):
 
   def __init__(self):
     super().__init__()
+
+    # On release/staging branches the prebuilt params_pyx.so has a compiled-
+    # in allowlist of param keys. Scintir* keys added in params_keys.h won't
+    # exist in that allowlist until the .so is rebuilt, and every toggle/
+    # option widget below reads its param at construction — which would
+    # raise UnknownKeyName and break the whole Toggles panel. Preflight one
+    # Scintir key; if it isn't registered, skip adding the Scintir widgets.
+    try:
+      self._params.get_bool("ScintirEVLimiterEnabled")
+    except UnknownKeyName:
+      return
 
     self._scintir_rsync_toggle = toggle_item_sp(
       title=lambda: tr("Scintir: Upload CAN logs"),
