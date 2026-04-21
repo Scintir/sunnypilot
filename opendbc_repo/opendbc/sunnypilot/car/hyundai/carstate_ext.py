@@ -16,9 +16,17 @@ from opendbc.sunnypilot.car.hyundai.scintir_ev_limiter import get_shared_state a
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 
 
-# Module-global: only warn once per process if the expected Scintir research
-# signals are absent on a car that otherwise claims HYBRID support.
+# Module-global: only warn once per process if the expected Scintir v2
+# signals (TCS13 aBasis, CLU13 DTE) are absent on a HYBRID car.
 _SCINTIR_MISSING_WARNED = False
+
+# Approximate curb mass of a 2022 Santa Fe PHEV (kg). Used to turn
+# aBasis (m/s^2) + vEgo (m/s) into an estimated propulsion power (W):
+#   P ~= mass * max(0, aBasis) * vEgo
+# Off by O(10%) because it ignores grade and drag losses, but that's more
+# than precise enough for an "ICE-about-to-engage" threshold that the user
+# will tune by hand anyway.
+SCINTIR_VEHICLE_MASS_KG = 1950.0
 
 
 class CarStateExt:
@@ -84,39 +92,63 @@ class CarStateExt:
 
     ret_sp.speedLimit = self.update_speed_limit(cp, cp_cam) * speed_conv
 
-    self._update_scintir_ev_signals(ret_sp, cp)
+    self._update_scintir_ev_signals(ret, ret_sp, cp)
 
-  def _update_scintir_ev_signals(self, ret_sp: structs.CarStateSP, cp: CANParser) -> None:
-    """Parse raw EV/hybrid telemetry used by the Scintir EV power limiter.
+  def _update_scintir_ev_signals(self, ret: structs.CarState, ret_sp: structs.CarStateSP, cp: CANParser) -> None:
+    """Parse signals the Scintir EV power limiter uses.
 
-    Only meaningful for Hyundai classic-CAN HYBRID cars; on other platforms
-    the BAT11 / P_STS messages may be absent or interpreted differently, so
-    we gate on the HYBRID flag and silently skip if the DBC doesn't provide
-    these signals.
+    Only meaningful for Hyundai classic-CAN HYBRID cars. The original plan
+    gated on BAT11 / P_STS (battery current + HCU status) but off-device
+    log analysis on real drives showed those messages are not on any panda-
+    logged bus for the Santa Fe PHEV. The limiter has since pivoted to
+    aBasis (aggregated acceleration demand from TCS13 — includes driver AND
+    stock SCC) plus CLU13 DTE (cluster distance-to-empty) plus an estimated
+    propulsion power. We keep the legacy BAT11/P_STS field writes behind a
+    try/except so the capnp fields are populated with zeros on this car and
+    with real data on any future platform that does expose those messages.
     """
     if not (self.CP.flags & HyundaiFlags.HYBRID):
       return
+
+    # Legacy BAT11 / P_STS decode (absent on Santa Fe PHEV but kept for any
+    # future HYBRID platform whose DBC does carry these)
     try:
       ret_sp.scintirBatterySoc = cp.vl["BAT11"]["BAT_SOC"]
       ret_sp.scintirBatteryCurrent = cp.vl["BAT11"]["BAT_SNSR_I"]
       ret_sp.scintirHcu1Status = int(cp.vl["P_STS"]["HCU1_STS"])
       ret_sp.scintirHcu5Status = int(cp.vl["P_STS"]["HCU5_STS"])
-      # Expose on self so CarController (which doesn't receive ret_sp) can
-      # read the same values via CS.scintir_battery_soc / scintir_battery_current.
       self.scintir_battery_soc = float(ret_sp.scintirBatterySoc)
       self.scintir_battery_current = float(ret_sp.scintirBatteryCurrent)
-      # Publish last frame's limiter state (CarController writes _SHARED_STATE).
-      pub = _scintir_shared_state()
-      ret_sp.scintirEvLimiterActive = bool(pub["active"])
-      ret_sp.scintirEvLimiterSetSpeedOffset = float(pub["set_speed_offset"])
+    except KeyError:
+      # Expected on Santa Fe PHEV — these aren't on the logged buses. Silent.
+      pass
+
+    # v2 signals — aggregated demand + DTE proxy
+    try:
+      abasis = float(cp.vl["TCS13"]["aBasis"])
+      v_ego = float(ret.vEgo)
+      power_w = SCINTIR_VEHICLE_MASS_KG * max(0.0, abasis) * v_ego
+      ret_sp.scintirAccelDemand = abasis
+      ret_sp.scintirEstPowerW = power_w
+      self.scintir_accel_demand = abasis
+      self.scintir_est_power_w = power_w
     except KeyError as e:
       global _SCINTIR_MISSING_WARNED
       if not _SCINTIR_MISSING_WARNED:
-        print(
-          f"[scintir] HYBRID flag set but BAT11/P_STS not available from parser: {e}",
-          file=sys.stderr,
-        )
+        print(f"[scintir] TCS13 aBasis missing from parser: {e}", file=sys.stderr)
         _SCINTIR_MISSING_WARNED = True
+
+    try:
+      dte_raw = int(cp.vl["CLU13"]["CF_Clu_DTE"])
+      ret_sp.scintirDteRaw = dte_raw
+      self.scintir_dte_raw = dte_raw
+    except KeyError:
+      pass
+
+    # Publish last frame's limiter state (CarController writes _SHARED_STATE).
+    pub = _scintir_shared_state()
+    ret_sp.scintirEvLimiterActive = bool(pub["active"])
+    ret_sp.scintirEvLimiterSetSpeedOffset = float(pub["set_speed_offset"])
 
   def update_canfd_ext(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser],
                        speed_factor: float) -> None:

@@ -28,23 +28,24 @@ class TogglesLayoutSP(TogglesLayout):
     self._scintir_limiter_toggle = toggle_item_sp(
       title=lambda: tr("Scintir: EV Power Limiter"),
       description=tr(
-        "Reduce cruise set speed to keep the vehicle in EV mode while the battery "
-        "has charge. Commands are only sent while sunnypilot / MADS is engaged; "
-        "the driver always overrides via brake or accelerator pedal."
+        "Reduce cruise set speed when propulsion-power demand looks about to "
+        "trigger ICE engagement. Uses aBasis (aggregated driver+SCC accel) x "
+        "vEgo as the demand estimate. Commands are only sent while sunnypilot "
+        "/ MADS is engaged; the driver always overrides via brake or accelerator pedal."
       ),
       param="ScintirEVLimiterEnabled",
     )
 
-    self._scintir_power_threshold = option_item_sp(
-      title=tr("Scintir: EV Limiter power threshold (A)"),
-      param="ScintirEVLimiterPowerThreshold",
-      min_value=10, max_value=200, value_change_step=10, inline=True,
+    self._scintir_power_threshold_kw = option_item_sp(
+      title=tr("Scintir: EV Limiter power threshold (kW)"),
+      param="ScintirEVLimiterPowerThresholdKW",
+      min_value=5, max_value=60, value_change_step=1, inline=True,
     )
 
-    self._scintir_soc_floor = option_item_sp(
-      title=tr("Scintir: EV Limiter battery SOC floor (%)"),
-      param="ScintirEVLimiterSOCFloor",
-      min_value=5, max_value=50, value_change_step=5, inline=True,
+    self._scintir_dte_floor = option_item_sp(
+      title=tr("Scintir: EV Limiter DTE floor (cluster raw)"),
+      param="ScintirEVLimiterDTEFloor",
+      min_value=1, max_value=50, value_change_step=1, inline=True,
     )
 
     self._scintir_min_speed = option_item_sp(
@@ -56,8 +57,8 @@ class TogglesLayoutSP(TogglesLayout):
     for widget in (
       self._scintir_rsync_toggle,
       self._scintir_limiter_toggle,
-      self._scintir_power_threshold,
-      self._scintir_soc_floor,
+      self._scintir_power_threshold_kw,
+      self._scintir_dte_floor,
       self._scintir_min_speed,
     ):
       self._scroller.add_widget(widget)

@@ -7,19 +7,33 @@ See the LICENSE.md file in the root directory for more details.
 Scintir EV power limiter — classic-CAN Hyundai HYBRID, stock-long only.
 
 Decides whether to press CLU11 SET_DECEL or RES_ACCEL to bias the stock
-SCC set speed down when the vehicle looks about to leave EV mode, or back
+SCC set speed down when the vehicle's propulsion-power demand looks about
+to exceed the EV drivetrain's envelope (forcing ICE engagement), or back
 up toward the driver's last observed target when demand has eased.
 
-Engagement gates:
+Trigger signal: estimated propulsion power
+    P_est = mass * max(0, aBasis) * vEgo
+where aBasis (TCS13) is the AGGREGATED longitudinal-acceleration demand
+— it naturally sums driver pedal, stock SCC torque request, and any ESP
+overlay — so the limiter fires whenever the VEHICLE is asking for power,
+not just when the driver is pressing. Verified in 45 drives of real data
+that aBasis > 0 during SCC-commanded acceleration with no driver pedal
+(raw pedal signal is 0 in that case).
+
+Engagement gates (all must hold for active TX):
   * sunnypilot is engaged (CC.enabled — panda controls_allowed == True);
-  * driver has not touched accelerator, brake, or own cruise buttons for
-    DRIVER_OVERRIDE_BACKOFF_FRAMES;
-  * battery SOC above the configured floor;
+  * no driver pedal / own-cruise-button press for DRIVER_OVERRIDE_BACKOFF_FRAMES;
+  * cluster DTE above the configured floor (proxy for "battery has juice");
   * ego speed above the configured minimum.
 
 Driver always overrides via brake or accelerator pedal (stock SCC
 disengages on either); the limiter additionally backs off on any observed
 cruise-button press.
+
+Historical note: v1 of this limiter used BAT11 battery current + P_STS
+HCU status + SOC floor. Off-device analysis of 45 real routes showed
+those messages are not on any panda-logged bus on the Santa Fe PHEV, so
+v2 pivoted to aBasis + DTE, which are both on bus 0.
 """
 from opendbc.car.hyundai.values import Buttons, HyundaiFlags
 
@@ -34,7 +48,7 @@ except Exception:  # opendbc may run outside openpilot (tests, standalone)
 
 PRESS_COOLDOWN_FRAMES = 20             # 200 ms at 100 Hz between commanded presses
 PRESS_BURST_COPIES = 5                  # duplicate presses sent per commanded frame so SCC reliably sees it
-POWER_HYSTERESIS_A = 10.0               # stop limiting when current drops this far below threshold
+POWER_HYSTERESIS_W = 5000.0             # 5 kW — stop limiting once P_est drops this far below threshold
 DRIVER_OVERRIDE_BACKOFF_FRAMES = 300    # 3 s back off after driver pedal/button interaction
 STUCK_LOOP_MAX_FRAMES = 6000            # 60 s continuous active -> safety reset to IDLE
 
@@ -120,14 +134,15 @@ class ScintirEVLimiter:
 
     # Tunables (bounded at the UI level; read every frame so changes take
     # effect without restart)
-    power_threshold = float(self._read_int("ScintirEVLimiterPowerThreshold", 40))
-    soc_floor = float(self._read_int("ScintirEVLimiterSOCFloor", 25))
+    power_threshold_kw = float(self._read_int("ScintirEVLimiterPowerThresholdKW", 30))
+    power_threshold_w = power_threshold_kw * 1000.0
+    dte_floor = float(self._read_int("ScintirEVLimiterDTEFloor", 5))
     min_speed_setting = float(self._read_int("ScintirEVLimiterMinSpeed", 15))
 
-    # Inputs from CarState / CarControl
+    # Inputs from CarState / CarControl (v2: aBasis-derived power + DTE)
     cc_enabled = bool(CC.enabled)
-    battery_soc = float(getattr(CS, "scintir_battery_soc", 0.0))
-    battery_current = float(getattr(CS, "scintir_battery_current", 0.0))
+    est_power_w = float(getattr(CS, "scintir_est_power_w", 0.0))
+    dte_raw = float(getattr(CS, "scintir_dte_raw", 0.0))
     observed_set_speed = float(CS.out.cruiseState.speed)
     v_ego = float(CS.out.vEgo)
     is_metric = bool(getattr(CS, "is_metric", False))
@@ -164,7 +179,7 @@ class ScintirEVLimiter:
     gates_ok = (
       cc_enabled
       and not driver_active
-      and battery_soc > soc_floor
+      and dte_raw > dte_floor
       and v_ego >= min_speed_ms
     )
 
@@ -173,8 +188,8 @@ class ScintirEVLimiter:
       self.active_frames = 0
       return _publish_and_return(Buttons.NONE, False)
 
-    over = battery_current > power_threshold
-    under = battery_current < (power_threshold - POWER_HYSTERESIS_A)
+    over = est_power_w > power_threshold_w
+    under = est_power_w < (power_threshold_w - POWER_HYSTERESIS_W)
 
     can_press = (frame - self.last_press_frame) >= PRESS_COOLDOWN_FRAMES
     button = Buttons.NONE

@@ -262,9 +262,12 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ScintirRsyncWifiOnly", {PERSISTENT, BOOL, "1"}},
     {"ScintirKeepLocalRoutes", {PERSISTENT, INT, "10"}},
     {"ScintirEVLimiterEnabled", {PERSISTENT, BOOL, "1"}},
-    {"ScintirEVLimiterPowerThreshold", {PERSISTENT, INT, "100"}},
-    {"ScintirEVLimiterSOCFloor", {PERSISTENT, INT, "25"}},
+    {"ScintirEVLimiterPowerThreshold", {PERSISTENT, INT, "100"}},   // deprecated: amps-based threshold (BAT11 unavailable)
+    {"ScintirEVLimiterSOCFloor", {PERSISTENT, INT, "25"}},           // deprecated: SOC unavailable
     {"ScintirEVLimiterMinSpeed", {PERSISTENT, INT, "15"}},
+    // v2 (aBasis / DTE based) — these are the ones the limiter actually reads now
+    {"ScintirEVLimiterPowerThresholdKW", {PERSISTENT, INT, "30"}},
+    {"ScintirEVLimiterDTEFloor", {PERSISTENT, INT, "5"}},
 
     // Speed Limit
     {"SpeedLimitMode", {PERSISTENT | BACKUP, INT, "1"}},
