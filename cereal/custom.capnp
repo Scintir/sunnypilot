@@ -436,20 +436,12 @@ struct BackupManagerSP @0xf98d843bfd7004a3 {
 struct CarStateSP @0xb86e6369214c01c8 {
   speedLimit @0 :Float32;
 
-  # Scintir research (legacy — BAT11 / P_STS turned out to be absent on the
-  # Santa Fe PHEV's logged buses; fields retained so ordinals don't shift)
-  scintirBatterySoc @1 :Float32;                  # unused on Santa Fe PHEV
-  scintirBatteryCurrent @2 :Float32;              # unused on Santa Fe PHEV
-  scintirHcu1Status @3 :UInt8;                    # unused on Santa Fe PHEV
-  scintirHcu5Status @4 :UInt8;                    # unused on Santa Fe PHEV
-  scintirEvLimiterActive @5 :Bool;                # limiter is commanding a set-speed offset
-  scintirEvLimiterSetSpeedOffset @6 :Float32;     # user target minus effective set speed (mph/kph)
-
-  # Scintir v2 signals (pivoted 2026-04-20): real aggregated-demand proxies
-  # sourced from TCS13 / CLU13 that ARE on the logged PT bus.
-  scintirAccelDemand @7 :Float32;                 # TCS13.aBasis, m/s^2 (aggregated: driver + SCC + control)
-  scintirDteRaw @8 :UInt16;                       # CLU13.CF_Clu_DTE, 10-bit raw cluster DTE value
-  scintirEstPowerW @9 :Float32;                   # mass * max(0, aBasis) * vEgo, W -- proxy for propulsion power demand
+  # Scintir research signals
+  scintirEvLimiterActive @1 :Bool;                # limiter is commanding a set-speed offset
+  scintirEvLimiterSetSpeedOffset @2 :Float32;     # user target minus effective set speed (mph/kph)
+  scintirAccelDemand @3 :Float32;                 # TCS13.aBasis, m/s^2 (aggregated: driver + SCC + control overlay)
+  scintirDteRaw @4 :UInt16;                       # CLU13.CF_Clu_DTE, 10-bit raw cluster distance-to-empty
+  scintirEstPowerW @5 :Float32;                   # mass * max(0, aBasis) * vEgo, W -- propulsion power demand proxy
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

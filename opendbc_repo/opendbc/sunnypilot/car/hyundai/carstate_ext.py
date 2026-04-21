@@ -95,35 +95,18 @@ class CarStateExt:
     self._update_scintir_ev_signals(ret, ret_sp, cp)
 
   def _update_scintir_ev_signals(self, ret: structs.CarState, ret_sp: structs.CarStateSP, cp: CANParser) -> None:
-    """Parse signals the Scintir EV power limiter uses.
+    """Populate Scintir signals used by the EV power limiter.
 
-    Only meaningful for Hyundai classic-CAN HYBRID cars. The original plan
-    gated on BAT11 / P_STS (battery current + HCU status) but off-device
-    log analysis on real drives showed those messages are not on any panda-
-    logged bus for the Santa Fe PHEV. The limiter has since pivoted to
-    aBasis (aggregated acceleration demand from TCS13 — includes driver AND
-    stock SCC) plus CLU13 DTE (cluster distance-to-empty) plus an estimated
-    propulsion power. We keep the legacy BAT11/P_STS field writes behind a
-    try/except so the capnp fields are populated with zeros on this car and
-    with real data on any future platform that does expose those messages.
+    Trigger input is an estimated propulsion power computed from TCS13.aBasis
+    (aggregated longitudinal-accel demand — includes driver + stock SCC +
+    control overlay) times vEgo times an approximate vehicle mass. DTE comes
+    from the cluster (CLU13.CF_Clu_DTE) as a "battery has juice" proxy.
+
+    Gated on the HYBRID flag since the limiter itself is HYBRID-only.
     """
     if not (self.CP.flags & HyundaiFlags.HYBRID):
       return
 
-    # Legacy BAT11 / P_STS decode (absent on Santa Fe PHEV but kept for any
-    # future HYBRID platform whose DBC does carry these)
-    try:
-      ret_sp.scintirBatterySoc = cp.vl["BAT11"]["BAT_SOC"]
-      ret_sp.scintirBatteryCurrent = cp.vl["BAT11"]["BAT_SNSR_I"]
-      ret_sp.scintirHcu1Status = int(cp.vl["P_STS"]["HCU1_STS"])
-      ret_sp.scintirHcu5Status = int(cp.vl["P_STS"]["HCU5_STS"])
-      self.scintir_battery_soc = float(ret_sp.scintirBatterySoc)
-      self.scintir_battery_current = float(ret_sp.scintirBatteryCurrent)
-    except KeyError:
-      # Expected on Santa Fe PHEV — these aren't on the logged buses. Silent.
-      pass
-
-    # v2 signals — aggregated demand + DTE proxy
     try:
       abasis = float(cp.vl["TCS13"]["aBasis"])
       v_ego = float(ret.vEgo)
@@ -145,7 +128,6 @@ class CarStateExt:
     except KeyError:
       pass
 
-    # Publish last frame's limiter state (CarController writes _SHARED_STATE).
     pub = _scintir_shared_state()
     ret_sp.scintirEvLimiterActive = bool(pub["active"])
     ret_sp.scintirEvLimiterSetSpeedOffset = float(pub["set_speed_offset"])
