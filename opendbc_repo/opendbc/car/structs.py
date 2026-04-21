@@ -170,3 +170,13 @@ class CarControlSP:
 @auto_dataclass
 class CarStateSP:
   speedLimit: float = auto_field()
+
+  # Scintir research signals — kept in lockstep with cereal/custom.capnp
+  # CarStateSP ordinals. carstate writes them; UI / analyzer read them via
+  # the cereal-published message. If this dataclass doesn't declare them,
+  # writes from carstate silently fail to serialize.
+  scintirEvLimiterActive: bool = auto_field()
+  scintirEvLimiterSetSpeedOffset: float = auto_field()
+  scintirAccelDemand: float = auto_field()
+  scintirDteRaw: int = auto_field()
+  scintirEstPowerW: float = auto_field()
