@@ -20,10 +20,13 @@ from openpilot.system.ui.widgets import Widget
 FONT_SIZE = 40
 PAD_X = 18
 PAD_Y = 10
-# Top-right of the usable area; the set-speed MAX box is at top-left so this
-# should not collide. Tweak if overlaps appear on specific devices.
-MARGIN_X = 40
-MARGIN_Y = 220
+# Middle-upper right of the usable area. Avoids:
+#   - top-left MAX/set-speed circle (y ~ 0..162)
+#   - top-center current-speed text (y ~ 90..280)
+#   - side blind-spot indicators (y 100..228, x within 128 px of each edge)
+#   - bottom-left steering-wheel icon
+MARGIN_X = 60
+MARGIN_Y = 320
 
 
 class ScintirLimiterIndicator(Widget):
