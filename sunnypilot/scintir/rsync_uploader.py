@@ -189,11 +189,12 @@ def main(exit_event: threading.Event | None = None) -> None:
         break
 
     # After repeated failures (bad key/host/destination) back off hard so we
-    # don't thrash the logs and wake-ups. Recovers on the next successful run.
+    # don't thrash the logs and wake-ups. The counter only resets on a
+    # successful rsync above -- that way a permanently misconfigured setup
+    # stays in long-sleep mode instead of cycling through short-sleep bursts.
     if consecutive_failures >= FAILURE_BACKOFF_THRESHOLD:
       cloudlog.warning("scintir_rsync: %d consecutive failures, backing off", consecutive_failures)
       time.sleep(IDLE_POLL_S * FAILURE_BACKOFF_MULT)
-      consecutive_failures = 0
     else:
       time.sleep(IDLE_POLL_S)
 

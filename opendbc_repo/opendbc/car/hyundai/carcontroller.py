@@ -137,9 +137,9 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       # Defensive second gate: never TX our button on the same frame the
       # driver is holding a cruise button, regardless of what the limiter
       # state machine decided (covers parser-vs-controller timing lag).
-      driver_on_cruise_button = (
-        len(CS.cruise_buttons) > 0
-        and CS.cruise_buttons[-1] in (Buttons.RES_ACCEL, Buttons.SET_DECEL, Buttons.CANCEL)
+      driver_on_cruise_button = any(
+        b in (Buttons.RES_ACCEL, Buttons.SET_DECEL, Buttons.CANCEL)
+        for b in CS.cruise_buttons
       )
       if scintir_button != Buttons.NONE and not driver_on_cruise_button:
         can_sends.extend(
