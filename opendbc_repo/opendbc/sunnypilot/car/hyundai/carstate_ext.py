@@ -16,17 +16,16 @@ from opendbc.sunnypilot.car.hyundai.scintir_ev_limiter import get_shared_state a
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 
 
-# Module-global: only warn once per process if the expected Scintir v2
+# Module-global: only warn once per process if the expected EV-limiter
 # signals (TCS13 aBasis, CLU13 DTE) are absent on a HYBRID car.
-_SCINTIR_MISSING_WARNED = False
+_EV_SIGNALS_MISSING_WARNED = False
 
 # Approximate curb mass of a 2022 Santa Fe PHEV (kg). Used to turn
 # aBasis (m/s^2) + vEgo (m/s) into an estimated propulsion power (W):
 #   P ~= mass * max(0, aBasis) * vEgo
-# Off by O(10%) because it ignores grade and drag losses, but that's more
-# than precise enough for an "ICE-about-to-engage" threshold that the user
-# will tune by hand anyway.
-SCINTIR_VEHICLE_MASS_KG = 1950.0
+# Off by O(10%) because it ignores grade and drag losses, but precise
+# enough for an "ICE-about-to-engage" threshold the user tunes by hand.
+VEHICLE_MASS_KG = 1950.0
 
 
 class CarStateExt:
@@ -95,7 +94,7 @@ class CarStateExt:
     self._update_scintir_ev_signals(ret, ret_sp, cp)
 
   def _update_scintir_ev_signals(self, ret: structs.CarState, ret_sp: structs.CarStateSP, cp: CANParser) -> None:
-    """Populate Scintir signals used by the EV power limiter.
+    """Populate EV-limiter signals.
 
     Trigger input is an estimated propulsion power computed from TCS13.aBasis
     (aggregated longitudinal-accel demand — includes driver + stock SCC +
@@ -110,27 +109,27 @@ class CarStateExt:
     try:
       abasis = float(cp.vl["TCS13"]["aBasis"])
       v_ego = float(ret.vEgo)
-      power_w = SCINTIR_VEHICLE_MASS_KG * max(0.0, abasis) * v_ego
-      ret_sp.scintirAccelDemand = abasis
-      ret_sp.scintirEstPowerW = power_w
-      self.scintir_accel_demand = abasis
-      self.scintir_est_power_w = power_w
+      power_w = VEHICLE_MASS_KG * max(0.0, abasis) * v_ego
+      ret_sp.accelDemand = abasis
+      ret_sp.estPowerW = power_w
+      self.accel_demand = abasis
+      self.est_power_w = power_w
     except KeyError as e:
-      global _SCINTIR_MISSING_WARNED
-      if not _SCINTIR_MISSING_WARNED:
-        print(f"[scintir] TCS13 aBasis missing from parser: {e}", file=sys.stderr)
-        _SCINTIR_MISSING_WARNED = True
+      global _EV_SIGNALS_MISSING_WARNED
+      if not _EV_SIGNALS_MISSING_WARNED:
+        print(f"[ev_limiter] TCS13 aBasis missing from parser: {e}", file=sys.stderr)
+        _EV_SIGNALS_MISSING_WARNED = True
 
     try:
       dte_raw = int(cp.vl["CLU13"]["CF_Clu_DTE"])
-      ret_sp.scintirDteRaw = dte_raw
-      self.scintir_dte_raw = dte_raw
+      ret_sp.dteRaw = dte_raw
+      self.dte_raw = dte_raw
     except KeyError:
       pass
 
     pub = _scintir_shared_state()
-    ret_sp.scintirEvLimiterActive = bool(pub["active"])
-    ret_sp.scintirEvLimiterSetSpeedOffset = float(pub["set_speed_offset"])
+    ret_sp.evLimiterActive = bool(pub["active"])
+    ret_sp.evLimiterSetSpeedOffset = float(pub["set_speed_offset"])
 
   def update_canfd_ext(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser],
                        speed_factor: float) -> None:

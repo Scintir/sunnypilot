@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Scintir CAN log rsync uploader.
 
-When offroad and `ScintirRsyncEnabled` is set, this daemon copies completed
+When offroad and `LogUploadEnabled` is set, this daemon copies completed
 route directories from the device to a user-managed server via rsync over
 SSH. Routes are marked with a `user.scintir.uploaded` xattr so they are not
 re-uploaded on subsequent passes. The daemon only runs offroad, so it never
 competes with onroad processing.
 
 Params used:
-  ScintirRsyncEnabled      bool  master switch
-  ScintirRsyncDestination  str   rsync destination, e.g. "user@host:/data/"
-  ScintirRsyncWifiOnly     bool  skip if not on WiFi (default on)
+  LogUploadEnabled      bool  master switch
+  LogUploadDestination  str   rsync destination, e.g. "user@host:/data/"
+  LogUploadWifiOnly     bool  skip if not on WiFi (default on)
 
 SSH key path (user provisions once, device-local):
   /data/scintir/id_ed25519
@@ -144,11 +144,11 @@ def _should_run(params: Params, sm: messaging.SubMaster) -> tuple[bool, str]:
   # branches; a read of any Scintir* param raises UnknownKeyName. Trap that
   # so the daemon stays dormant rather than crashing.
   try:
-    if not params.get_bool("ScintirRsyncEnabled"):
+    if not params.get_bool("LogUploadEnabled"):
       return False, "disabled"
-    if not params.get("ScintirRsyncDestination"):
+    if not params.get("LogUploadDestination"):
       return False, "no destination"
-    wifi_only = params.get_bool("ScintirRsyncWifiOnly")
+    wifi_only = params.get_bool("LogUploadWifiOnly")
   except UnknownKeyName:
     return False, "scintir params not yet registered (rebuild params_pyx.so to enable)"
   if not os.path.exists(SSH_KEY_PATH):
@@ -181,7 +181,7 @@ def main(exit_event: threading.Event | None = None) -> None:
       time.sleep(IDLE_POLL_S)
       continue
 
-    destination = params.get("ScintirRsyncDestination")
+    destination = params.get("LogUploadDestination")
     for route_path in _iter_pending_routes(root):
       if exit_event.is_set():
         break

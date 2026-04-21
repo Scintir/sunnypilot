@@ -256,15 +256,15 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"RoadName", {CLEAR_ON_ONROAD_TRANSITION, STRING}},
     {"RoadNameToggle", {PERSISTENT | BACKUP, BOOL, "0"}},
 
-    // --- Scintir research params (local to device, not backed up / not synced) ---
-    {"ScintirRsyncEnabled", {PERSISTENT, BOOL, "1"}},
-    {"ScintirRsyncDestination", {PERSISTENT, STRING, ""}},
-    {"ScintirRsyncWifiOnly", {PERSISTENT, BOOL, "1"}},
-    {"ScintirKeepLocalRoutes", {PERSISTENT, INT, "10"}},
-    {"ScintirEVLimiterEnabled", {PERSISTENT, BOOL, "1"}},
-    {"ScintirEVLimiterPowerThresholdKW", {PERSISTENT, INT, "40"}},
-    {"ScintirEVLimiterDTEFloor", {PERSISTENT, INT, "5"}},
-    {"ScintirEVLimiterMinSpeed", {PERSISTENT, INT, "15"}},
+    // --- EV limiter + log upload (Scintir project, local to device) ---
+    {"LogUploadEnabled", {PERSISTENT, BOOL, "1"}},
+    {"LogUploadDestination", {PERSISTENT, STRING, ""}},
+    {"LogUploadWifiOnly", {PERSISTENT, BOOL, "1"}},
+    {"LogKeepLocalRoutes", {PERSISTENT, INT, "10"}},
+    {"EVLimiterEnabled", {PERSISTENT, BOOL, "1"}},
+    {"EVLimiterPowerThresholdKW", {PERSISTENT, INT, "40"}},
+    {"EVLimiterDTEFloor", {PERSISTENT, INT, "5"}},
+    {"EVLimiterMaxGapMph", {PERSISTENT, INT, "5"}},
 
     // Speed Limit
     {"SpeedLimitMode", {PERSISTENT | BACKUP, INT, "1"}},

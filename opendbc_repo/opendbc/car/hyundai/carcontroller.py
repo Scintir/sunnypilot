@@ -130,20 +130,18 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     # Intelligent Cruise Button Management
     can_sends.extend(IntelligentCruiseButtonManagementInterface.update(self, CS, CC_SP, self.packer, self.frame, self.last_button_frame, self.CAN))
 
-    # Scintir EV power limiter (classic-CAN HYBRID stock-long only; limiter
-    # internally no-ops on any other fingerprint).
+    # EV power limiter (classic-CAN HYBRID stock-long only; limiter
+    # internally no-ops on any other fingerprint). The limiter now handles
+    # driver button presses internally (background user_target adjustment
+    # with echo filtering) so we do NOT veto based on cruise_buttons here —
+    # that would suppress legitimate limiter TX every time the driver is
+    # adjusting the user target.
     if not self.CP.flags & HyundaiFlags.CANFD:
-      scintir_button, _ = self.scintir_limiter.update(CC, CS, self.frame)
-      # Defensive second gate: never TX our button on the same frame the
-      # driver is holding a cruise button, regardless of what the limiter
-      # state machine decided (covers parser-vs-controller timing lag).
-      driver_on_cruise_button = any(
-        b in (Buttons.RES_ACCEL, Buttons.SET_DECEL, Buttons.CANCEL)
-        for b in CS.cruise_buttons
-      )
-      if scintir_button != Buttons.NONE and not driver_on_cruise_button:
+      ev_button, _ = self.scintir_limiter.update(CC, CS, self.frame)
+      if ev_button != Buttons.NONE:
+        burst = self.scintir_limiter.current_burst_count
         can_sends.extend(
-          [hyundaican.create_clu11(self.packer, self.frame, CS.clu11, scintir_button, self.CP)] * PRESS_BURST_COPIES
+          [hyundaican.create_clu11(self.packer, self.frame, CS.clu11, ev_button, self.CP)] * burst
         )
 
     new_actuators = actuators.as_builder()

@@ -436,12 +436,12 @@ struct BackupManagerSP @0xf98d843bfd7004a3 {
 struct CarStateSP @0xb86e6369214c01c8 {
   speedLimit @0 :Float32;
 
-  # Scintir research signals
-  scintirEvLimiterActive @1 :Bool;                # limiter is commanding a set-speed offset
-  scintirEvLimiterSetSpeedOffset @2 :Float32;     # user target minus effective set speed, m/s (UI converts to mph/kph)
-  scintirAccelDemand @3 :Float32;                 # TCS13.aBasis, m/s^2 (aggregated: driver + SCC + control overlay)
-  scintirDteRaw @4 :UInt16;                       # CLU13.CF_Clu_DTE, 10-bit raw cluster distance-to-empty
-  scintirEstPowerW @5 :Float32;                   # mass * max(0, aBasis) * vEgo, W -- propulsion power demand proxy
+  # EV power limiter signals (Scintir project — Hyundai Santa Fe PHEV)
+  evLimiterActive @1 :Bool;                       # limiter is commanding a set-speed offset
+  evLimiterSetSpeedOffset @2 :Float32;            # user target minus effective set speed, m/s (UI converts to mph/kph)
+  accelDemand @3 :Float32;                        # TCS13.aBasis, m/s^2 (aggregated: driver + SCC + control overlay)
+  dteRaw @4 :UInt16;                              # CLU13.CF_Clu_DTE, 10-bit raw cluster distance-to-empty
+  estPowerW @5 :Float32;                          # mass * max(0, aBasis) * vEgo, W -- propulsion power demand proxy
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

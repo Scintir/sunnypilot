@@ -100,8 +100,8 @@ def analyze_route(route_dir: Path) -> dict:
         set_speed.append(TimelineEntry(t, float(cs.cruiseState.speed)))
       elif typ == "carStateSP":
         sp = msg.carStateSP
-        limiter_active.append(TimelineEntry(t, bool(getattr(sp, "scintirEvLimiterActive", False))))
-        limiter_offset.append(TimelineEntry(t, float(getattr(sp, "scintirEvLimiterSetSpeedOffset", 0.0))))
+        limiter_active.append(TimelineEntry(t, bool(getattr(sp, "evLimiterActive", False))))
+        limiter_offset.append(TimelineEntry(t, float(getattr(sp, "evLimiterSetSpeedOffset", 0.0))))
         soc.append(TimelineEntry(t, float(getattr(sp, "scintirBatterySoc", 0.0))))
         current.append(TimelineEntry(t, float(getattr(sp, "scintirBatteryCurrent", 0.0))))
         hcu1.append(TimelineEntry(t, int(getattr(sp, "scintirHcu1Status", 0))))

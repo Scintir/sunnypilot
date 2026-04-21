@@ -3,6 +3,7 @@ from cereal import log
 from openpilot.common.params import UnknownKeyName
 from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.mici.widgets.button import BigParamControl, BigMultiParamToggle
+from openpilot.selfdrive.ui.sunnypilot.mici.widgets.cycling_int_button import CyclingIntButton
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.selfdrive.ui.layouts.settings.common import restart_needed_callback
 from openpilot.selfdrive.ui.ui_state import ui_state
@@ -45,21 +46,43 @@ class TogglesLayoutMici(NavScroller):
       ("OpenpilotEnabledToggle", enable_openpilot),
     )
 
-    # Scintir research — only rendered if params_pyx.so has been rebuilt to
-    # know about the Scintir* keys. On a stock prebuilt release library the
-    # probe raises UnknownKeyName and we simply skip the widgets so the rest
-    # of the Toggles panel keeps working.
+    # EV limiter + log upload — only rendered if params_pyx.so has been
+    # rebuilt to know about our custom keys. On a stock prebuilt library
+    # the probe raises UnknownKeyName and we skip the widgets cleanly so
+    # the rest of the Toggles panel keeps working.
     try:
-      ui_state.params.get_bool("ScintirEVLimiterEnabled")
-      scintir_rsync = BigParamControl("scintir: upload can logs", "ScintirRsyncEnabled")
-      scintir_limiter = BigParamControl("scintir: ev power limiter", "ScintirEVLimiterEnabled")
-      self._scroller.add_widgets([scintir_rsync, scintir_limiter])
-      self._refresh_toggles = self._refresh_toggles + (
-        ("ScintirRsyncEnabled", scintir_rsync),
-        ("ScintirEVLimiterEnabled", scintir_limiter),
+      ui_state.params.get_bool("EVLimiterEnabled")
+      log_upload = BigParamControl("upload CAN logs", "LogUploadEnabled")
+      ev_limiter = BigParamControl("EV power limiter", "EVLimiterEnabled")
+      ev_power_thr = CyclingIntButton(
+        "EV limiter power threshold",
+        "EVLimiterPowerThresholdKW",
+        values=[20, 30, 40, 50, 60],
+        suffix=" kW",
+        default=40,
       )
+      ev_dte_floor = CyclingIntButton(
+        "EV limiter DTE floor",
+        "EVLimiterDTEFloor",
+        values=[1, 3, 5, 10, 20, 50],
+        suffix="",
+        default=5,
+      )
+      ev_max_gap = CyclingIntButton(
+        "EV limiter max gap",
+        "EVLimiterMaxGapMph",
+        values=[3, 5, 7, 10, 15],
+        suffix=" mph",
+        default=5,
+      )
+      self._scroller.add_widgets([log_upload, ev_limiter, ev_power_thr, ev_dte_floor, ev_max_gap])
+      self._refresh_toggles = self._refresh_toggles + (
+        ("LogUploadEnabled", log_upload),
+        ("EVLimiterEnabled", ev_limiter),
+      )
+      self._cycling_refresh = (ev_power_thr, ev_dte_floor, ev_max_gap)
     except UnknownKeyName:
-      pass
+      self._cycling_refresh = ()
 
     enable_openpilot.set_enabled(lambda: not ui_state.engaged)
     record_front.set_enabled(False if ui_state.params.get_bool("RecordFrontLock") else (lambda: not ui_state.engaged))
@@ -102,3 +125,7 @@ class TogglesLayoutMici(NavScroller):
     # Refresh toggles from params to mirror external changes
     for key, item in self._refresh_toggles:
       item.set_checked(ui_state.params.get_bool(key))
+
+    # Refresh cycling-int displays (EV limiter tunables set via SSH etc.)
+    for btn in getattr(self, "_cycling_refresh", ()):
+      btn._refresh_display()

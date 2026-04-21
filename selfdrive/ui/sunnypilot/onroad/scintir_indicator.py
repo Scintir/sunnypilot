@@ -41,12 +41,12 @@ class ScintirLimiterIndicator(Widget):
     except Exception:
       return
 
-    active = bool(getattr(cs_sp, "scintirEvLimiterActive", False))
+    active = bool(getattr(cs_sp, "evLimiterActive", False))
     if not active:
       return
 
-    # scintirEvLimiterSetSpeedOffset is in m/s (carstate units); convert here.
-    offset_ms = float(getattr(cs_sp, "scintirEvLimiterSetSpeedOffset", 0.0))
+    # evLimiterSetSpeedOffset is in m/s (carstate units); convert here.
+    offset_ms = float(getattr(cs_sp, "evLimiterSetSpeedOffset", 0.0))
     if ui_state.is_metric:
       offset_display = offset_ms * 3.6          # m/s -> kph
       unit = "kph"

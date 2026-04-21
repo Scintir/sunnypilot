@@ -102,16 +102,16 @@ def uploader_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
 
 def scintir_rsync_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
   # On release/staging branches the prebuilt params_pyx.so has a compiled-in
-  # allowlist of param keys that doesn't know about Scintir* yet; reading an
-  # unregistered key raises UnknownKeyName and would crash the manager on
-  # boot. Trap it here so the daemon simply stays dormant until the .so is
-  # rebuilt (see TogglesLayoutSP, rsync_uploader._should_run — same guard).
+  # allowlist of param keys that doesn't know about our custom keys yet;
+  # reading an unregistered key raises UnknownKeyName and would crash the
+  # manager on boot. Trap it here so the daemon simply stays dormant until
+  # the .so is rebuilt.
   if started:
     return False
   try:
-    if not params.get_bool("ScintirRsyncEnabled"):
+    if not params.get_bool("LogUploadEnabled"):
       return False
-    if not params.get("ScintirRsyncDestination"):
+    if not params.get("LogUploadDestination"):
       return False
   except UnknownKeyName:
     return False
