@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scintir off-device route analyzer.
+"""Off-device route analyzer for the EV limiter log uploader.
 
 Reads every rlog.zst in a route directory, produces:
 
@@ -7,12 +7,12 @@ Reads every rlog.zst in a route directory, produces:
   report.json -- machine-readable inventory + event timelines
 
 Intended to be run on an operator's workstation against routes that the
-Comma 4's Scintir rsync uploader has pushed to the user's server. Depends on
+on-device log uploader has pushed to the user's server. Depends on
 openpilot.tools.lib.logreader, so run it from a sunnypilot / openpilot
 checkout:
 
   cd /path/to/sunnypilot
-  python3 tools/scintir/analyze_route.py /path/to/route_dir
+  python3 tools/log_uploader/analyze_route.py /path/to/route_dir
 """
 
 from __future__ import annotations
@@ -235,7 +235,7 @@ def write_reports(report: dict, route_dir: Path, write_md: bool = True) -> tuple
     return json_path, None
 
   lines: list = []
-  lines.append(f"# Scintir route report: `{Path(report['route']).name}`")
+  lines.append(f"# Route report: `{Path(report['route']).name}`")
   lines.append("")
   lines.append(f"- Segments: **{report['segments']}**")
   lines.append(f"- Duration: **{report['duration_s']} s**")
@@ -290,7 +290,7 @@ def write_reports(report: dict, route_dir: Path, write_md: bool = True) -> tuple
 
 
 def main() -> int:
-  ap = argparse.ArgumentParser(description="Analyze a Scintir-uploaded route")
+  ap = argparse.ArgumentParser(description="Analyze an uploaded route")
   ap.add_argument("route_dir", type=Path, help="Path to route directory")
   ap.add_argument("--json-only", action="store_true", help="Only write report.json")
   args = ap.parse_args()

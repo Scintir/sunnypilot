@@ -2,7 +2,7 @@
 #
 # Rebuild common/params_pyx.so on a Comma 4 (or any AGNOS / tici / mici)
 # device so the compiled params allowlist picks up new keys added to
-# common/params_keys.h (e.g. the Scintir* keys).
+# common/params_keys.h (e.g. new EV-limiter keys).
 #
 # Why this exists: sunnypilot release/staging branches ship prebuilt
 # binaries (the `prebuilt` sentinel is committed) and strip SConstruct out
@@ -12,7 +12,7 @@
 #
 # Usage (on the device, after SSH):
 #   cd /data/openpilot
-#   bash tools/scintir/rebuild_params_pyx.sh
+#   bash tools/log_uploader/rebuild_params_pyx.sh
 #   sudo reboot
 #
 # Safe to run multiple times. Old .so is backed up to

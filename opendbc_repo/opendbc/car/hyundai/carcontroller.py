@@ -13,7 +13,7 @@ from opendbc.sunnypilot.car.hyundai.icbm import IntelligentCruiseButtonManagemen
 from opendbc.sunnypilot.car.hyundai.longitudinal.controller import LongitudinalController
 from opendbc.sunnypilot.car.hyundai.lead_data_ext import LeadDataCarController
 from opendbc.sunnypilot.car.hyundai.mads import MadsCarController
-from opendbc.sunnypilot.car.hyundai.scintir_ev_limiter import ScintirEVLimiter, PRESS_BURST_COPIES
+from opendbc.sunnypilot.car.hyundai.ev_limiter import EVLimiter
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 LongCtrlState = structs.CarControl.Actuators.LongControlState
@@ -62,7 +62,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     self.params = CarControllerParams(CP)
     self.packer = CANPacker(dbc_names[Bus.pt])
     self.angle_limit_counter = 0
-    self.scintir_limiter = ScintirEVLimiter(CP, CP_SP)
+    self.ev_limiter = EVLimiter(CP, CP_SP)
 
     self.accel_last = 0
     self.apply_torque_last = 0
@@ -131,15 +131,15 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     can_sends.extend(IntelligentCruiseButtonManagementInterface.update(self, CS, CC_SP, self.packer, self.frame, self.last_button_frame, self.CAN))
 
     # EV power limiter (classic-CAN HYBRID stock-long only; limiter
-    # internally no-ops on any other fingerprint). The limiter now handles
+    # internally no-ops on any other fingerprint). The limiter handles
     # driver button presses internally (background user_target adjustment
     # with echo filtering) so we do NOT veto based on cruise_buttons here —
     # that would suppress legitimate limiter TX every time the driver is
     # adjusting the user target.
     if not self.CP.flags & HyundaiFlags.CANFD:
-      ev_button, _ = self.scintir_limiter.update(CC, CS, self.frame)
+      ev_button, _ = self.ev_limiter.update(CC, CS, self.frame)
       if ev_button != Buttons.NONE:
-        burst = self.scintir_limiter.current_burst_count
+        burst = self.ev_limiter.current_burst_count
         can_sends.extend(
           [hyundaican.create_clu11(self.packer, self.frame, CS.clu11, ev_button, self.CP)] * burst
         )

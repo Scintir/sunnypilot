@@ -4,7 +4,7 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-Onroad overlay for the Scintir EV power limiter. Two lines:
+Onroad overlay for the EV power limiter. Two lines:
   EV LIMIT  -N mph        (only while the limiter is actively biasing set speed)
   TARGET: NN mph          (whenever the driver has a non-zero stored target)
 
@@ -35,7 +35,7 @@ MARGIN_X = 60
 MARGIN_Y = 320
 
 
-class ScintirLimiterIndicator(Widget):
+class EVLimiterIndicator(Widget):
   def __init__(self):
     super().__init__()
     self._font = gui_app.font(FontWeight.BOLD)

@@ -32,7 +32,7 @@ class TogglesLayoutSP(TogglesLayout):
       description=tr(
         "Rsync completed route logs to your server while offroad and on WiFi. "
         "Set LogUploadDestination via SSH (e.g. user@host:/path/) and place "
-        "your SSH private key at /data/scintir/id_ed25519."
+        "your SSH private key at /data/log_uploader/id_ed25519."
       ),
       param="LogUploadEnabled",
     )

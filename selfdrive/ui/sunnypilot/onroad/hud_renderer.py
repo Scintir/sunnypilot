@@ -15,7 +15,7 @@ from openpilot.selfdrive.ui.sunnypilot.onroad.speed_limit import SpeedLimitRende
 from openpilot.selfdrive.ui.sunnypilot.onroad.smart_cruise_control import SmartCruiseControlRenderer
 from openpilot.selfdrive.ui.sunnypilot.onroad.turn_signal import TurnSignalController
 from openpilot.selfdrive.ui.sunnypilot.onroad.circular_alerts import CircularAlertsRenderer
-from openpilot.selfdrive.ui.sunnypilot.onroad.scintir_indicator import ScintirLimiterIndicator
+from openpilot.selfdrive.ui.sunnypilot.onroad.ev_limiter_indicator import EVLimiterIndicator
 from openpilot.selfdrive.ui.sunnypilot.onroad.speed_renderer import SpeedRenderer
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.selfdrive.ui.onroad.hud_renderer import HudRenderer, UI_CONFIG, FONT_SIZES, COLORS, CRUISE_DISABLED_CHAR
@@ -36,7 +36,7 @@ class HudRendererSP(HudRenderer):
     self.smart_cruise_control_renderer = SmartCruiseControlRenderer()
     self.turn_signal_controller = TurnSignalController()
     self.circular_alerts_renderer = CircularAlertsRenderer()
-    self.scintir_indicator = ScintirLimiterIndicator()
+    self.ev_limiter_indicator = EVLimiterIndicator()
     self.speed_renderer = SpeedRenderer()
     self._torque_bar = TorqueBar(scale=3.0, always=True)
 
@@ -145,5 +145,5 @@ class HudRendererSP(HudRenderer):
     self.smart_cruise_control_renderer.render(rect)
     self.turn_signal_controller.render(rect)
     self.circular_alerts_renderer.render(rect)
-    self.scintir_indicator.render(rect)
+    self.ev_limiter_indicator.render(rect)
     self.rocket_fuel.render(rect, ui_state.sm)

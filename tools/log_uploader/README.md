@@ -1,7 +1,7 @@
-# Scintir off-device analysis tools
+# Off-device log-analysis tools
 
 Run these on your workstation (**not** on the Comma 4) against routes that the
-device's Scintir rsync uploader has pushed to your server. They consume
+device's log uploader has pushed to your server. They consume
 `rlog.zst` segments and produce a human-readable drive report plus a
 machine-readable JSON inventory.
 
@@ -10,18 +10,18 @@ machine-readable JSON inventory.
 - A checkout of this repo with its Python deps installed (for
   `openpilot.tools.lib.logreader`).
 - Passwordless SSH to the server hosting the uploaded routes.
-- The environment variable `SCINTIR_REMOTE` pointing at the remote path the
-  Comma 4 is rsyncing into — e.g. `user@host:/srv/scintir/`.
+- The environment variable `LOG_UPLOAD_REMOTE` pointing at the remote path the
+  Comma 4 is rsyncing into — e.g. `user@host:/srv/logs/`.
 
 ## Typical workflow after a drive
 
 ```bash
 # 1. pull the latest route from the server
-SCINTIR_REMOTE=user@host:/srv/scintir/ \
-  ./tools/scintir/fetch_route.sh 2026-04-20--14-00-00--abc123 ~/scintir_routes
+LOG_UPLOAD_REMOTE=user@host:/srv/logs/ \
+  ./tools/log_uploader/fetch_route.sh 2026-04-20--14-00-00--abc123 ~/log_routes
 
 # 2. analyze it locally
-python3 tools/scintir/analyze_route.py ~/scintir_routes/2026-04-20--14-00-00--abc123
+python3 tools/log_uploader/analyze_route.py ~/log_routes/2026-04-20--14-00-00--abc123
 
 # 3. read the report and hand it to Claude in this container, narrate the drive
 #    ("merged onto highway around 12min, heard ICE kick in around 18min"),

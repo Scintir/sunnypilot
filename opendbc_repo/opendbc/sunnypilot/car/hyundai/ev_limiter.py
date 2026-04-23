@@ -128,7 +128,7 @@ def get_shared_state() -> dict:
   return _SHARED_STATE
 
 
-class ScintirEVLimiter:
+class EVLimiter:
   def __init__(self, CP, CP_SP):
     self.CP = CP
     self.CP_SP = CP_SP

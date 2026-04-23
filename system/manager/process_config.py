@@ -100,7 +100,7 @@ def uploader_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
 
   return always_run(started, params, CP)
 
-def scintir_rsync_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
+def log_uploader_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
   # On release/staging branches the prebuilt params_pyx.so has a compiled-in
   # allowlist of param keys that doesn't know about our custom keys yet;
   # reading an unregistered key raises UnknownKeyName and would crash the
@@ -200,9 +200,9 @@ procs += [
   NativeProcess("locationd_llk", "sunnypilot/selfdrive/locationd", ["./locationd"], only_onroad),
 ]
 
-# Scintir research
+# CAN log uploader (offroad rsync to user-managed server)
 procs += [
-  PythonProcess("scintir_rsync_uploader", "sunnypilot.scintir.rsync_uploader", scintir_rsync_ready),
+  PythonProcess("log_uploader", "sunnypilot.log_uploader.rsync_uploader", log_uploader_ready),
 ]
 
 if os.path.exists("./github_runner.sh"):

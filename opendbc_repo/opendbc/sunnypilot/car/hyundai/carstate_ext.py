@@ -12,7 +12,7 @@ import sys
 from opendbc.car import Bus, structs
 from opendbc.can.parser import CANParser
 from opendbc.car.hyundai.values import HyundaiFlags
-from opendbc.sunnypilot.car.hyundai.scintir_ev_limiter import get_shared_state as _scintir_shared_state
+from opendbc.sunnypilot.car.hyundai.ev_limiter import get_shared_state as _ev_limiter_shared_state
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 
 
@@ -91,9 +91,9 @@ class CarStateExt:
 
     ret_sp.speedLimit = self.update_speed_limit(cp, cp_cam) * speed_conv
 
-    self._update_scintir_ev_signals(ret, ret_sp, cp)
+    self._update_ev_limiter_signals(ret, ret_sp, cp)
 
-  def _update_scintir_ev_signals(self, ret: structs.CarState, ret_sp: structs.CarStateSP, cp: CANParser) -> None:
+  def _update_ev_limiter_signals(self, ret: structs.CarState, ret_sp: structs.CarStateSP, cp: CANParser) -> None:
     """Populate EV-limiter signals.
 
     Trigger input is an estimated propulsion power computed from TCS13.aBasis
@@ -127,7 +127,7 @@ class CarStateExt:
     except KeyError:
       pass
 
-    pub = _scintir_shared_state()
+    pub = _ev_limiter_shared_state()
     ret_sp.evLimiterActive = bool(pub["active"])
     ret_sp.evLimiterSetSpeedOffset = float(pub["set_speed_offset"])
     ret_sp.evLimiterUserTargetSpeed = float(pub.get("user_target", 0.0))
