@@ -48,41 +48,50 @@ class TogglesLayoutMici(NavScroller):
 
     # EV limiter + log upload — only rendered if params_pyx.so has been
     # rebuilt to know about our custom keys. On a stock prebuilt library
-    # the probe raises UnknownKeyName and we skip the widgets cleanly so
-    # the rest of the Toggles panel keeps working.
+    # any probe raises UnknownKeyName, and any OTHER exception (stale
+    # .so, corrupted widget, missing upstream dep) should ALSO not wipe
+    # out the Toggles panel. Catch broadly and keep going — user can
+    # still reach experimental/metric/record/etc.
+    self._cycling_refresh = ()
     try:
       ui_state.params.get_bool("EVLimiterEnabled")
-      log_upload = BigParamControl("upload CAN logs", "LogUploadEnabled")
-      ev_limiter = BigParamControl("EV power limiter", "EVLimiterEnabled")
-      ev_power_thr = CyclingIntButton(
-        "EV limiter power threshold",
-        "EVLimiterPowerThresholdKW",
-        values=[20, 30, 40, 50, 60],
-        suffix=" kW",
-        default=40,
-      )
-      ev_dte_floor = CyclingIntButton(
-        "EV limiter DTE floor",
-        "EVLimiterDTEFloor",
-        values=[1, 3, 5, 10, 20, 50],
-        suffix="",
-        default=5,
-      )
-      ev_max_gap = CyclingIntButton(
-        "EV limiter max gap",
-        "EVLimiterMaxGapMph",
-        values=[3, 5, 7, 10, 15],
-        suffix=" mph",
-        default=5,
-      )
-      self._scroller.add_widgets([log_upload, ev_limiter, ev_power_thr, ev_dte_floor, ev_max_gap])
-      self._refresh_toggles = self._refresh_toggles + (
-        ("LogUploadEnabled", log_upload),
-        ("EVLimiterEnabled", ev_limiter),
-      )
-      self._cycling_refresh = (ev_power_thr, ev_dte_floor, ev_max_gap)
-    except UnknownKeyName:
-      self._cycling_refresh = ()
+      ev_widgets_ok = True
+    except Exception:
+      ev_widgets_ok = False
+
+    if ev_widgets_ok:
+      try:
+        log_upload = BigParamControl("upload CAN logs", "LogUploadEnabled")
+        ev_limiter = BigParamControl("EV power limiter", "EVLimiterEnabled")
+        ev_power_thr = CyclingIntButton(
+          "EV limiter power threshold",
+          "EVLimiterPowerThresholdKW",
+          values=[20, 30, 40, 50, 60],
+          suffix=" kW",
+          default=40,
+        )
+        ev_dte_floor = CyclingIntButton(
+          "EV limiter DTE floor",
+          "EVLimiterDTEFloor",
+          values=[1, 3, 5, 10, 20, 50],
+          suffix="",
+          default=5,
+        )
+        ev_max_gap = CyclingIntButton(
+          "EV limiter max gap",
+          "EVLimiterMaxGapMph",
+          values=[3, 5, 7, 10, 15],
+          suffix=" mph",
+          default=5,
+        )
+        self._scroller.add_widgets([log_upload, ev_limiter, ev_power_thr, ev_dte_floor, ev_max_gap])
+        self._refresh_toggles = self._refresh_toggles + (
+          ("LogUploadEnabled", log_upload),
+          ("EVLimiterEnabled", ev_limiter),
+        )
+        self._cycling_refresh = (ev_power_thr, ev_dte_floor, ev_max_gap)
+      except Exception as e:  # widget constructors must not take down the panel
+        print(f"[toggles] EV-limiter widget init failed: {type(e).__name__}: {e}")
 
     enable_openpilot.set_enabled(lambda: not ui_state.engaged)
     record_front.set_enabled(False if ui_state.params.get_bool("RecordFrontLock") else (lambda: not ui_state.engaged))
@@ -122,10 +131,19 @@ class TogglesLayoutMici(NavScroller):
         self._personality_toggle.set_visible(False)
         ui_state.params.remove("ExperimentalMode")
 
-    # Refresh toggles from params to mirror external changes
+    # Refresh toggles from params to mirror external changes. One bad key
+    # must not stop the loop — if a param has gone stale (e.g. params_pyx.so
+    # rebuilt without a key), keep going so the rest of the panel still
+    # reflects live state.
     for key, item in self._refresh_toggles:
-      item.set_checked(ui_state.params.get_bool(key))
+      try:
+        item.set_checked(ui_state.params.get_bool(key))
+      except Exception:
+        pass
 
     # Refresh cycling-int displays (EV limiter tunables set via SSH etc.)
     for btn in getattr(self, "_cycling_refresh", ()):
-      btn._refresh_display()
+      try:
+        btn._refresh_display()
+      except Exception:
+        pass

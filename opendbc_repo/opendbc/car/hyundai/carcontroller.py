@@ -137,12 +137,20 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     # that would suppress legitimate limiter TX every time the driver is
     # adjusting the user target.
     if not self.CP.flags & HyundaiFlags.CANFD:
-      ev_button, _ = self.ev_limiter.update(CC, CS, self.frame)
-      if ev_button != Buttons.NONE:
-        burst = self.ev_limiter.current_burst_count
-        can_sends.extend(
-          [hyundaican.create_clu11(self.packer, self.frame, CS.clu11, ev_button, self.CP)] * burst
-        )
+      # Limiter MUST NOT crash the car controller — a single raised exception
+      # here would bubble up through card and cause a control-loop fault.
+      # Wrap the whole update + TX so any surprise keeps the car safe to
+      # drive even if it means we skip the EV limiter for that tick.
+      try:
+        ev_button, _ = self.ev_limiter.update(CC, CS, self.frame)
+        if ev_button != Buttons.NONE:
+          burst = self.ev_limiter.current_burst_count
+          can_sends.extend(
+            [hyundaican.create_clu11(self.packer, self.frame, CS.clu11, ev_button, self.CP)] * burst
+          )
+      except Exception as e:
+        # Print rather than log — the controller may run before cloudlog init
+        print(f"[ev_limiter] update suppressed: {type(e).__name__}: {e}")
 
     new_actuators = actuators.as_builder()
     new_actuators.torque = apply_torque / self.params.STEER_MAX

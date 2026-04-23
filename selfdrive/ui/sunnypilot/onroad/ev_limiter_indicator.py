@@ -41,6 +41,15 @@ class EVLimiterIndicator(Widget):
     self._font = gui_app.font(FontWeight.BOLD)
 
   def _render(self, rect: rl.Rectangle) -> None:
+    # Absolute no-crash policy: any exception here silently no-ops.
+    # The indicator is cosmetic; it must never take down the rest of
+    # the HUD.
+    try:
+      self._render_inner(rect)
+    except Exception as e:
+      print(f"[ev_limiter_indicator] render suppressed: {type(e).__name__}: {e}")
+
+  def _render_inner(self, rect: rl.Rectangle) -> None:
     sm = ui_state.sm
     try:
       cs_sp = sm["carStateSP"]

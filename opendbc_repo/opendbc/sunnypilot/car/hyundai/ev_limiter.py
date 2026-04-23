@@ -383,7 +383,7 @@ class EVLimiter:
         if (frame - self.last_set_frame) >= SET_COOLDOWN_FRAMES:
           if self._consume_global_rate_limit(frame, BURST_COPIES):
             button = Buttons.SET_DECEL
-            state = STATE_SOFT_CAP_ACTIVE if soft_cap and not over_user_target else STATE_SOFT_CAP_ACTIVE
+            state = STATE_SOFT_CAP_ACTIVE
       # If suppressed, still report override state for logging
       if suppressed:
         state = STATE_DRIVER_OVERRIDE_RES
