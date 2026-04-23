@@ -180,3 +180,5 @@ class CarStateSP:
   accelDemand: float = auto_field()
   dteRaw: int = auto_field()
   estPowerW: float = auto_field()
+  evLimiterUserTargetSpeed: float = auto_field()
+  evLimiterState: int = auto_field()

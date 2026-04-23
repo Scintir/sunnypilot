@@ -6,37 +6,41 @@ See the LICENSE.md file in the root directory for more details.
 
 EV Power Limiter — classic-CAN Hyundai HYBRID, stock-long only.
 
-Decides whether to press CLU11 SET_DECEL or RES_ACCEL to bias the stock
-SCC set speed so the car stays in EV mode as long as practical.
+Prevents the ICE from kicking on during ACC by biasing the stock SCC set
+speed via CLU11 button injection. Rewritten 2026-04-22 as a state machine
+after the first flat-controller iteration regressed badly (pressed SET
+while stopped, fought driver wheel input, saturated the bus).
 
-Controller is GAP-BASED (per user direction 2026-04-21):
-    ceiling = min(user_target_speed, vEgo + max_gap)
-and the limiter drives `observed_set_speed` toward that ceiling:
-  - observed > ceiling           -> press SET_DECEL  (no load gate — the
-                                    gap is the priority)
-  - observed < ceiling AND not
-    currently overdrawing power  -> press RES_ACCEL
-  - otherwise                     -> hold
+States (published as evLimiterState uint8):
+  0 IDLE                — gates pass, no action required
+  1 STANDSTILL_HOLD     — vehicle at/near stop; emit absolutely nothing
+  2 SOFT_CAP_ACTIVE     — ICE-imminent trigger held long enough; press SET_DECEL
+  3 RECOVERY_ACTIVE     — observed set below user target and safe to raise
+  4 DRIVER_OVERRIDE_SET — driver pressed wheel SET recently; we don't RES
+  5 DRIVER_OVERRIDE_RES — driver pressed wheel RES recently; we don't SET
+  6 BUS_FAULT_HOLD      — reserved for future use (bus error back-off)
+  7 DISABLED            — not supported / not enabled / CC off
 
-The power threshold is used ONLY as the safety gate on RES_ACCEL — we
-never ask for MORE speed while the drivetrain is already over the
-configured EV-power threshold.
-
-Driver's own wheel presses are handled in the *background*: a SET- press
-adjusts `user_target_speed` down by 1 mph (and RES+ up by 1 mph). The
-limiter's gap logic then picks up the new target on subsequent frames.
-Driver's button presses never directly move `observed_set_speed` out of
-the limiter's control — the SCC may blip by 1 mph, but the next
-commanded frame pulls it back to ceiling.
-
-An "initial catch-up" mode kicks in when `observed - ceiling` is large
-(fresh engagement from low vEgo with a high user target): larger burst
-count and shorter cooldown so the set speed collapses onto the vEgo + 5
-ceiling in roughly a second rather than 12.
-
-Limiter runs at ALL speeds — there is no `MinSpeed` gate anymore per
-user direction.
+Key design points (per gpt-5.4 iteration-2 review):
+  - Constant 20 mph gap ceiling combined with `vEgo > 15 mph` entry gate
+    on SOFT_CAP. Below 15 mph the cap simply does not engage, which fixes
+    the "stopped-and-crawling" regression.
+  - SOFT_CAP requires load persistence (≥ 200 ms) and exits with
+    hysteresis (power < 0.5 × threshold for ≥ 500 ms). No single-frame
+    triggers.
+  - Driver wheel input priority is directional: driver SET suppresses our
+    RES for 2 s; driver RES suppresses our SET for 1 s. Windows extend
+    while the driver holds the button.
+  - Echo filter: 80 ms, first-matching-event-only. Driver press-and-hold
+    after that first pulse gets through.
+  - Burst count is 2 copies per commanded frame; global rate limit of 6
+    logical presses/sec over any rolling 1-second window. No catchup mode.
+  - user_target is seeded from observed_set_speed on every engage rising
+    edge. Short cc-off intervals do NOT zero it; the next engage edge
+    re-seeds it fresh.
 """
+from collections import deque
+
 from opendbc.car import structs
 from opendbc.car.hyundai.values import Buttons, HyundaiFlags
 
@@ -51,44 +55,76 @@ except Exception:  # opendbc may run outside openpilot (tests, standalone)
 
 ButtonType = structs.CarState.ButtonEvent.Type
 
-# Mapping from CLU11 button codes (what the Hyundai wire protocol uses) to
-# the button-event type carstate emits after edge detection.
 TX_BUTTON_TO_EVENT_TYPE = {
   Buttons.RES_ACCEL: ButtonType.accelCruise,
   Buttons.SET_DECEL: ButtonType.decelCruise,
   Buttons.CANCEL:    ButtonType.cancel,
 }
 
-# Press cadences / burst counts
-PRESS_COOLDOWN_FRAMES = 20             # 200 ms at 100 Hz — normal between presses
-PRESS_BURST_COPIES = 5                  # normal duplicate presses per commanded frame
-INITIAL_CATCHUP_COOLDOWN_FRAMES = 10    # 100 ms when catching up a big gap
-INITIAL_CATCHUP_BURST_COPIES = 25       # bigger burst for rapid gap close (match stock RES pattern)
+# State enum (stays in sync with evLimiterState @7 in cereal/custom.capnp)
+STATE_IDLE                = 0
+STATE_STANDSTILL_HOLD     = 1
+STATE_SOFT_CAP_ACTIVE     = 2
+STATE_RECOVERY_ACTIVE     = 3
+STATE_DRIVER_OVERRIDE_SET = 4
+STATE_DRIVER_OVERRIDE_RES = 5
+STATE_BUS_FAULT_HOLD      = 6
+STATE_DISABLED            = 7
 
-DRIVER_OVERRIDE_BACKOFF_FRAMES = 300    # 3 s back off after driver pedal interaction (NOT button press)
-STUCK_LOOP_MAX_FRAMES = 6000            # 60 s continuous active -> safety reset
-ECHO_FILTER_FRAMES = 30                 # drop button events within 300 ms of our own TX
+# Frame rate — carcontroller runs at 100 Hz.
+FRAMES_PER_SEC = 100
 
-# Unit constants (cruiseState.speed is m/s regardless of is_metric)
+# Burst / cadence
+BURST_COPIES = 2                         # copies per commanded frame
+SET_COOLDOWN_FRAMES = 30                 # 300 ms between commanded SET frames
+RES_COOLDOWN_FRAMES = 40                 # 400 ms between commanded RES frames
+GLOBAL_RATE_LIMIT_PRESSES_PER_SEC = 6    # logical presses (incl. bursts) per rolling second
+ECHO_FILTER_FRAMES = 8                   # 80 ms, first matching event only
+
+# Driver-priority window lengths
+DRIVER_OVERRIDE_SET_FRAMES = 200         # 2 s after last driver SET
+DRIVER_OVERRIDE_RES_FRAMES = 100         # 1 s after last driver RES
+
+# Standstill entry/exit
+STANDSTILL_V_EGO_MS = 2 * 0.44704        # 2 mph
+STANDSTILL_EXIT_V_EGO_MS = 3 * 0.44704   # 3 mph
+BRAKE_LOW_SPEED_V_EGO_MS = 5 * 0.44704   # 5 mph (brake gates standstill only under this)
+STANDSTILL_CONFIRM_FRAMES = 20           # 200 ms persistence on entry
+RECOVERY_AFTER_STANDSTILL_FRAMES = 30    # 300 ms clean after standstill before RES allowed
+
+# SOFT_CAP entry/exit
+SOFT_CAP_V_EGO_FLOOR_MS = 15 * 0.44704   # 15 mph
+SOFT_CAP_V_EGO_EXIT_MS = 12 * 0.44704    # 12 mph exit hysteresis
+SOFT_CAP_POWER_ENTER_FRAC = 0.75         # of EVLimiterPowerThresholdKW
+SOFT_CAP_POWER_EXIT_FRAC = 0.50
+SOFT_CAP_ABASIS_ENTER = 0.2              # m/s^2
+SOFT_CAP_ENTER_FRAMES = 20               # 200 ms persistence
+SOFT_CAP_EXIT_FRAMES = 50                # 500 ms clean exit
+
+# Gap (flat per gpt-5.4)
+CONSTANT_MAX_GAP_MPH = 20.0
+
+# Recovery
+RECOVERY_DEADBAND_MS = 1.0 * 0.44704     # 1 mph deadband around user_target
+RECOVERY_V_EGO_FLOOR_MS = 3 * 0.44704    # must be moving
+
+# user_target clamp range
 MPH_TO_MS = 0.44704
-KPH_TO_MS = 1.0 / 3.6
-
-# Clamp the "user target speed" we track to a sane range (m/s). An unbounded
-# counter could drift arbitrarily high after many RES presses or arbitrarily
-# low during sustained SET presses.
 USER_TARGET_MIN_MS = 0.0
-USER_TARGET_MAX_MS = 95.0 * MPH_TO_MS   # ~42 m/s ~ 153 kph — well above any street-legal target
+USER_TARGET_MAX_MS = 95.0 * MPH_TO_MS
 
-# Module-level singleton so the CarController-side limiter can share state
-# with the CarState-side publisher without passing references.
+
+# Module-level singleton so the CarState-side publisher (carstate_ext) can
+# read state without passing references through CarController plumbing.
 _SHARED_STATE: dict = {
   "active": False,
-  "set_speed_offset": 0.0,  # m/s, user_target - observed
+  "set_speed_offset": 0.0,   # m/s, max(0, user_target - observed)
+  "user_target": 0.0,        # m/s
+  "state": STATE_DISABLED,
 }
 
 
 def get_shared_state() -> dict:
-  """Return the latest limiter state for UI-side consumers (read-only)."""
   return _SHARED_STATE
 
 
@@ -97,8 +133,6 @@ class ScintirEVLimiter:
     self.CP = CP
     self.CP_SP = CP_SP
 
-    # Only meaningful on classic-CAN Hyundai HYBRID with stock longitudinal.
-    # On any other config self.update() is a no-op.
     self.supported = (
       not bool(CP.flags & HyundaiFlags.CANFD)
       and bool(CP.flags & HyundaiFlags.HYBRID)
@@ -107,17 +141,38 @@ class ScintirEVLimiter:
 
     self._params = _Params() if _PARAMS_AVAILABLE else None
 
-    self.last_press_frame = -10000
-    self.last_tx_frame = -10000
-    self.last_tx_button = Buttons.NONE
-    self.driver_interacted_frame = -10000
-    self.active_frames = 0
-    self.active = False
+    # user_target lifecycle — seeded on engage rising edge, never auto-zeroed
     self.user_target_speed = 0.0
     self.was_cc_enabled = False
-    # Dynamic burst count — CarController reads this to decide how many
-    # copies of the CLU11 button to TX on the commanded frame.
-    self.current_burst_count = PRESS_BURST_COPIES
+
+    # TX bookkeeping
+    self.last_set_frame = -10000
+    self.last_res_frame = -10000
+    self.press_history = deque()  # of (frame, copies) — for global rate limit
+
+    # Echo filter (single-slot, first-match consumption)
+    self._pending_echo_button = Buttons.NONE
+    self._pending_echo_frame = -10000
+
+    # Driver override windows — track LAST driver press of each direction
+    self._driver_set_last_frame = -10000
+    self._driver_res_last_frame = -10000
+
+    # SOFT_CAP persistence
+    self._soft_cap_trigger_frames = 0
+    self._soft_cap_clean_frames = 0
+    self._soft_cap_on = False
+
+    # STANDSTILL persistence
+    self._standstill_trigger_frames = 0
+    self._standstill_on = False
+    self._left_standstill_at_frame = -10000
+
+    # Published burst count (carcontroller reads this each frame)
+    self.current_burst_count = BURST_COPIES
+
+    # Debug state (for logging)
+    self.state = STATE_DISABLED
 
   # ----- Params helpers ---------------------------------------------------
 
@@ -140,141 +195,240 @@ class ScintirEVLimiter:
     except (ValueError, TypeError):
       return default
 
+  # ----- Helpers ----------------------------------------------------------
+
+  def _consume_global_rate_limit(self, frame: int, copies: int) -> bool:
+    """Return True and record the TX if adding `copies` presses in the last
+    1 s stays at or under GLOBAL_RATE_LIMIT_PRESSES_PER_SEC. Otherwise drop."""
+    cutoff = frame - FRAMES_PER_SEC
+    while self.press_history and self.press_history[0][0] < cutoff:
+      self.press_history.popleft()
+    total = sum(c for _, c in self.press_history)
+    if total + copies > GLOBAL_RATE_LIMIT_PRESSES_PER_SEC:
+      return False
+    self.press_history.append((frame, copies))
+    return True
+
+  def _process_button_events(self, CS, frame: int) -> None:
+    """Feed driver wheel input into user_target + driver-override windows.
+    First matching event within ECHO_FILTER_FRAMES of our TX is swallowed
+    as our own echo; subsequent events pass through."""
+    echo_window_open = (
+      self._pending_echo_button != Buttons.NONE
+      and (frame - self._pending_echo_frame) < ECHO_FILTER_FRAMES
+    )
+    for event in CS.out.buttonEvents:
+      if not event.pressed:
+        continue
+      # Try to consume the echo on the first matching event
+      if echo_window_open:
+        our_type = TX_BUTTON_TO_EVENT_TYPE.get(self._pending_echo_button)
+        if our_type is not None and event.type == our_type:
+          # swallow + mark consumed
+          self._pending_echo_button = Buttons.NONE
+          echo_window_open = False
+          continue
+      # Real driver press
+      if event.type == ButtonType.decelCruise:
+        self.user_target_speed -= MPH_TO_MS
+        self._driver_set_last_frame = frame
+      elif event.type == ButtonType.accelCruise:
+        self.user_target_speed += MPH_TO_MS
+        self._driver_res_last_frame = frame
+    self.user_target_speed = max(USER_TARGET_MIN_MS, min(USER_TARGET_MAX_MS, self.user_target_speed))
+
+  def _in_driver_override_set(self, frame: int) -> bool:
+    return (frame - self._driver_set_last_frame) < DRIVER_OVERRIDE_SET_FRAMES
+
+  def _in_driver_override_res(self, frame: int) -> bool:
+    return (frame - self._driver_res_last_frame) < DRIVER_OVERRIDE_RES_FRAMES
+
+  def _update_standstill(self, v_ego, brake_pressed, standstill_flag) -> bool:
+    trigger = (
+      v_ego < STANDSTILL_V_EGO_MS
+      or standstill_flag
+      or (brake_pressed and v_ego < BRAKE_LOW_SPEED_V_EGO_MS)
+    )
+    exit_ok = (v_ego >= STANDSTILL_EXIT_V_EGO_MS and not brake_pressed and not standstill_flag)
+    if trigger:
+      self._standstill_trigger_frames += 1
+      if self._standstill_trigger_frames >= STANDSTILL_CONFIRM_FRAMES:
+        self._standstill_on = True
+    else:
+      self._standstill_trigger_frames = 0
+    if self._standstill_on and exit_ok:
+      self._standstill_on = False
+    return self._standstill_on
+
+  def _update_soft_cap(self, v_ego, brake_pressed, est_power_w, abasis, power_threshold_w) -> bool:
+    if brake_pressed:
+      self._soft_cap_on = False
+      self._soft_cap_trigger_frames = 0
+      return False
+    enter_cond = (
+      v_ego > SOFT_CAP_V_EGO_FLOOR_MS
+      and est_power_w > SOFT_CAP_POWER_ENTER_FRAC * power_threshold_w
+      and abasis > SOFT_CAP_ABASIS_ENTER
+    )
+    exit_cond = (
+      v_ego < SOFT_CAP_V_EGO_EXIT_MS
+      or est_power_w < SOFT_CAP_POWER_EXIT_FRAC * power_threshold_w
+    )
+    if enter_cond:
+      self._soft_cap_trigger_frames += 1
+      self._soft_cap_clean_frames = 0
+      if self._soft_cap_trigger_frames >= SOFT_CAP_ENTER_FRAMES:
+        self._soft_cap_on = True
+    elif exit_cond:
+      self._soft_cap_clean_frames += 1
+      self._soft_cap_trigger_frames = 0
+      if self._soft_cap_clean_frames >= SOFT_CAP_EXIT_FRAMES:
+        self._soft_cap_on = False
+    return self._soft_cap_on
+
+  def _record_tx(self, frame: int, button: int) -> None:
+    if button == Buttons.SET_DECEL:
+      self.last_set_frame = frame
+    elif button == Buttons.RES_ACCEL:
+      self.last_res_frame = frame
+    self._pending_echo_button = button
+    self._pending_echo_frame = frame
+
+  def _reset_tx_cadence(self) -> None:
+    """Called on entry to STANDSTILL_HOLD / driver override — drops pending
+    cadence so we don't snap a stale cooldown the instant we exit."""
+    self.last_set_frame = -10000
+    self.last_res_frame = -10000
+
   # ----- Main update ------------------------------------------------------
 
   def update(self, CC, CS, frame: int) -> tuple[int, bool]:
-    """Advance the limiter and return (button, active)."""
+    """Advance the limiter one tick. Return (button, active)."""
 
     if not self.supported:
-      self._hard_reset()
-      return Buttons.NONE, False
+      return self._publish(Buttons.NONE, STATE_DISABLED, 0.0)
 
     if not self._read_bool("EVLimiterEnabled", False):
-      self._hard_reset()
-      return Buttons.NONE, False
+      self.user_target_speed = 0.0
+      return self._publish(Buttons.NONE, STATE_DISABLED, 0.0)
 
-    # Tunables (read every frame so changes take effect without restart)
+    # Tunables (read every frame so params changes take effect live)
     power_threshold_w = float(self._read_int("EVLimiterPowerThresholdKW", 40)) * 1000.0
     dte_floor = float(self._read_int("EVLimiterDTEFloor", 5))
-    max_gap_ms = float(self._read_int("EVLimiterMaxGapMph", 5)) * MPH_TO_MS
 
     # Inputs
     cc_enabled = bool(CC.enabled)
-    est_power_w = float(getattr(CS, "est_power_w", 0.0))
-    dte_raw = float(getattr(CS, "dte_raw", 0.0))
-    observed_set_speed = float(CS.out.cruiseState.speed)
     v_ego = float(CS.out.vEgo)
-    gas_pressed = bool(CS.out.gasPressed)
+    observed_set_speed = float(CS.out.cruiseState.speed)
     brake_pressed = bool(CS.out.brakePressed)
+    gas_pressed = bool(CS.out.gasPressed)
+    standstill_flag = bool(getattr(CS.out.cruiseState, "standstill", False))
+    est_power_w = float(getattr(CS, "est_power_w", 0.0))
+    abasis = float(getattr(CS, "accel_demand", 0.0))
+    dte_raw = float(getattr(CS, "dte_raw", 0.0))
 
-    # -------- user_target tracking ----------
-    # On fresh engagement, take the SCC's current set speed as the user's
-    # intended target. After that, only the driver's own wheel presses
-    # (below) mutate user_target.
+    # engage rising edge -> seed user_target from observed
     if cc_enabled and not self.was_cc_enabled:
       self.user_target_speed = observed_set_speed
     self.was_cc_enabled = cc_enabled
 
-    # Filter button events and apply driver's intent to user_target.
-    for event in CS.out.buttonEvents:
-      if not event.pressed:
-        continue
-      # Drop our own echoes: if we TX'd a button within ECHO_FILTER_FRAMES
-      # and this event matches that button type, it's our echo, not the driver.
-      our_event_type = TX_BUTTON_TO_EVENT_TYPE.get(self.last_tx_button)
-      if our_event_type is not None \
-          and (frame - self.last_tx_frame) < ECHO_FILTER_FRAMES \
-          and event.type == our_event_type:
-        # Consume the echo so it can't double-fire against the next event.
-        self.last_tx_button = Buttons.NONE
-        continue
-      # Real driver press — adjust user_target in the background.
-      if event.type == ButtonType.decelCruise:
-        self.user_target_speed -= MPH_TO_MS
-      elif event.type == ButtonType.accelCruise:
-        self.user_target_speed += MPH_TO_MS
+    # Driver wheel input — always processed (background user_target tracking
+    # + override windows), even when we're going to HOLD this tick.
+    self._process_button_events(CS, frame)
 
-    # Keep user_target in a sane range.
-    self.user_target_speed = max(USER_TARGET_MIN_MS, min(USER_TARGET_MAX_MS, self.user_target_speed))
+    if not cc_enabled:
+      # Control internals reset after 200 ms cc-off, but user_target persists.
+      self._reset_tx_cadence()
+      self._soft_cap_on = False
+      self._soft_cap_trigger_frames = 0
+      self._standstill_trigger_frames = 0
+      return self._publish(Buttons.NONE, STATE_DISABLED, observed_set_speed)
 
-    # Publish helper (called at every exit so the UI never sees stale state).
-    def _publish_and_return(button: int, active: bool) -> tuple[int, bool]:
-      _SHARED_STATE["active"] = bool(active)
-      _SHARED_STATE["set_speed_offset"] = max(0.0, self.user_target_speed - observed_set_speed)
-      return button, active
+    if dte_raw <= dte_floor:
+      return self._publish(Buttons.NONE, STATE_DISABLED, observed_set_speed)
 
-    # -------- driver override (pedal only) ----------
-    # Wheel button presses now feed user_target and should NOT themselves
-    # suppress the limiter. The pedal IS a real override though.
-    if gas_pressed or brake_pressed:
-      self.driver_interacted_frame = frame
-    driver_active = (frame - self.driver_interacted_frame) < DRIVER_OVERRIDE_BACKOFF_FRAMES
+    # Standstill gate takes precedence over everything (fixes the 250-press/s
+    # stoplight spam). Emit absolutely nothing while held.
+    standstill = self._update_standstill(v_ego, brake_pressed, standstill_flag)
+    if standstill:
+      self._reset_tx_cadence()
+      self._left_standstill_at_frame = frame  # keep re-stamping so we can require clean time after exit
+      return self._publish(Buttons.NONE, STATE_STANDSTILL_HOLD, observed_set_speed)
 
-    # -------- engagement gates (no min-speed gate anymore) ----------
-    gates_ok = (
-      cc_enabled
-      and not driver_active
-      and dte_raw > dte_floor
-    )
-    if not gates_ok:
-      self.active = False
-      self.active_frames = 0
-      self.current_burst_count = PRESS_BURST_COPIES
-      return _publish_and_return(Buttons.NONE, False)
+    # Driver override windows — if active, emit nothing in the blocked direction.
+    in_override_set = self._in_driver_override_set(frame)
+    in_override_res = self._in_driver_override_res(frame)
 
-    # -------- gap-based ceiling ----------
-    ceiling = min(self.user_target_speed, v_ego + max_gap_ms)
-    tolerance = 0.1  # m/s — avoid oscillation around the exact ceiling
-    over_ceiling = observed_set_speed > ceiling + tolerance
-    below_ceiling = observed_set_speed < ceiling - tolerance
-    over_power = est_power_w > power_threshold_w
+    # Soft cap state (independent of override — we might still SET if cap trips and no RES override)
+    soft_cap = self._update_soft_cap(v_ego, brake_pressed, est_power_w, abasis, power_threshold_w)
 
-    # -------- initial catch-up mode ----------
-    # If we're well above the ceiling (fresh engagement, target way above
-    # current vEgo), use the bigger burst + shorter cooldown so the set speed
-    # collapses fast.
-    big_gap = (observed_set_speed - ceiling) > (10 * MPH_TO_MS)
-    cooldown = INITIAL_CATCHUP_COOLDOWN_FRAMES if big_gap else PRESS_COOLDOWN_FRAMES
-    self.current_burst_count = INITIAL_CATCHUP_BURST_COPIES if big_gap else PRESS_BURST_COPIES
+    # Hard user-target cap (always enforced regardless of soft_cap):
+    # if the SCC somehow ended up above the driver's target, pull it down.
+    over_user_target = observed_set_speed > self.user_target_speed + 0.5 * MPH_TO_MS
 
-    can_press = (frame - self.last_press_frame) >= cooldown
+    # Compute soft ceiling (only meaningful when soft_cap fires)
+    soft_ceiling_ms = v_ego + CONSTANT_MAX_GAP_MPH * MPH_TO_MS
+    over_soft_ceiling = observed_set_speed > soft_ceiling_ms + 0.5 * MPH_TO_MS
+
+    # Candidate action picking (SET wins over RES; hard cap wins over soft cap)
     button = Buttons.NONE
-    self.active = False
+    state = STATE_IDLE
 
-    if over_ceiling:
-      # Pull down: regardless of power (we're over the gap-from-vEgo ceiling
-      # or over user_target — both are hard caps).
-      self.active = True
-      if can_press:
-        button = Buttons.SET_DECEL
-        self.last_press_frame = frame
-    elif below_ceiling and not over_power:
-      # Room to raise AND not currently overdrawing — ramp up toward ceiling.
-      self.active = True
-      if can_press:
-        button = Buttons.RES_ACCEL
-        self.last_press_frame = frame
-    # else: hold (observed ≈ ceiling, or below but overdrawing)
-
-    # Stuck-loop safety
-    if self.active:
-      self.active_frames += 1
-      if self.active_frames > STUCK_LOOP_MAX_FRAMES:
-        self._hard_reset()
-        return Buttons.NONE, False
+    want_set = over_user_target or (soft_cap and over_soft_ceiling)
+    if want_set:
+      # Suppressed only by driver RES override (and even then, we still allow
+      # a hard user-target-exceeded SET so we never let observed exceed target).
+      suppressed = in_override_res and not over_user_target
+      if not suppressed:
+        if (frame - self.last_set_frame) >= SET_COOLDOWN_FRAMES:
+          if self._consume_global_rate_limit(frame, BURST_COPIES):
+            button = Buttons.SET_DECEL
+            state = STATE_SOFT_CAP_ACTIVE if soft_cap and not over_user_target else STATE_SOFT_CAP_ACTIVE
+      # If suppressed, still report override state for logging
+      if suppressed:
+        state = STATE_DRIVER_OVERRIDE_RES
     else:
-      self.active_frames = 0
+      # Recovery: observed below user_target by > 1 mph, not in soft cap,
+      # not under driver SET override, no gas pedal, above 3 mph, and at least
+      # 300 ms out of standstill.
+      below_target = observed_set_speed < self.user_target_speed - RECOVERY_DEADBAND_MS
+      standstill_clear = (frame - self._left_standstill_at_frame) >= RECOVERY_AFTER_STANDSTILL_FRAMES
+      may_recover = (
+        below_target
+        and not soft_cap
+        and not in_override_set
+        and not gas_pressed
+        and v_ego > RECOVERY_V_EGO_FLOOR_MS
+        and standstill_clear
+      )
+      if may_recover:
+        if (frame - self.last_res_frame) >= RES_COOLDOWN_FRAMES:
+          if self._consume_global_rate_limit(frame, BURST_COPIES):
+            button = Buttons.RES_ACCEL
+            state = STATE_RECOVERY_ACTIVE
+      else:
+        if in_override_set:
+          state = STATE_DRIVER_OVERRIDE_SET
+        elif in_override_res:
+          state = STATE_DRIVER_OVERRIDE_RES
+        elif soft_cap:
+          state = STATE_SOFT_CAP_ACTIVE
+        else:
+          state = STATE_IDLE
 
-    # Record what we're about to TX so future frames can filter our echo.
     if button != Buttons.NONE:
-      self.last_tx_frame = frame
-      self.last_tx_button = button
+      self._record_tx(frame, button)
 
-    return _publish_and_return(button, self.active)
+    return self._publish(button, state, observed_set_speed)
 
-  def _hard_reset(self) -> None:
-    self.active = False
-    self.active_frames = 0
-    self.current_burst_count = PRESS_BURST_COPIES
-    _SHARED_STATE["active"] = False
-    _SHARED_STATE["set_speed_offset"] = 0.0
+  # ----- Publish ----------------------------------------------------------
+
+  def _publish(self, button: int, state: int, observed_set_speed: float) -> tuple[int, bool]:
+    self.state = state
+    active = state in (STATE_SOFT_CAP_ACTIVE, STATE_RECOVERY_ACTIVE)
+    self.current_burst_count = BURST_COPIES
+    _SHARED_STATE["active"] = bool(active)
+    _SHARED_STATE["set_speed_offset"] = max(0.0, self.user_target_speed - observed_set_speed)
+    _SHARED_STATE["user_target"] = float(self.user_target_speed)
+    _SHARED_STATE["state"] = int(state)
+    return button, active

@@ -4,10 +4,14 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-Small onroad overlay that appears when the Scintir EV power limiter is
-actively biasing the stock SCC set speed. Reads state from the carStateSP
-message which is published each frame by CarStateExt (one-frame lag from
-CarController-side CLU11 TX).
+Onroad overlay for the Scintir EV power limiter. Two lines:
+  EV LIMIT  -N mph        (only while the limiter is actively biasing set speed)
+  TARGET: NN mph          (whenever the driver has a non-zero stored target)
+
+Second line is always visible once a target is stored — driver asked for
+persistent feedback on "what the system will try to recover to." Reads the
+carStateSP message (evLimiterActive, evLimiterSetSpeedOffset,
+evLimiterUserTargetSpeed) published by CarStateExt.
 """
 import pyray as rl
 
@@ -20,6 +24,8 @@ from openpilot.system.ui.widgets import Widget
 FONT_SIZE = 40
 PAD_X = 18
 PAD_Y = 10
+LINE_GAP = 8
+
 # Middle-upper right of the usable area. Avoids:
 #   - top-left MAX/set-speed circle (y ~ 0..162)
 #   - top-center current-speed text (y ~ 90..280)
@@ -42,35 +48,37 @@ class ScintirLimiterIndicator(Widget):
       return
 
     active = bool(getattr(cs_sp, "evLimiterActive", False))
-    if not active:
-      return
-
-    # evLimiterSetSpeedOffset is in m/s (carstate units); convert here.
     offset_ms = float(getattr(cs_sp, "evLimiterSetSpeedOffset", 0.0))
+    user_target_ms = float(getattr(cs_sp, "evLimiterUserTargetSpeed", 0.0))
+
     if ui_state.is_metric:
-      offset_display = offset_ms * 3.6          # m/s -> kph
+      conv = 3.6
       unit = "kph"
     else:
-      offset_display = offset_ms * 2.23693629   # m/s -> mph
+      conv = 2.23693629
       unit = "mph"
-    label = f"EV LIMIT  -{int(round(offset_display))} {unit}" if offset_display >= 0.5 else "EV LIMIT"
-    size = measure_text_cached(self._font, label, FONT_SIZE)
 
-    box_w = size.x + PAD_X * 2
-    box_h = size.y + PAD_Y * 2
-    box = rl.Rectangle(
-      rect.x + rect.width - box_w - MARGIN_X,
-      rect.y + MARGIN_Y,
-      box_w,
-      box_h,
-    )
+    lines: list[tuple[str, rl.Color]] = []
 
-    rl.draw_rectangle_rounded(box, 0.25, 4, rl.Color(0xff, 0x8c, 0x00, 0xdc))
-    rl.draw_text_ex(
-      self._font,
-      label,
-      rl.Vector2(box.x + PAD_X, box.y + PAD_Y),
-      FONT_SIZE,
-      0,
-      rl.WHITE,
-    )
+    if active:
+      offset_display = offset_ms * conv
+      label = f"EV LIMIT  -{int(round(offset_display))} {unit}" if offset_display >= 0.5 else "EV LIMIT"
+      lines.append((label, rl.Color(0xff, 0x8c, 0x00, 0xdc)))
+
+    if user_target_ms > 0.5:
+      target_display = user_target_ms * conv
+      lines.append((f"TARGET: {int(round(target_display))} {unit}", rl.Color(0x28, 0x80, 0xff, 0xdc)))
+
+    if not lines:
+      return
+
+    # Size each line and draw stacked top-to-bottom
+    y = rect.y + MARGIN_Y
+    for label, bg in lines:
+      size = measure_text_cached(self._font, label, FONT_SIZE)
+      box_w = size.x + PAD_X * 2
+      box_h = size.y + PAD_Y * 2
+      box = rl.Rectangle(rect.x + rect.width - box_w - MARGIN_X, y, box_w, box_h)
+      rl.draw_rectangle_rounded(box, 0.25, 4, bg)
+      rl.draw_text_ex(self._font, label, rl.Vector2(box.x + PAD_X, box.y + PAD_Y), FONT_SIZE, 0, rl.WHITE)
+      y += box_h + LINE_GAP

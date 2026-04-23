@@ -130,6 +130,8 @@ class CarStateExt:
     pub = _scintir_shared_state()
     ret_sp.evLimiterActive = bool(pub["active"])
     ret_sp.evLimiterSetSpeedOffset = float(pub["set_speed_offset"])
+    ret_sp.evLimiterUserTargetSpeed = float(pub.get("user_target", 0.0))
+    ret_sp.evLimiterState = int(pub.get("state", 7))
 
   def update_canfd_ext(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser],
                        speed_factor: float) -> None:
