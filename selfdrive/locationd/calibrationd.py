@@ -39,14 +39,24 @@ HEIGHT_INIT = np.array([1.22])
 
 # These values are needed to accommodate the model frame in the narrow cam
 if HARDWARE.get_device_type() == 'mici':
-  PITCH_LIMITS = np.array([-0.143101, 0.22235988])
+  # Widened from upstream [-0.143101, 0.22235988] (~-8.2°..+12.7°) to give
+  # road-geometry-bias headroom — was tripping invalidation on a specific
+  # commute stretch where the window-mean pitch crossed the upstream edge.
+  # Spread check (MAX_ALLOWED_PITCH_SPREAD = 4°) still catches mount shifts.
+  PITCH_LIMITS = np.array([-0.21, 0.30])
 else:
   PITCH_LIMITS = np.array([-0.09074112085129739, 0.17])
 YAW_LIMITS = np.array([-0.06912048084718224, 0.06912048084718235])
 DEBUG = os.getenv("DEBUG") is not None
 
 
-def is_calibration_valid(rpy: np.ndarray) -> bool:
+def is_calibration_valid(rpy: np.ndarray, bypass: bool = False) -> bool:
+  # When bypass is enabled (CalibrationBoxCheckDisabled param), the box
+  # check is short-circuited to True. The spread check downstream in
+  # update_status() still runs, so genuine mount shifts still trigger
+  # the recalibrating path.
+  if bypass:
+    return True
   return (PITCH_LIMITS[0] < rpy[1] < PITCH_LIMITS[1]) and (YAW_LIMITS[0] < rpy[2] < YAW_LIMITS[1])
 
 
@@ -74,6 +84,27 @@ class Calibrator:
     height = HEIGHT_INIT
     valid_blocks = 0
     self.cal_status = log.LiveCalibrationData.Status.uncalibrated
+
+    # Live-readable bypass flag for the box check. Refreshed in
+    # update_status() at ~1 Hz so the user can toggle mid-drive.
+    self.box_check_disabled = False
+    self._param_read_counter = 0
+    if param_put:
+      try:
+        self.box_check_disabled = self.params.get_bool("CalibrationBoxCheckDisabled")
+      except Exception:
+        cloudlog.exception("Error reading CalibrationBoxCheckDisabled")
+
+    # One-shot user-requested reset → start in "recalibrating" rather than
+    # first-time "calibrating". Flag is consumed here.
+    if param_put:
+      try:
+        if self.params.get_bool("CalibrationResetRequested"):
+          self.cal_status = log.LiveCalibrationData.Status.recalibrating
+          self.params.remove("CalibrationResetRequested")
+          cloudlog.info("calibrationd: user-requested reset, starting in recalibrating state")
+      except Exception:
+        cloudlog.exception("Error reading CalibrationResetRequested")
 
     if param_put and calibration_params:
       try:
@@ -135,6 +166,17 @@ class Calibrator:
     return before_current + after_current
 
   def update_status(self) -> None:
+    # Poll bypass param at ~1 Hz so the user can toggle it live.
+    # update_status() runs at ~20 Hz when samples are accepted, so refresh
+    # every 20 calls (~1 s) to pick up UI changes without disk I/O on hot path.
+    if self.param_put:
+      self._param_read_counter = (self._param_read_counter + 1) % 20
+      if self._param_read_counter == 0:
+        try:
+          self.box_check_disabled = self.params.get_bool("CalibrationBoxCheckDisabled")
+        except Exception:
+          pass
+
     valid_idxs = self.get_valid_idxs()
     if valid_idxs:
       self.wide_from_device_euler = np.mean(self.wide_from_device_eulers[valid_idxs], axis=0)
@@ -152,7 +194,7 @@ class Calibrator:
         self.cal_status = log.LiveCalibrationData.Status.recalibrating
       else:
         self.cal_status = log.LiveCalibrationData.Status.uncalibrated
-    elif is_calibration_valid(self.rpy):
+    elif is_calibration_valid(self.rpy, bypass=self.box_check_disabled):
       self.cal_status = log.LiveCalibrationData.Status.calibrated
     else:
       self.cal_status = log.LiveCalibrationData.Status.invalid

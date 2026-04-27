@@ -93,6 +93,28 @@ class TogglesLayoutMici(NavScroller):
       except Exception as e:  # widget constructors must not take down the panel
         print(f"[toggles] EV-limiter widget init failed: {type(e).__name__}: {e}")
 
+    # Calibration box-check bypass (re-applied from older branch).
+    # Off by default: the upstream PITCH/YAW box check runs normally.
+    # Toggling on disables only the box check — the spread check still runs,
+    # so genuine mount shifts will still trigger recalibrating.
+    # Same defensive try/except pattern as the EV widgets above.
+    try:
+      ui_state.params.get_bool("CalibrationBoxCheckDisabled")
+      cal_widget_ok = True
+    except Exception:
+      cal_widget_ok = False
+
+    if cal_widget_ok:
+      try:
+        calib_bypass = BigParamControl("disable calibration box check",
+                                       "CalibrationBoxCheckDisabled")
+        self._scroller.add_widgets([calib_bypass])
+        self._refresh_toggles = self._refresh_toggles + (
+          ("CalibrationBoxCheckDisabled", calib_bypass),
+        )
+      except Exception as e:
+        print(f"[toggles] calibration-bypass widget init failed: {type(e).__name__}: {e}")
+
     enable_openpilot.set_enabled(lambda: not ui_state.engaged)
     record_front.set_enabled(False if ui_state.params.get_bool("RecordFrontLock") else (lambda: not ui_state.engaged))
     record_mic.set_enabled(lambda: not ui_state.engaged)

@@ -266,6 +266,16 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"EVLimiterDTEFloor", {PERSISTENT, INT, "5"}},
     {"EVLimiterMaxGapMph", {PERSISTENT, INT, "5"}},
 
+    // Calibration box-check bypass + reset signaling (re-applied from older branch).
+    // CalibrationBoxCheckDisabled: when true, is_calibration_valid() returns True
+    //   unconditionally (skips PITCH/YAW box check). Spread check still runs, so
+    //   genuine mount shifts still trip the recalibrating path.
+    // CalibrationResetRequested: one-shot flag set by the mici "Reset Calibration"
+    //   button. Consumed by calibrationd at startup to initialize cal_status as
+    //   "recalibrating" rather than first-time "calibrating".
+    {"CalibrationBoxCheckDisabled", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"CalibrationResetRequested", {PERSISTENT, BOOL, "0"}},
+
     // Speed Limit
     {"SpeedLimitMode", {PERSISTENT | BACKUP, INT, "1"}},
     {"SpeedLimitOffsetType", {PERSISTENT | BACKUP, INT, "0"}},
