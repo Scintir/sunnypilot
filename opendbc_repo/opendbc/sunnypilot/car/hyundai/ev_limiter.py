@@ -21,23 +21,39 @@ States (published as evLimiterState uint8):
   6 BUS_FAULT_HOLD      — reserved for future use (bus error back-off)
   7 DISABLED            — not supported / not enabled / CC off
 
-Key design points (per gpt-5.4 iteration-2 review):
-  - Constant 20 mph gap ceiling combined with `vEgo > 15 mph` entry gate
-    on SOFT_CAP. Below 15 mph the cap simply does not engage, which fixes
-    the "stopped-and-crawling" regression.
-  - SOFT_CAP requires load persistence (≥ 200 ms) and exits with
-    hysteresis (power < 0.5 × threshold for ≥ 500 ms). No single-frame
-    triggers.
-  - Driver wheel input priority is directional: driver SET suppresses our
-    RES for 2 s; driver RES suppresses our SET for 1 s. Windows extend
-    while the driver holds the button.
-  - Echo filter: 80 ms, first-matching-event-only. Driver press-and-hold
-    after that first pulse gets through.
-  - Burst count is 2 copies per commanded frame; global rate limit of 6
-    logical presses/sec over any rolling 1-second window. No catchup mode.
-  - user_target is seeded from observed_set_speed on every engage rising
-    edge. Short cc-off intervals do NOT zero it; the next engage edge
-    re-seeds it fresh.
+Key design points (per drive-#3 retro + gpt-5.5 review, 2026-04-27, with
+follow-up fixes from gpt-5.5 v2 review):
+  - SOFT_CAP target is `vEgo + 2 mph` (NOT vEgo + 20 — that was functionally
+    no cap). When the cap fires it actually pulls observed down to remove
+    accel demand from the SCC, preventing ICE engagement.
+  - SOFT_CAP entry: power > threshold (slider value at face value, no 0.75
+    multiplier) OR aBasis > +0.7 m/s² (catches accel pulses where power
+    proxy may be muted). 300 ms persistence; 2 s clean exit; 1 s minimum
+    dwell once entered (prevents cap/recover/cap cycling on rolling grades).
+    Brake forces immediate exit AND clears the pre_cap_set latch (brake
+    is authoritative).
+  - Recovery aims at `pre_cap_set` (latched observed at SOFT_CAP entry).
+    Driver RES EXTENDS pre_cap_set (max of current target, user_target, and
+    observed-after-step) — but ONLY when a latch already exists; RES with
+    no prior cap event does NOT create a recovery target out of thin air.
+    Driver SET / CANCEL / brake clears pre_cap_set.
+  - Driver-priority windows: SET blocks our RES for 2 s, RES blocks our SET
+    for 3 s. Override windows take priority over LIMITING/RECOVERING in
+    state reporting (driver respect signal beats limiter activity signal).
+  - One-direction-at-a-time: after our own SET, block our own RES for
+    1.5 s (and vice versa). Prevents visible oscillation.
+  - 2 s settle delay between SOFT_CAP exit and RECOVERY firing.
+  - user_target is seeded from observed at engage and primarily mutated by
+    real driver edges (±1 mph each). It is also snapped to observed during
+    a 300 ms post-edge window when the SCC's 5-mph quantization step lands
+    after our edge — this is display/recovery-target tracking only and
+    cannot itself trigger any TX. The hard user-target cap that previously
+    used user_target as a control input was removed in iter-3.
+  - Burst count 2 copies per frame; global rate limit 6 logical presses/sec.
+  - Echo filter: 80 ms, first-matching-event-only (for buttonEvent stream).
+  - Quantization observation window uses 200 ms TX attribution (different
+    timing concern from the buttonEvent echo filter).
+  - Standstill (vEgo<2 OR standstill_flag OR brake<5mph) emits zero presses.
 """
 from collections import deque
 
@@ -83,7 +99,7 @@ ECHO_FILTER_FRAMES = 8                   # 80 ms, first matching event only
 
 # Driver-priority window lengths
 DRIVER_OVERRIDE_SET_FRAMES = 200         # 2 s after last driver SET
-DRIVER_OVERRIDE_RES_FRAMES = 100         # 1 s after last driver RES
+DRIVER_OVERRIDE_RES_FRAMES = 300         # 3 s after last driver RES (extended per drive #3 fix)
 
 # Standstill entry/exit
 STANDSTILL_V_EGO_MS = 2 * 0.44704        # 2 mph
@@ -93,34 +109,41 @@ STANDSTILL_CONFIRM_FRAMES = 20           # 200 ms persistence on entry
 RECOVERY_AFTER_STANDSTILL_FRAMES = 30    # 300 ms clean after standstill before RES allowed
 
 # SOFT_CAP entry/exit
+# Power threshold from EVLimiterPowerThresholdKW param is taken at face value
+# now (no hidden 0.75x multiplier). Slider says "40 kW" -> entry at 40 kW.
 SOFT_CAP_V_EGO_FLOOR_MS = 15 * 0.44704   # 15 mph
 SOFT_CAP_V_EGO_EXIT_MS = 12 * 0.44704    # 12 mph exit hysteresis
-SOFT_CAP_POWER_ENTER_FRAC = 0.75         # of EVLimiterPowerThresholdKW
-SOFT_CAP_POWER_EXIT_FRAC = 0.50
-SOFT_CAP_ABASIS_ENTER = 0.2              # m/s^2
-SOFT_CAP_ENTER_FRAMES = 20               # 200 ms persistence
-SOFT_CAP_EXIT_FRAMES = 50                # 500 ms clean exit
+SOFT_CAP_POWER_EXIT_KW_MARGIN = 8.0      # exit when power drops 8 kW below entry threshold
+SOFT_CAP_ABASIS_FALLBACK = 0.7           # m/s^2 — secondary trigger for accel pulses where
+                                          # power proxy may be muted (regen, low-SOC, brief grade).
+                                          # Raised from 0.45 per gpt-5.5 review — 0.45 was firing
+                                          # on ordinary highway acceleration / lane changes.
+SOFT_CAP_ENTER_FRAMES = 30               # 300 ms persistence (was 200 ms)
+SOFT_CAP_EXIT_FRAMES = 200               # 2 s clean exit (was 500 ms — prevents cap/recover/cap cycling)
+SOFT_CAP_MIN_DWELL_FRAMES = 100          # 1 s minimum hold once entered
 
-# Gap (flat per gpt-5.4)
-CONSTANT_MAX_GAP_MPH = 20.0
+# SOFT_CAP target ceiling: pull observed_set down to vEgo + this many mph
+# when cap fires (was 20 mph — functionally no cap; per drive #3 + gpt-5.5 review)
+SOFT_CAP_CEILING_MARGIN_MPH = 2.0
 
 # Recovery
-RECOVERY_DEADBAND_MS = 1.0 * 0.44704     # 1 mph deadband around user_target
+RECOVERY_DEADBAND_MS = 1.0 * 0.44704     # 1 mph deadband around recovery target
 RECOVERY_V_EGO_FLOOR_MS = 3 * 0.44704    # must be moving
+RECOVERY_AFTER_CAP_EXIT_FRAMES = 200     # 2 s settle after SOFT_CAP exits before RES'ing
+
+# One-direction-at-a-time cooldowns to prevent visible oscillation
+LIMITER_OPPOSITE_DIR_BLOCK_FRAMES = 150  # after our SET, block our RES for 1.5 s, and vice versa
+
+# Driver-adjust observation window: after a driver button edge, watch a short
+# follow-up window to catch the SCC's eventual +5 mph quantization step on
+# held buttons. During this window we update HUD-display user_target and the
+# recovery-target latch from observed; we do NOT use it for any cap/control.
+DRIVER_ADJUST_WINDOW_FRAMES = 30         # 300 ms — long enough to see the cluster respond
 
 # user_target clamp range
 MPH_TO_MS = 0.44704
 USER_TARGET_MIN_MS = 0.0
 USER_TARGET_MAX_MS = 95.0 * MPH_TO_MS
-
-# Driver-adjustment window: while a driver button edge is recent, observed
-# set-speed jumps that can't be attributed to our TX are taken as the
-# driver's intent (handles Hyundai SCC's 5-mph step on held RES/SET, where
-# we only see one ButtonEvent edge but the SCC bumps observed by 5 mph).
-DRIVER_ADJUST_WINDOW_FRAMES = 150        # 1.5 s after last driver edge
-OBSERVED_JUMP_THRESHOLD_MS = 0.5 * MPH_TO_MS  # treat changes ≥ ~1 mph as "jumps"
-TX_ECHO_ATTRIBUTION_FRAMES = 40          # 400 ms — observed changes within this many
-                                          # frames of our TX are attributed to us
 
 
 # Module-level singleton so the CarState-side publisher (carstate_ext) can
@@ -167,20 +190,21 @@ class EVLimiter:
     self._driver_set_last_frame = -10000
     self._driver_res_last_frame = -10000
 
-    # SOFT_CAP persistence
+    # SOFT_CAP persistence + dwell
     self._soft_cap_trigger_frames = 0
     self._soft_cap_clean_frames = 0
     self._soft_cap_on = False
-    self._pre_cap_set_speed = 0.0  # observed_set_speed at SOFT_CAP entry — recovery target
+    self._soft_cap_entered_frame = -10000
+    self._soft_cap_exited_frame = -10000
+    self._pre_cap_set_speed = 0.0  # latched at SOFT_CAP entry — recovery target
 
     # STANDSTILL persistence
     self._standstill_trigger_frames = 0
     self._standstill_on = False
     self._left_standstill_at_frame = -10000
 
-    # Driver-adjustment window state — see DRIVER_ADJUST_WINDOW_FRAMES doc above
+    # Driver-adjust observation window — see DRIVER_ADJUST_WINDOW_FRAMES doc
     self._driver_adjust_until = -10000
-    self._last_observed_set_speed = 0.0
 
     # Published burst count (carcontroller reads this each frame)
     self.current_burst_count = BURST_COPIES
@@ -223,10 +247,19 @@ class EVLimiter:
     self.press_history.append((frame, copies))
     return True
 
-  def _process_button_events(self, CS, frame: int) -> None:
+  def _process_button_events(self, CS, observed_set_speed: float, frame: int) -> None:
     """Feed driver wheel input into user_target + driver-override windows.
     First matching event within ECHO_FILTER_FRAMES of our TX is swallowed
-    as our own echo; subsequent events pass through."""
+    as our own echo; subsequent events pass through.
+
+    Per drive #3 fix:
+    - Driver RES extends pre_cap_set instead of clearing it (RES aligns with
+      recovery direction, so we should keep the recovery target alive).
+    - Driver SET / CANCEL clears pre_cap_set (driver wants lower / off-CC).
+    - user_target follows physical edges only (±1 mph each). It does NOT
+      auto-snap to observed; the SCC's 5-mph quantization on held presses is
+      handled by extending pre_cap_set with `max(observed)` instead.
+    """
     echo_window_open = (
       self._pending_echo_button != Buttons.NONE
       and (frame - self._pending_echo_frame) < ECHO_FILTER_FRAMES
@@ -238,7 +271,6 @@ class EVLimiter:
       if echo_window_open:
         our_type = TX_BUTTON_TO_EVENT_TYPE.get(self._pending_echo_button)
         if our_type is not None and event.type == our_type:
-          # swallow + mark consumed
           self._pending_echo_button = Buttons.NONE
           echo_window_open = False
           continue
@@ -247,37 +279,63 @@ class EVLimiter:
         self.user_target_speed -= MPH_TO_MS
         self._driver_set_last_frame = frame
         self._driver_adjust_until = frame + DRIVER_ADJUST_WINDOW_FRAMES
-        # Driver button activity invalidates any pending recovery target —
-        # they're driving manually now.
+        # Driver wants observed lower — abandon recovery toward an older value.
         self._pre_cap_set_speed = 0.0
       elif event.type == ButtonType.accelCruise:
         self.user_target_speed += MPH_TO_MS
         self._driver_res_last_frame = frame
         self._driver_adjust_until = frame + DRIVER_ADJUST_WINDOW_FRAMES
-        self._pre_cap_set_speed = 0.0
+        # Driver RES aligns with recovery direction. Only EXTEND an existing
+        # recovery latch — don't create one from zero (that would let the
+        # limiter fire RES toward a target that no SOFT_CAP cycle ever set).
+        if self._pre_cap_set_speed > 0.5 * MPH_TO_MS:
+          self._pre_cap_set_speed = max(
+            self._pre_cap_set_speed,
+            self.user_target_speed,
+            observed_set_speed,
+          )
       elif event.type == ButtonType.cancel:
         self._pre_cap_set_speed = 0.0
     self.user_target_speed = max(USER_TARGET_MIN_MS, min(USER_TARGET_MAX_MS, self.user_target_speed))
 
-  def _maybe_snap_user_target(self, observed_set_speed: float, frame: int) -> None:
-    """During a driver-adjustment window, if observed set speed jumped by
-    more than the per-edge ±1 mph we recorded, treat the difference as
-    SCC quantization (Hyundai steps observed by 5 mph on held buttons)
-    and snap user_target up/down to match. This keeps user_target as a
-    truthful "where the driver wants to go" record for HUD + recovery."""
+  def _maybe_observe_quantization(self, observed_set_speed: float, frame: int) -> None:
+    """During the 300 ms after a real driver edge, watch for the Hyundai SCC's
+    delayed +5 mph quantization step (held button → cluster bumps observed by
+    5 mph a few frames after our buttonEvent edge). Two effects, both display/
+    target-tracking only — never used as a control input or cap:
+
+      1. user_target snaps UP to observed if observed > user_target (driver
+         intent surfaced via SCC step). Keeps HUD `EV TARGET` honest.
+      2. If a recovery latch is active, extend pre_cap_set up to observed.
+         Catches the case where driver RES'es during a cap cycle and the
+         SCC's 5-mph step lifts the high-water mark above what we recorded
+         on the edge frame.
+
+    Driver SET-side: snap user_target DOWN if observed < user_target.
+    """
     if frame >= self._driver_adjust_until:
       return
-    delta = observed_set_speed - self._last_observed_set_speed
-    if abs(delta) < OBSERVED_JUMP_THRESHOLD_MS:
-      return
-    # If our TX likely caused this change, don't snap.
+    # Don't react to observed changes that are likely our own SET/RES landing.
+    # Window must be longer than the cluster's response to one of our presses;
+    # 200 ms is a conservative bound (vs 80 ms which is the echo-filter window
+    # for the buttonEvent stream — a different timing concern).
     last_tx_frame = max(self.last_set_frame, self.last_res_frame)
-    if (frame - last_tx_frame) < TX_ECHO_ATTRIBUTION_FRAMES:
+    if (frame - last_tx_frame) < 20:  # 200 ms attribution window
       return
-    self.user_target_speed = max(
-      USER_TARGET_MIN_MS,
-      min(USER_TARGET_MAX_MS, observed_set_speed),
-    )
+    # Pick whichever driver edge is MORE RECENT (so a SET right after a RES
+    # routes through the SET branch correctly).
+    res_age = frame - self._driver_res_last_frame
+    set_age = frame - self._driver_set_last_frame
+    res_recent = res_age < DRIVER_ADJUST_WINDOW_FRAMES
+    set_recent = set_age < DRIVER_ADJUST_WINDOW_FRAMES
+    most_recent_is_res = res_recent and (not set_recent or res_age <= set_age)
+    most_recent_is_set = set_recent and (not res_recent or set_age < res_age)
+    if most_recent_is_res and observed_set_speed > self.user_target_speed + 0.5 * MPH_TO_MS:
+      self.user_target_speed = min(USER_TARGET_MAX_MS, observed_set_speed)
+      if self._pre_cap_set_speed > 0.5 * MPH_TO_MS:
+        self._pre_cap_set_speed = max(self._pre_cap_set_speed, observed_set_speed)
+    elif most_recent_is_set and observed_set_speed < self.user_target_speed - 0.5 * MPH_TO_MS:
+      self.user_target_speed = max(USER_TARGET_MIN_MS, observed_set_speed)
 
   def _in_driver_override_set(self, frame: int) -> bool:
     return (frame - self._driver_set_last_frame) < DRIVER_OVERRIDE_SET_FRAMES
@@ -302,30 +360,66 @@ class EVLimiter:
       self._standstill_on = False
     return self._standstill_on
 
-  def _update_soft_cap(self, v_ego, brake_pressed, est_power_w, abasis, power_threshold_w) -> bool:
+  def _update_soft_cap(self, v_ego, brake_pressed, est_power_w, abasis,
+                       power_threshold_w, frame: int) -> bool:
+    """Detect ICE-imminent conditions and gate SOFT_CAP entry/exit.
+
+    Two parallel triggers:
+      - Power load: estimated motor power exceeds the user's threshold
+        directly (no 0.75x multiplier — slider value is what fires).
+        Best signal for steady high-load conditions like grades.
+      - aBasis fallback: commanded longitudinal accel sustained above
+        +0.45 m/s². Catches accel pulses where the power proxy may be
+        muted (regen interaction, low-SOC, brief transients).
+
+    Either trigger met for SOFT_CAP_ENTER_FRAMES (300 ms) -> enter.
+    Power drops `SOFT_CAP_POWER_EXIT_KW_MARGIN` below threshold AND
+    aBasis below fallback for SOFT_CAP_EXIT_FRAMES (2 s) -> exit.
+    Brake forces immediate exit. Minimum dwell of 1 s prevents rapid
+    cap/recover/cap cycling on rolling grades.
+    """
     if brake_pressed:
+      # Record exit frame so the post-cap settle window applies after brake
+      # release — otherwise recovery could fire immediately on brake release.
+      if self._soft_cap_on:
+        self._soft_cap_exited_frame = frame
       self._soft_cap_on = False
       self._soft_cap_trigger_frames = 0
+      self._soft_cap_clean_frames = 0
+      # Brake is authoritative override — kill any pending recovery target.
+      self._pre_cap_set_speed = 0.0
       return False
-    enter_cond = (
-      v_ego > SOFT_CAP_V_EGO_FLOOR_MS
-      and est_power_w > SOFT_CAP_POWER_ENTER_FRAC * power_threshold_w
-      and abasis > SOFT_CAP_ABASIS_ENTER
-    )
+
+    high_load = est_power_w > power_threshold_w
+    high_abasis = abasis > SOFT_CAP_ABASIS_FALLBACK
+    enter_cond = (v_ego > SOFT_CAP_V_EGO_FLOOR_MS) and (high_load or high_abasis)
+    # Clamp exit threshold so a very low slider value doesn't push it negative
+    # (which would deadlock — `est_power_w < negative` never true). Use a small
+    # positive floor and `<=` so power=0 always satisfies the exit threshold.
+    exit_threshold_w = max(500.0, power_threshold_w - SOFT_CAP_POWER_EXIT_KW_MARGIN * 1000.0)
     exit_cond = (
       v_ego < SOFT_CAP_V_EGO_EXIT_MS
-      or est_power_w < SOFT_CAP_POWER_EXIT_FRAC * power_threshold_w
+      or (est_power_w <= exit_threshold_w and abasis < SOFT_CAP_ABASIS_FALLBACK)
     )
+
     if enter_cond:
       self._soft_cap_trigger_frames += 1
       self._soft_cap_clean_frames = 0
-      if self._soft_cap_trigger_frames >= SOFT_CAP_ENTER_FRAMES:
+      if not self._soft_cap_on and self._soft_cap_trigger_frames >= SOFT_CAP_ENTER_FRAMES:
         self._soft_cap_on = True
+        self._soft_cap_entered_frame = frame
     elif exit_cond:
       self._soft_cap_clean_frames += 1
       self._soft_cap_trigger_frames = 0
-      if self._soft_cap_clean_frames >= SOFT_CAP_EXIT_FRAMES:
+      # Honor minimum dwell — don't drop the cap the instant load eases.
+      held_long_enough = (frame - self._soft_cap_entered_frame) >= SOFT_CAP_MIN_DWELL_FRAMES
+      if (
+        self._soft_cap_on
+        and held_long_enough
+        and self._soft_cap_clean_frames >= SOFT_CAP_EXIT_FRAMES
+      ):
         self._soft_cap_on = False
+        self._soft_cap_exited_frame = frame
     return self._soft_cap_on
 
   def _record_tx(self, frame: int, button: int) -> None:
@@ -369,22 +463,21 @@ class EVLimiter:
     abasis = float(getattr(CS, "accel_demand", 0.0))
     dte_raw = float(getattr(CS, "dte_raw", 0.0))
 
-    # engage rising edge -> seed user_target from observed; reset adjust state
+    # engage rising edge -> seed user_target from observed; clear pre_cap latch
     if cc_enabled and not self.was_cc_enabled:
       self.user_target_speed = observed_set_speed
-      self._last_observed_set_speed = observed_set_speed
       self._pre_cap_set_speed = 0.0
     self.was_cc_enabled = cc_enabled
 
     # Driver wheel input — always processed (background user_target tracking
-    # + override windows), even when we're going to HOLD this tick.
-    self._process_button_events(CS, frame)
+    # + override windows), even when we're going to HOLD this tick. RES extends
+    # pre_cap_set (only if a latch already exists); SET/CANCEL clears it.
+    self._process_button_events(CS, observed_set_speed, frame)
 
-    # Driver-adjustment window: snap user_target to observed if observed jumped
-    # by more than per-edge ±1 mph and the change isn't attributable to our TX.
-    # Handles the Hyundai SCC 5-mph quantization on held buttons.
-    self._maybe_snap_user_target(observed_set_speed, frame)
-    self._last_observed_set_speed = observed_set_speed
+    # Observe the SCC's 5-mph quantization step that lands a few frames after
+    # a held driver button — display/recovery-target tracking only, never
+    # used as a control input.
+    self._maybe_observe_quantization(observed_set_speed, frame)
 
     if not cc_enabled:
       # Control internals reset after 200 ms cc-off, but user_target persists.
@@ -409,77 +502,97 @@ class EVLimiter:
     in_override_set = self._in_driver_override_set(frame)
     in_override_res = self._in_driver_override_res(frame)
 
-    # Soft cap state (independent of override — we might still SET if cap trips and no RES override)
+    # Soft cap state. Power threshold from param is taken at face value
+    # (no 0.75x multiplier). Latches pre_cap_set on rising edge.
     soft_cap_prev = self._soft_cap_on
-    soft_cap = self._update_soft_cap(v_ego, brake_pressed, est_power_w, abasis, power_threshold_w)
-    # Latch pre-cap observed speed on SOFT_CAP rising edge — recovery aims back
-    # at THIS value, not stale user_target. Cleared on driver edge (in
-    # _process_button_events above) or once recovery completes.
+    soft_cap = self._update_soft_cap(v_ego, brake_pressed, est_power_w, abasis,
+                                     power_threshold_w, frame)
     if soft_cap and not soft_cap_prev:
-      self._pre_cap_set_speed = observed_set_speed
+      # Latch the observed set speed at the moment cap engaged — that's where
+      # recovery should aim. If a previous latch is still alive (driver pressed
+      # RES during the prior cap cycle), keep the higher value.
+      self._pre_cap_set_speed = max(self._pre_cap_set_speed, observed_set_speed)
 
-    # Soft ceiling (only meaningful when soft_cap fires)
-    soft_ceiling_ms = v_ego + CONSTANT_MAX_GAP_MPH * MPH_TO_MS
+    # Soft ceiling: pull observed down to vEgo + small margin (was vEgo + 20).
+    # Margin keeps SCC from commanding *deceleration*; just removes accel demand.
+    soft_ceiling_ms = v_ego + SOFT_CAP_CEILING_MARGIN_MPH * MPH_TO_MS
     over_soft_ceiling = observed_set_speed > soft_ceiling_ms + 0.5 * MPH_TO_MS
 
-    # Candidate action picking
-    #
-    # Per gpt-5.5 review (4/27): the previous "hard user_target cap" was the
-    # cause of the limiter fighting driver RES presses. Hyundai SCC steps
-    # observed by 5 mph on a held button while we count 1 ButtonEvent edge
-    # per press, so observed routinely outran user_target — the hard cap then
-    # cascaded SET presses to drag observed back down. ICE protection is
-    # actually provided by the soft cap (load + accel + persistence + hyst).
-    # The hard user_target cap is GONE.
+    # One-direction-at-a-time gates: after we just pressed SET, block our own
+    # RES for a window so the cluster doesn't tick down/up/down. Same
+    # symmetrically for RES blocking SET.
+    self_set_recent = (frame - self.last_set_frame) < LIMITER_OPPOSITE_DIR_BLOCK_FRAMES
+    self_res_recent = (frame - self.last_res_frame) < LIMITER_OPPOSITE_DIR_BLOCK_FRAMES
+
+    # Recovery latch maintenance: clear once observed catches up to the
+    # recovery target. ONLY clear when soft cap is off — during an active
+    # cap cycle, observed sits at or above the latched value (the latch was
+    # taken at the cap's rising edge and the SET cascade hasn't pulled
+    # observed down yet), so we'd otherwise spuriously clear the latch in
+    # the very first cap-active frame. After the cap exits, the SET cascade
+    # has lowered observed below the latch, and recovery (or driver RES)
+    # gradually brings it back up; when it reaches the target, clear.
+    if (
+      not self._soft_cap_on
+      and self._pre_cap_set_speed > 0.5 * MPH_TO_MS
+      and observed_set_speed >= self._pre_cap_set_speed - 0.1 * MPH_TO_MS
+    ):
+      self._pre_cap_set_speed = 0.0
+
     button = Buttons.NONE
-    state = STATE_IDLE
+
+    # State reporting from internal flags (NOT TX outcome). Driver overrides
+    # take priority over cap/recovery for HUD purposes — when the driver is
+    # actively pressing buttons, the relevant signal to the driver is "we're
+    # respecting your input," even if soft_cap is technically still on.
+    if in_override_set:
+      base_state = STATE_DRIVER_OVERRIDE_SET
+    elif in_override_res:
+      base_state = STATE_DRIVER_OVERRIDE_RES
+    elif soft_cap:
+      base_state = STATE_SOFT_CAP_ACTIVE
+    elif self._pre_cap_set_speed > 0.5 * MPH_TO_MS \
+         and observed_set_speed < self._pre_cap_set_speed - RECOVERY_DEADBAND_MS \
+         and not gas_pressed and not brake_pressed and v_ego > RECOVERY_V_EGO_FLOOR_MS:
+      base_state = STATE_RECOVERY_ACTIVE
+    else:
+      base_state = STATE_IDLE
+    state = base_state
 
     want_set = soft_cap and over_soft_ceiling
     if want_set:
-      suppressed = in_override_res
+      # Block SET on driver RES override or recent self-RES.
+      suppressed = in_override_res or self_res_recent
       if not suppressed:
         if (frame - self.last_set_frame) >= SET_COOLDOWN_FRAMES:
           if self._consume_global_rate_limit(frame, BURST_COPIES):
             button = Buttons.SET_DECEL
-            state = STATE_SOFT_CAP_ACTIVE
-      else:
-        state = STATE_DRIVER_OVERRIDE_RES
     else:
-      # Recovery target is the latched pre-cap observed speed, not user_target.
-      # If pre_cap_set_speed is 0 (no cap event since last driver edge / engage)
-      # there's nothing to recover toward and we stay idle.
+      # Recovery aims at pre_cap_set (latched at last cap entry, possibly
+      # extended by driver RES). Won't fire if pre_cap_set wasn't latched
+      # (no cap event), driver SET cleared it, or driver pressed gas/brake.
       recovery_target = self._pre_cap_set_speed
       below_target = (
         recovery_target > 0.5 * MPH_TO_MS
         and observed_set_speed < recovery_target - RECOVERY_DEADBAND_MS
       )
       standstill_clear = (frame - self._left_standstill_at_frame) >= RECOVERY_AFTER_STANDSTILL_FRAMES
+      cap_settle_clear = (frame - self._soft_cap_exited_frame) >= RECOVERY_AFTER_CAP_EXIT_FRAMES
       may_recover = (
         below_target
         and not soft_cap
         and not in_override_set
         and not gas_pressed
+        and not brake_pressed
+        and not self_set_recent
         and v_ego > RECOVERY_V_EGO_FLOOR_MS
         and standstill_clear
+        and cap_settle_clear
       )
       if may_recover:
         if (frame - self.last_res_frame) >= RES_COOLDOWN_FRAMES:
           if self._consume_global_rate_limit(frame, BURST_COPIES):
             button = Buttons.RES_ACCEL
-            state = STATE_RECOVERY_ACTIVE
-        # Recovery completes when observed catches up — clear the latch so we
-        # don't keep RES'ing into infinity if observed overshoots.
-        if observed_set_speed >= recovery_target - 0.1 * MPH_TO_MS:
-          self._pre_cap_set_speed = 0.0
-      else:
-        if in_override_set:
-          state = STATE_DRIVER_OVERRIDE_SET
-        elif in_override_res:
-          state = STATE_DRIVER_OVERRIDE_RES
-        elif soft_cap:
-          state = STATE_SOFT_CAP_ACTIVE
-        else:
-          state = STATE_IDLE
 
     if button != Buttons.NONE:
       self._record_tx(frame, button)
