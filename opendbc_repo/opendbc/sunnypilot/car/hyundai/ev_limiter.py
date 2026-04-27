@@ -139,6 +139,8 @@ LIMITER_OPPOSITE_DIR_BLOCK_FRAMES = 150  # after our SET, block our RES for 1.5 
 # held buttons. During this window we update HUD-display user_target and the
 # recovery-target latch from observed; we do NOT use it for any cap/control.
 DRIVER_ADJUST_WINDOW_FRAMES = 30         # 300 ms — long enough to see the cluster respond
+TX_ECHO_ATTRIBUTION_FRAMES = 20          # 200 ms — observed changes within this window of
+                                          # our last TX are attributed to us, not the driver
 
 # user_target clamp range
 MPH_TO_MS = 0.44704
@@ -252,13 +254,14 @@ class EVLimiter:
     First matching event within ECHO_FILTER_FRAMES of our TX is swallowed
     as our own echo; subsequent events pass through.
 
-    Per drive #3 fix:
-    - Driver RES extends pre_cap_set instead of clearing it (RES aligns with
-      recovery direction, so we should keep the recovery target alive).
-    - Driver SET / CANCEL clears pre_cap_set (driver wants lower / off-CC).
-    - user_target follows physical edges only (±1 mph each). It does NOT
-      auto-snap to observed; the SCC's 5-mph quantization on held presses is
-      handled by extending pre_cap_set with `max(observed)` instead.
+    Per drive #3 fix + gpt-5.5 v2 review:
+    - Physical driver edges adjust user_target by ±1 mph each.
+    - The SCC's 5-mph quantization step that follows a held button is
+      caught later in _maybe_observe_quantization (display + recovery-
+      target tracking only — never used as a control input).
+    - Driver RES extends pre_cap_set ONLY if a latch already exists (no
+      cap, no recovery target — RES alone shouldn't manufacture one).
+    - Driver SET / CANCEL clears pre_cap_set.
     """
     echo_window_open = (
       self._pending_echo_button != Buttons.NONE
@@ -316,11 +319,8 @@ class EVLimiter:
     if frame >= self._driver_adjust_until:
       return
     # Don't react to observed changes that are likely our own SET/RES landing.
-    # Window must be longer than the cluster's response to one of our presses;
-    # 200 ms is a conservative bound (vs 80 ms which is the echo-filter window
-    # for the buttonEvent stream — a different timing concern).
     last_tx_frame = max(self.last_set_frame, self.last_res_frame)
-    if (frame - last_tx_frame) < 20:  # 200 ms attribution window
+    if (frame - last_tx_frame) < TX_ECHO_ATTRIBUTION_FRAMES:
       return
     # Pick whichever driver edge is MORE RECENT (so a SET right after a RES
     # routes through the SET branch correctly).
@@ -362,21 +362,21 @@ class EVLimiter:
 
   def _update_soft_cap(self, v_ego, brake_pressed, est_power_w, abasis,
                        power_threshold_w, frame: int) -> bool:
-    """Detect ICE-imminent conditions and gate SOFT_CAP entry/exit.
+    """Detect high-load conditions and gate SOFT_CAP entry/exit.
 
     Two parallel triggers:
       - Power load: estimated motor power exceeds the user's threshold
         directly (no 0.75x multiplier — slider value is what fires).
         Best signal for steady high-load conditions like grades.
       - aBasis fallback: commanded longitudinal accel sustained above
-        +0.45 m/s². Catches accel pulses where the power proxy may be
+        +0.7 m/s². Catches accel pulses where the power proxy may be
         muted (regen interaction, low-SOC, brief transients).
 
     Either trigger met for SOFT_CAP_ENTER_FRAMES (300 ms) -> enter.
     Power drops `SOFT_CAP_POWER_EXIT_KW_MARGIN` below threshold AND
     aBasis below fallback for SOFT_CAP_EXIT_FRAMES (2 s) -> exit.
-    Brake forces immediate exit. Minimum dwell of 1 s prevents rapid
-    cap/recover/cap cycling on rolling grades.
+    Brake forces immediate exit AND clears the recovery latch. Minimum
+    dwell of 1 s prevents rapid cap/recover/cap cycling on rolling grades.
     """
     if brake_pressed:
       # Record exit frame so the post-cap settle window applies after brake
@@ -545,7 +545,13 @@ class EVLimiter:
     # take priority over cap/recovery for HUD purposes — when the driver is
     # actively pressing buttons, the relevant signal to the driver is "we're
     # respecting your input," even if soft_cap is technically still on.
-    if in_override_set:
+    # Pick the more-recent driver edge if both windows overlap, so HUD
+    # shows the freshest driver intent.
+    if in_override_set and in_override_res:
+      set_age = frame - self._driver_set_last_frame
+      res_age = frame - self._driver_res_last_frame
+      base_state = STATE_DRIVER_OVERRIDE_SET if set_age <= res_age else STATE_DRIVER_OVERRIDE_RES
+    elif in_override_set:
       base_state = STATE_DRIVER_OVERRIDE_SET
     elif in_override_res:
       base_state = STATE_DRIVER_OVERRIDE_RES
@@ -553,7 +559,10 @@ class EVLimiter:
       base_state = STATE_SOFT_CAP_ACTIVE
     elif self._pre_cap_set_speed > 0.5 * MPH_TO_MS \
          and observed_set_speed < self._pre_cap_set_speed - RECOVERY_DEADBAND_MS \
-         and not gas_pressed and not brake_pressed and v_ego > RECOVERY_V_EGO_FLOOR_MS:
+         and not gas_pressed and not brake_pressed and v_ego > RECOVERY_V_EGO_FLOOR_MS \
+         and (frame - self._soft_cap_exited_frame) >= RECOVERY_AFTER_CAP_EXIT_FRAMES:
+      # Only show RECOVERING once the post-cap settle delay has elapsed —
+      # before that, RES TX is blocked anyway.
       base_state = STATE_RECOVERY_ACTIVE
     else:
       base_state = STATE_IDLE
