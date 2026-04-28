@@ -5,14 +5,18 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
 Onroad overlay for the EV power limiter. Always-on banner once CC has been
-engaged, deliberately positioned and sized so the driver can't miss it
-(the previous middle-right placement was reportedly invisible on the road).
+engaged, sized for the comma 4 (mici) 536×240 landscape display.
 
-Three lines, big font, top-center under the speed display:
+Three lines, anchored top-right next to the cluster set-speed circle
+(circle lives top-left at ~(21,14)→(183,176)). Drive #4 retro: previous
+56pt + TOP_MARGIN=200 layout assumed a much taller display and was rendered
+mostly off-screen — only the top ~40 px of the box was visible. iter5 sizes
+the widget for mici's actual screen and adds hard clamps so the box can
+never render off-screen even if a future device has different dimensions.
 
-   EV TARGET 65            <- driver's stored target (carStateSP.evLimiterUserTargetSpeed)
-   SET 55                  <- current cluster set speed (carState.cruiseState.speed)
-   STATE: LIMITING         <- limiter state (carStateSP.evLimiterState)
+   EV TGT 65            <- driver's stored target (carStateSP.evLimiterUserTargetSpeed)
+   SET 55               <- current cluster set speed (carState.cruiseState.speed)
+   STATE: LIMITING      <- limiter state (carStateSP.evLimiterState)
 
 Color codes the banner border:
   green  - IDLE / steady
@@ -29,14 +33,14 @@ from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.widgets import Widget
 
 
-FONT_SIZE_BIG = 56     # for TARGET / SET numbers
-FONT_SIZE_SMALL = 32   # for STATE label
-PAD_X = 22
-PAD_Y = 12
-LINE_GAP = 6
-BORDER_PX = 4
-TOP_MARGIN = 200       # below the cluster set-speed circle which lives top-left, but
-                        # we anchor center-top here for prominence
+FONT_SIZE_BIG = 24     # for TARGET / SET numbers (was 56 — too big for mici 240px-tall screen)
+FONT_SIZE_SMALL = 16   # for STATE label
+PAD_X = 12
+PAD_Y = 6
+LINE_GAP = 2
+BORDER_PX = 2
+RIGHT_MARGIN = 14      # distance from screen right edge
+TOP_MARGIN = 14        # distance from screen top edge
 
 STATE_NAMES = {
   0: "IDLE",
@@ -100,8 +104,8 @@ class EVLimiterIndicator(Widget):
     target_disp = int(round(user_target_ms * conv)) if user_target_ms > 0.5 else 0
     set_disp = int(round(set_speed_ms * conv)) if set_speed_ms > 0.5 else 0
 
-    target_str = f"EV TARGET  {target_disp} {unit}" if target_disp > 0 else f"EV TARGET  -- {unit}"
-    set_str = f"SET  {set_disp} {unit}" if set_disp > 0 else f"SET  --"
+    target_str = f"EV TGT {target_disp} {unit}" if target_disp > 0 else f"EV TGT -- {unit}"
+    set_str = f"SET {set_disp} {unit}" if set_disp > 0 else f"SET --"
     state_str = f"STATE: {STATE_NAMES.get(state, str(state))}"
     border_color = STATE_COLORS.get(state, STATE_COLORS[0])
 
@@ -115,14 +119,15 @@ class EVLimiterIndicator(Widget):
     content_h = s_target.y + s_set.y + s_state.y + LINE_GAP * 2
     box_h = content_h + PAD_Y * 2
 
-    # Center horizontally, fixed vertical anchor near the top so it sits below
-    # the cluster set-speed circle and above the lane preview.
-    box = rl.Rectangle(
-      rect.x + (rect.width - box_w) / 2,
-      rect.y + TOP_MARGIN,
-      box_w,
-      box_h,
-    )
+    # Anchor top-right next to the cluster set-speed circle (cluster lives
+    # top-left). Hard-clamp into rect so an unexpectedly small display can
+    # never push the box off-screen — drive #4 hit this exactly: 240 px
+    # tall display + TOP_MARGIN=200 + 140 px box = 100 px clipped.
+    box_x = rect.x + rect.width - box_w - RIGHT_MARGIN
+    box_y = rect.y + TOP_MARGIN
+    box_x = max(rect.x, min(box_x, rect.x + rect.width - box_w))
+    box_y = max(rect.y, min(box_y, rect.y + rect.height - box_h))
+    box = rl.Rectangle(box_x, box_y, box_w, box_h)
 
     # Background (semi-transparent dark) + colored border framing
     rl.draw_rectangle_rounded(box, 0.18, 10, rl.Color(0x10, 0x10, 0x14, 0xcc))

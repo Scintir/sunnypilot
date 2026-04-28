@@ -441,9 +441,10 @@ struct CarStateSP @0xb86e6369214c01c8 {
   evLimiterSetSpeedOffset @2 :Float32;            # user target minus effective set speed, m/s (UI converts to mph/kph)
   accelDemand @3 :Float32;                        # TCS13.aBasis, m/s^2 (aggregated: driver + SCC + control overlay)
   dteRaw @4 :UInt16;                              # CLU13.CF_Clu_DTE, 10-bit raw cluster distance-to-empty
-  estPowerW @5 :Float32;                          # mass * max(0, aBasis) * vEgo, W -- propulsion power demand proxy
+  estPowerW @5 :Float32;                          # mass * max(0, aBasis + uphill_grade_accel) * vEgo, W -- grade-aware propulsion power demand proxy
   evLimiterUserTargetSpeed @6 :Float32;           # m/s — driver's intended set speed (what HUD should say "recover to")
   evLimiterState @7 :UInt8;                       # state-machine enum: 0 IDLE, 1 STANDSTILL_HOLD, 2 SOFT_CAP_ACTIVE, 3 RECOVERY_ACTIVE, 4 DRIVER_OVERRIDE_SET, 5 DRIVER_OVERRIDE_RES, 6 BUS_FAULT_HOLD, 7 DISABLED
+  evLimiterGradeAccel @8 :Float32;                # m/s^2, signed; LP-filtered (LONG_ACCEL - aEgo). Positive = uphill. Used to grade-correct estPowerW.
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

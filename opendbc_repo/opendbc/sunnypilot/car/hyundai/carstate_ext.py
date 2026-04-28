@@ -21,11 +21,24 @@ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 _EV_SIGNALS_MISSING_WARNED = False
 
 # Approximate curb mass of a 2022 Santa Fe PHEV (kg). Used to turn
-# aBasis (m/s^2) + vEgo (m/s) into an estimated propulsion power (W):
-#   P ~= mass * max(0, aBasis) * vEgo
-# Off by O(10%) because it ignores grade and drag losses, but precise
-# enough for an "ICE-about-to-engage" threshold the user tunes by hand.
+# aBasis (m/s^2) + grade contribution + vEgo (m/s) into an estimated
+# propulsion-power demand (W) that's used as the SOFT_CAP trigger:
+#   P ~= mass * max(0, aBasis + max(0, grade_accel)) * vEgo
+# Drag is intentionally NOT modelled — what we want is *marginal* demand
+# above flat-cruise baseline, since flat cruise rarely engages ICE.
 VEHICLE_MASS_KG = 1950.0
+
+# Grade derivation from CAN-only signals (no openpilot service dependency).
+# Body-frame longitudinal accel (ESP12.LONG_ACCEL) ≈ inertial accel + g·sin(pitch),
+# while wheel-speed-derived aEgo is purely inertial in the ground frame, so:
+#   g·sin(pitch) ≈ LONG_ACCEL - aEgo
+# Sign verified empirically in drive #4 (corr +0.65 across 17.6k samples;
+# bin analysis: ratio ≈ 0.94 of geometric expectation across pitch range).
+GRADE_FILTER_TAU_S = 1.0                  # ~1 s LP for grade — slow grade vs noisy axle accel
+GRADE_FILTER_DT_S = 0.01                  # carstate_ext.update() runs at 100 Hz (card.py Ratekeeper)
+GRADE_FILTER_ALPHA = GRADE_FILTER_DT_S / (GRADE_FILTER_TAU_S + GRADE_FILTER_DT_S)
+GRADE_ACCEL_RAW_CLIP_MS2 = 1.5            # clip raw input before filtering
+GRADE_ACCEL_FILTERED_CLIP_MS2 = 1.0       # clip filtered output (≈10% grade ceiling)
 
 
 class CarStateExt:
@@ -34,6 +47,7 @@ class CarStateExt:
     self.CP_SP = CP_SP
 
     self.aBasis = 0.0
+    self.grade_accel_filtered = 0.0  # m/s^2, signed; positive = uphill
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -98,8 +112,10 @@ class CarStateExt:
 
     Trigger input is an estimated propulsion power computed from TCS13.aBasis
     (aggregated longitudinal-accel demand — includes driver + stock SCC +
-    control overlay) times vEgo times an approximate vehicle mass. DTE comes
-    from the cluster (CLU13.CF_Clu_DTE) as a "battery has juice" proxy.
+    control overlay) plus a grade-correction term derived from
+    ESP12.LONG_ACCEL minus aEgo, times vEgo times an approximate vehicle
+    mass. DTE comes from the cluster (CLU13.CF_Clu_DTE) as a "battery has
+    juice" proxy.
 
     Gated on the HYBRID flag since the limiter itself is HYBRID-only.
     """
@@ -109,9 +125,48 @@ class CarStateExt:
     try:
       abasis = float(cp.vl["TCS13"]["aBasis"])
       v_ego = float(ret.vEgo)
-      power_w = VEHICLE_MASS_KG * max(0.0, abasis) * v_ego
+
+      # Grade derivation (sign verified, drive #4 logs):
+      #   body-frame LONG_ACCEL ≈ inertial accel + g·sin(pitch)
+      #   ground-frame aEgo     ≈ inertial accel
+      # So grade_accel ≈ LONG_ACCEL - aEgo, positive on uphill.
+      # ESP12 is missing on some Hyundai PT buses (lazy `cp.vl[...]` access
+      # raises AssertionError when the DBC doesn't define the message). On
+      # miss we hold the last filter value rather than resetting — for a
+      # transient miss after a valid history that stays conservative; on a
+      # car that never has ESP12 at all the filter starts and stays at 0.
+      try:
+        long_accel = float(cp.vl["ESP12"]["LONG_ACCEL"])
+        a_ego = float(ret.aEgo)
+        grade_accel_raw = long_accel - a_ego
+        if grade_accel_raw > GRADE_ACCEL_RAW_CLIP_MS2:
+          grade_accel_raw = GRADE_ACCEL_RAW_CLIP_MS2
+        elif grade_accel_raw < -GRADE_ACCEL_RAW_CLIP_MS2:
+          grade_accel_raw = -GRADE_ACCEL_RAW_CLIP_MS2
+        # First-order LP at ~1 s τ to smooth axle/IMU noise; sign retained
+        # so consumers can see downhill grades for HUD/debug.
+        self.grade_accel_filtered += GRADE_FILTER_ALPHA * (grade_accel_raw - self.grade_accel_filtered)
+      except (KeyError, AssertionError):
+        pass
+
+      grade_f = self.grade_accel_filtered
+      if grade_f > GRADE_ACCEL_FILTERED_CLIP_MS2:
+        grade_f = GRADE_ACCEL_FILTERED_CLIP_MS2
+      elif grade_f < -GRADE_ACCEL_FILTERED_CLIP_MS2:
+        grade_f = -GRADE_ACCEL_FILTERED_CLIP_MS2
+      # Only the uphill component contributes to ICE-engagement risk.
+      # max(0, …) is applied AFTER filtering — applying it before would
+      # let positive-side noise bias the filter on flat ground.
+      uphill_grade = max(0.0, grade_f)
+
+      effective_accel = max(0.0, abasis + uphill_grade)
+      power_w = VEHICLE_MASS_KG * effective_accel * v_ego
+
       ret_sp.accelDemand = abasis
       ret_sp.estPowerW = power_w
+      # Publish the clipped value — that's what consumers should see, and it
+      # matches the schema comment about a ±1.0 m/s² ceiling.
+      ret_sp.evLimiterGradeAccel = float(grade_f)
       self.accel_demand = abasis
       self.est_power_w = power_w
     except KeyError as e:

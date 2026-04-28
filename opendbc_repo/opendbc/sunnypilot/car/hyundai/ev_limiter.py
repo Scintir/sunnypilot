@@ -92,9 +92,29 @@ FRAMES_PER_SEC = 100
 
 # Burst / cadence
 BURST_COPIES = 2                         # copies per commanded frame
-SET_COOLDOWN_FRAMES = 30                 # 300 ms between commanded SET frames
-RES_COOLDOWN_FRAMES = 40                 # 400 ms between commanded RES frames
-GLOBAL_RATE_LIMIT_PRESSES_PER_SEC = 6    # logical presses (incl. bursts) per rolling second
+SET_COOLDOWN_FRAMES = 30                 # 300 ms between commanded SET frames (default)
+RES_COOLDOWN_FRAMES = 80                 # 800 ms between commanded RES frames
+                                          # (was 400 ms = 2.5 mph/s. Drive #4: user reported
+                                          # recovery ramp felt "way too aggressive". Halved
+                                          # to 1.25 mph/s for gentler ramp toward user_target;
+                                          # the load gate still pauses entirely if power/aBasis
+                                          # crosses pause thresholds, so this is just a softer
+                                          # baseline rate, not a safety mechanism.)
+# Auto-resume guard: faster SET cadence right after engage so SOFT_CAP can
+# keep up with Hyundai SCC's autonomous resume-ramp (~5-8 mph/s observed).
+# Active for AUTO_RESUME_GUARD_FRAMES post-engage and only when SOFT_CAP is
+# firing — so we don't burn rate-limit budget when there's nothing to fight.
+AUTO_RESUME_GUARD_FRAMES = 500           # 5 s post-engage window
+AUTO_RESUME_SET_COOLDOWN_FRAMES = 15     # 150 ms during guard + SOFT_CAP (vs 300 ms default)
+# Disabled-frame RES press lookback: a wheel RES button event can land 1-2
+# frames before cc_enabled rises (CAN ordering / SCC state propagation), so
+# if we look only at the engage frame's buttonEvents we'll miss it. 20 frames
+# = 200 ms is more than enough latitude for that race without false positives
+# from older disabled-state presses.
+DISABLED_RES_ENGAGE_WINDOW_FRAMES = 20
+GLOBAL_RATE_LIMIT_PRESSES_PER_SEC = 6    # LOGICAL presses per rolling second; burst copies
+                                          # are reliability dupes for the cluster, not separate
+                                          # commands, so they don't count.
 ECHO_FILTER_FRAMES = 8                   # 80 ms, first matching event only
 
 # Driver-priority window lengths
@@ -129,7 +149,23 @@ SOFT_CAP_CEILING_MARGIN_MPH = 2.0
 # Recovery
 RECOVERY_DEADBAND_MS = 1.0 * 0.44704     # 1 mph deadband around recovery target
 RECOVERY_V_EGO_FLOOR_MS = 3 * 0.44704    # must be moving
-RECOVERY_AFTER_CAP_EXIT_FRAMES = 200     # 2 s settle after SOFT_CAP exits before RES'ing
+RECOVERY_AFTER_CAP_EXIT_FRAMES = 30      # 300 ms settle after SOFT_CAP exits before RES'ing
+                                          # (was 2 s — double-counted SOFT_CAP_EXIT_FRAMES'
+                                          # 2 s clean-exit hysteresis. Drive #4 forensic
+                                          # showed deterministic 2 s dead time before recovery
+                                          # ramp; 300 ms is enough for the SCC to acknowledge
+                                          # cap exit before the first RES press lands.)
+
+# Recovery load gate — hysteresis on power headroom and aBasis.
+# Pause recovery when load is nearing the SOFT_CAP threshold so RES presses
+# don't push the motor across the ICE-engage boundary, and when commanded
+# accel is rising (transient veto). Resume only when both signals are well
+# below the pause thresholds — single-threshold gating produced press/no-press
+# chatter at the boundary in iter4 simulator runs.
+RECOVERY_POWER_PAUSE_FRAC = 0.60         # pause when est_power_w > 60% of cap
+RECOVERY_POWER_RESUME_FRAC = 0.50        # resume when est_power_w < 50% of cap
+RECOVERY_ABASIS_PAUSE_MS2 = 0.4          # pause when commanded longitudinal accel > 0.4 m/s²
+RECOVERY_ABASIS_RESUME_MS2 = 0.25        # resume when it falls below 0.25 m/s²
 
 # One-direction-at-a-time cooldowns to prevent visible oscillation
 LIMITER_OPPOSITE_DIR_BLOCK_FRAMES = 150  # after our SET, block our RES for 1.5 s, and vice versa
@@ -208,6 +244,20 @@ class EVLimiter:
     # Driver-adjust observation window — see DRIVER_ADJUST_WINDOW_FRAMES doc
     self._driver_adjust_until = -10000
 
+    # Recovery load-gate hysteresis state
+    self._recovery_load_paused = False
+
+    # Pre-engage observed setpoint — frozen during DISABLED, used to seed
+    # user_target on RES re-engage (drive #4: SCC autonomously snaps cluster
+    # up on RES; reading post-engage observed gives a polluted seed).
+    self._observed_set_speed_at_disable = 0.0
+    # Last frame a physical RES press was seen while DISABLED. The engage
+    # frame may not contain the press itself if cc_enabled rises 1-2 frames
+    # later, so engage classification looks back this far.
+    self._last_disabled_res_press_frame = -10000
+    # Engage frame, used to gate the auto-resume faster-SET-cadence window.
+    self._engage_frame = -10000
+
     # Published burst count (carcontroller reads this each frame)
     self.current_burst_count = BURST_COPIES
 
@@ -237,19 +287,24 @@ class EVLimiter:
 
   # ----- Helpers ----------------------------------------------------------
 
-  def _consume_global_rate_limit(self, frame: int, copies: int) -> bool:
-    """Return True and record the TX if adding `copies` presses in the last
-    1 s stays at or under GLOBAL_RATE_LIMIT_PRESSES_PER_SEC. Otherwise drop."""
+  def _consume_global_rate_limit(self, frame: int, n_logical: int) -> bool:
+    """Return True and record the TX if adding `n_logical` logical button
+    commands in the last 1 s stays at or under GLOBAL_RATE_LIMIT_PRESSES_PER_SEC.
+
+    Burst copies are reliability duplicates (same logical press repeated for
+    the cluster to see), so callers pass 1 per logical command — not BURST_COPIES.
+    """
     cutoff = frame - FRAMES_PER_SEC
     while self.press_history and self.press_history[0][0] < cutoff:
       self.press_history.popleft()
     total = sum(c for _, c in self.press_history)
-    if total + copies > GLOBAL_RATE_LIMIT_PRESSES_PER_SEC:
+    if total + n_logical > GLOBAL_RATE_LIMIT_PRESSES_PER_SEC:
       return False
-    self.press_history.append((frame, copies))
+    self.press_history.append((frame, n_logical))
     return True
 
-  def _process_button_events(self, CS, observed_set_speed: float, frame: int) -> None:
+  def _process_button_events(self, CS, observed_set_speed: float, frame: int,
+                              just_engaged: bool) -> None:
     """Feed driver wheel input into user_target + driver-override windows.
     First matching event within ECHO_FILTER_FRAMES of our TX is swallowed
     as our own echo; subsequent events pass through.
@@ -262,6 +317,14 @@ class EVLimiter:
     - Driver RES extends pre_cap_set ONLY if a latch already exists (no
       cap, no recovery target — RES alone shouldn't manufacture one).
     - Driver SET / CANCEL clears pre_cap_set.
+
+    Per drive #4 fix:
+    - When `just_engaged` (cc_enabled rising edge this frame), accelCruise
+      events are the user re-engaging cruise — NOT intent to accelerate.
+      Skip them entirely so we don't open a 3 s DRIVER_OVERRIDE_RES window
+      that suppresses SOFT_CAP during Hyundai SCC's autonomous resume-
+      ramp behavior. The engage-edge code already seeded user_target from
+      observed; bumping it +1 mph here would also be wrong.
     """
     echo_window_open = (
       self._pending_echo_button != Buttons.NONE
@@ -278,6 +341,13 @@ class EVLimiter:
           echo_window_open = False
           continue
       # Real driver press
+      if just_engaged and event.type in (ButtonType.accelCruise, ButtonType.decelCruise):
+        # Engage-edge SET/RES press: enabling cruise, NOT directional intent.
+        # Don't open DRIVER_OVERRIDE windows, don't bump user_target on top
+        # of the rising-edge seed. Stock SCC will autonomously resume on
+        # RES — the limiter must remain free to fire SOFT_CAP if that
+        # resume crosses the load threshold (drive #4 fix).
+        continue
       if event.type == ButtonType.decelCruise:
         self.user_target_speed -= MPH_TO_MS
         self._driver_set_last_frame = frame
@@ -463,29 +533,91 @@ class EVLimiter:
     abasis = float(getattr(CS, "accel_demand", 0.0))
     dte_raw = float(getattr(CS, "dte_raw", 0.0))
 
-    # engage rising edge -> seed user_target from observed; clear pre_cap latch
-    if cc_enabled and not self.was_cc_enabled:
-      self.user_target_speed = observed_set_speed
+    # Handle DISABLED state EARLY — track engage-classification inputs but
+    # do NOT process button events through the normal driver-adjust path.
+    # Drive #4 race fix: a wheel RES press can land 1-2 frames before
+    # cc_enabled rises (CAN ordering). If we processed it as if cruise were
+    # active we'd open DRV_RES + driver-adjust windows that survive the
+    # engage transition and corrupt the engage-edge seed.
+    if not cc_enabled:
+      # Track cluster's last-observed set so RES re-engage can seed
+      # user_target from this (vs SCC-polluted post-engage observed).
+      self._observed_set_speed_at_disable = observed_set_speed
+      # Note physical RES presses for engage classification — but only
+      # ones that are NOT our own TX echoes (we shouldn't TX while
+      # disabled, but defensive against stale echoes).
+      echo_window_open = (
+        self._pending_echo_button != Buttons.NONE
+        and (frame - self._pending_echo_frame) < ECHO_FILTER_FRAMES
+      )
+      our_type = TX_BUTTON_TO_EVENT_TYPE.get(self._pending_echo_button) if echo_window_open else None
+      for e in CS.out.buttonEvents:
+        if not e.pressed or e.type != ButtonType.accelCruise:
+          continue
+        if echo_window_open and our_type == ButtonType.accelCruise:
+          # Consume our own echo, don't count as physical press.
+          self._pending_echo_button = Buttons.NONE
+          echo_window_open = False
+          our_type = None
+          continue
+        self._last_disabled_res_press_frame = frame
+        break
+      # Drop stale driver-adjust / override state from a previous engaged
+      # session so the engage frame starts clean.
+      self._driver_adjust_until = -10000
+      self._driver_res_last_frame = -10000
+      self._driver_set_last_frame = -10000
+      # Reset control internals.
+      self._reset_tx_cadence()
+      self._soft_cap_on = False
+      self._soft_cap_trigger_frames = 0
+      self._standstill_trigger_frames = 0
+      self._recovery_load_paused = False
+      self.was_cc_enabled = cc_enabled
+      return self._publish(Buttons.NONE, STATE_DISABLED, observed_set_speed)
+
+    # cc_enabled is True from here on.
+    # Engage rising edge -> seed user_target; clear pre_cap latch.
+    just_engaged = not self.was_cc_enabled
+    engage_via_res = False
+    if just_engaged:
+      self._engage_frame = frame
+      # Engage via RES? Check current-frame buttonEvents AND recent
+      # disabled-frame RES presses (the wheel press may have landed before
+      # cc_enabled rose). Engage via SET / main-switch leaves observed
+      # clean (no SCC autonomous resume snap), so we only redirect the
+      # seed for engage_via_res cases.
+      for e in CS.out.buttonEvents:
+        if e.pressed and e.type == ButtonType.accelCruise:
+          engage_via_res = True
+          break
+      if not engage_via_res:
+        recent_disabled_res = (frame - self._last_disabled_res_press_frame) <= DISABLED_RES_ENGAGE_WINDOW_FRAMES
+        if recent_disabled_res:
+          engage_via_res = True
+      if engage_via_res and self._observed_set_speed_at_disable > 0.5 * MPH_TO_MS:
+        # Drive #4: SCC autonomously snaps cluster up on RES re-engage.
+        # Seed from the frozen pre-disable value instead.
+        self.user_target_speed = self._observed_set_speed_at_disable
+      else:
+        self.user_target_speed = observed_set_speed
       self._pre_cap_set_speed = 0.0
+      # Defensive: ensure no stale adjust window survives into engaged
+      # state (DISABLED branch already clears these but make it explicit
+      # for readers expecting engage-edge invariants).
+      self._driver_adjust_until = -10000
     self.was_cc_enabled = cc_enabled
 
-    # Driver wheel input — always processed (background user_target tracking
-    # + override windows), even when we're going to HOLD this tick. RES extends
-    # pre_cap_set (only if a latch already exists); SET/CANCEL clears it.
-    self._process_button_events(CS, observed_set_speed, frame)
+    # Driver wheel input — only processed when cc_enabled (disabled-state
+    # button events are handled in the DISABLED branch above). On the
+    # just_engaged frame, accelCruise events are skipped (engage press
+    # isn't accel intent).
+    self._process_button_events(CS, observed_set_speed, frame, just_engaged)
 
     # Observe the SCC's 5-mph quantization step that lands a few frames after
     # a held driver button — display/recovery-target tracking only, never
     # used as a control input.
     self._maybe_observe_quantization(observed_set_speed, frame)
-
-    if not cc_enabled:
-      # Control internals reset after 200 ms cc-off, but user_target persists.
-      self._reset_tx_cadence()
-      self._soft_cap_on = False
-      self._soft_cap_trigger_frames = 0
-      self._standstill_trigger_frames = 0
-      return self._publish(Buttons.NONE, STATE_DISABLED, observed_set_speed)
 
     if dte_raw <= dte_floor:
       return self._publish(Buttons.NONE, STATE_DISABLED, observed_set_speed)
@@ -539,6 +671,17 @@ class EVLimiter:
     ):
       self._pre_cap_set_speed = 0.0
 
+    # Update recovery load-gate hysteresis. Power thresholds scale with
+    # the user's slider so the gate stays meaningful at any cap setting.
+    pause_pwr_w = power_threshold_w * RECOVERY_POWER_PAUSE_FRAC
+    resume_pwr_w = power_threshold_w * RECOVERY_POWER_RESUME_FRAC
+    if self._recovery_load_paused:
+      if est_power_w < resume_pwr_w and abasis < RECOVERY_ABASIS_RESUME_MS2:
+        self._recovery_load_paused = False
+    else:
+      if est_power_w > pause_pwr_w or abasis > RECOVERY_ABASIS_PAUSE_MS2:
+        self._recovery_load_paused = True
+
     button = Buttons.NONE
 
     # State reporting from internal flags (NOT TX outcome). Driver overrides
@@ -570,11 +713,25 @@ class EVLimiter:
 
     want_set = soft_cap and over_soft_ceiling
     if want_set:
-      # Block SET on driver RES override or recent self-RES.
-      suppressed = in_override_res or self_res_recent
+      # SOFT_CAP fires only after 300 ms of high-load persistence (or aBasis
+      # fallback) — by the time we get here, the load signal is real, not
+      # noise. The driver-RES override window exists to respect "I want to
+      # accelerate" intent, but it does NOT extend to letting the motor
+      # cross the ICE-engage boundary. Per drive #4: SCC's autonomous
+      # resume on re-engage was suppressing SOFT_CAP for 3 s while the
+      # cluster ran 12 mph above target. Driver still has CANCEL/brake/SET
+      # to push back if SOFT_CAP is over-firing.
+      # Self-RES suppression remains — that prevents oscillation against
+      # our own recent RES bursts and is unrelated to driver intent.
+      suppressed = self_res_recent
       if not suppressed:
-        if (frame - self.last_set_frame) >= SET_COOLDOWN_FRAMES:
-          if self._consume_global_rate_limit(frame, BURST_COPIES):
+        # During the post-engage auto-resume window, fire SET at 150 ms
+        # cadence so we can keep up with SCC's 5-8 mph/s autonomous resume
+        # ramp. Outside the window, the default 300 ms cadence applies.
+        in_auto_resume_guard = (frame - self._engage_frame) < AUTO_RESUME_GUARD_FRAMES
+        set_cooldown = AUTO_RESUME_SET_COOLDOWN_FRAMES if in_auto_resume_guard else SET_COOLDOWN_FRAMES
+        if (frame - self.last_set_frame) >= set_cooldown:
+          if self._consume_global_rate_limit(frame, 1):
             button = Buttons.SET_DECEL
     else:
       # Recovery aims at pre_cap_set (latched at last cap entry, possibly
@@ -597,10 +754,11 @@ class EVLimiter:
         and v_ego > RECOVERY_V_EGO_FLOOR_MS
         and standstill_clear
         and cap_settle_clear
+        and not self._recovery_load_paused
       )
       if may_recover:
         if (frame - self.last_res_frame) >= RES_COOLDOWN_FRAMES:
-          if self._consume_global_rate_limit(frame, BURST_COPIES):
+          if self._consume_global_rate_limit(frame, 1):
             button = Buttons.RES_ACCEL
 
     if button != Buttons.NONE:
