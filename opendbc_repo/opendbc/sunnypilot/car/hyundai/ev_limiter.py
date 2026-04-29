@@ -141,13 +141,32 @@ STANDSTILL_CONFIRM_FRAMES = 20           # 200 ms persistence on entry
 RECOVERY_AFTER_STANDSTILL_FRAMES = 30    # 300 ms clean after standstill before RES allowed
 
 # Sliding cap (iter6 core mechanism). cluster_set is held within
-# `vEgo + dynamic_margin(vEgo)`. Wider at low speed so a stored set of
-# e.g. 60 mph at standstill doesn't drive aggressive launch accel; tight
-# at highway speed so SCC's accel demand stays bounded.
-LOW_SPEED_MARGIN_MPH = 20.0              # max set-vEgo gap at vEgo = 0
-HIGH_SPEED_MARGIN_MPH = 5.0              # max set-vEgo gap at vEgo >= MARGIN_BLEND_END_MPH
+# `vEgo + dynamic_margin(vEgo, est_power)`. Margin shape:
+#   - Wider at low speed so a stored set of e.g. 60 mph at standstill
+#     doesn't drive aggressive launch accel.
+#   - Tight at highway speed so SCC's accel demand stays bounded.
+#   - PLUS a low-load bonus (iter7): when est_power_w is well below the
+#     user's threshold, allow extra margin so SCC has room to accelerate
+#     toward user_target on flats. Drive #6 confirmed iter6's flat 5 mph
+#     cap throttled natural recovery to a crawl — vehicle and cluster_set
+#     stuck together at vEgo+5 because SCC's accel demand for a 5 mph gap
+#     under low load is essentially zero.
+LOW_SPEED_MARGIN_MPH = 20.0              # base margin at vEgo = 0
+HIGH_SPEED_MARGIN_MPH = 5.0              # base margin at vEgo >= MARGIN_BLEND_END_MPH
 MARGIN_BLEND_END_MPH = 30.0              # vEgo above this uses HIGH_SPEED_MARGIN_MPH; below
-                                          # this, margin interpolates linearly downward
+                                          # this, base margin interpolates linearly
+LOW_LOAD_BONUS_MPH = 10.0                # extra margin when load is well below threshold
+LOAD_BONUS_LOW_FRAC = 0.4                # below 40% of threshold = full bonus
+LOAD_BONUS_HIGH_FRAC = 0.8               # above 80% of threshold = no bonus
+                                          # (linear taper between)
+
+# Standstill SET (iter7). Drive #6: hard decel from cruise to red light
+# left cluster_set frozen mid-pulldown when raw_standstill kicked in (e.g.
+# stored 62 mph, cluster frozen at 31 because SET cascade lost the race).
+# Iter7 allows SET-only at standstill to pull set down toward the
+# LOW_SPEED_MARGIN cap of 20 mph. Bounded pulse count prevents runaway TX
+# if Hyundai SCC ignores SET at vEgo=0.
+STANDSTILL_SET_PULSE_CAP = 30            # max synthetic SETs per single standstill window
 
 # Down-trigger (SET) deadbands
 SET_TRIGGER_DEADBAND_MS = 0.5 * 0.44704  # 0.5 mph above target_set before we push down
@@ -229,6 +248,10 @@ class EVLimiter:
     self._standstill_trigger_frames = 0
     self._standstill_on = False
     self._left_standstill_at_frame = -10000
+    # iter7: bounded SET-pulse counter at standstill (prevents runaway TX
+    # if Hyundai SCC ignores SET commands at vEgo=0).
+    self._standstill_set_pulses = 0
+    self._was_in_standstill_last_frame = False
 
     # Driver-adjust observation window — see DRIVER_ADJUST_WINDOW_FRAMES doc
     self._driver_adjust_until = -10000
@@ -381,24 +404,49 @@ class EVLimiter:
     return self._standstill_on
 
   @staticmethod
-  def _dynamic_margin_ms(v_ego_ms: float) -> float:
-    """Sliding cap formula. Returns the maximum allowable
-    `cluster_set - vEgo` gap (m/s) given current vEgo (m/s):
+  def _dynamic_margin_ms(v_ego_ms: float, est_power_w: float, power_threshold_w: float) -> float:
+    """Sliding cap formula with iter7 power-aware bonus.
+
+    Base margin (vEgo-only):
       vEgo = 0       → LOW_SPEED_MARGIN_MPH (20 mph default)
       vEgo = 30 mph  → HIGH_SPEED_MARGIN_MPH (5 mph default)
       vEgo > 30 mph  → flat at HIGH_SPEED_MARGIN_MPH
-    Linear interpolation between the two endpoints. Wider margin at low
-    speed prevents a stored 60 mph from causing aggressive launch accel;
-    tight margin at highway speed bounds SCC's accel demand by construction.
+
+    Low-load bonus (iter7 dwell fix):
+      load_frac <= LOAD_BONUS_LOW_FRAC (0.4)  → +LOW_LOAD_BONUS_MPH (10 mph)
+      load_frac >= LOAD_BONUS_HIGH_FRAC (0.8) → +0 mph
+      between                                 → linear taper
+
+    Fail safe: if power_threshold_w is invalid (≤0), bonus is 0 — never
+    treat invalid threshold as low load.
     """
     v_ego_mph = v_ego_ms / MPH_TO_MS
     if v_ego_mph >= MARGIN_BLEND_END_MPH:
-      margin_mph = HIGH_SPEED_MARGIN_MPH
+      base_mph = HIGH_SPEED_MARGIN_MPH
     elif v_ego_mph <= 0.0:
-      margin_mph = LOW_SPEED_MARGIN_MPH
+      base_mph = LOW_SPEED_MARGIN_MPH
     else:
       frac = v_ego_mph / MARGIN_BLEND_END_MPH
-      margin_mph = LOW_SPEED_MARGIN_MPH + frac * (HIGH_SPEED_MARGIN_MPH - LOW_SPEED_MARGIN_MPH)
+      base_mph = LOW_SPEED_MARGIN_MPH + frac * (HIGH_SPEED_MARGIN_MPH - LOW_SPEED_MARGIN_MPH)
+
+    if power_threshold_w <= 0.0:
+      bonus_mph = 0.0
+    else:
+      load_frac = max(0.0, est_power_w) / power_threshold_w
+      if load_frac <= LOAD_BONUS_LOW_FRAC:
+        bonus_mph = LOW_LOAD_BONUS_MPH
+      elif load_frac >= LOAD_BONUS_HIGH_FRAC:
+        bonus_mph = 0.0
+      else:
+        taper = (LOAD_BONUS_HIGH_FRAC - load_frac) / (LOAD_BONUS_HIGH_FRAC - LOAD_BONUS_LOW_FRAC)
+        bonus_mph = LOW_LOAD_BONUS_MPH * taper
+
+    margin_mph = base_mph + bonus_mph
+    # Defensive clamp — should never trigger given the math above, but cheap insurance.
+    if margin_mph < base_mph:
+      margin_mph = base_mph
+    elif margin_mph > base_mph + LOW_LOAD_BONUS_MPH:
+      margin_mph = base_mph + LOW_LOAD_BONUS_MPH
     return margin_mph * MPH_TO_MS
 
   def _record_tx(self, frame: int, button: int) -> None:
@@ -526,21 +574,50 @@ class EVLimiter:
     if dte_raw <= dte_floor:
       return self._publish(Buttons.NONE, STATE_DISABLED, observed_set_speed)
 
-    # Standstill gate takes precedence over everything (fixes the 250-press/s
-    # stoplight spam). Emit absolutely nothing while held.
-    # raw_standstill fires immediately (no 20-frame confirm) so engaging
-    # while already stopped — or a brief sub-2 mph dip — suppresses TX
-    # in-frame. The confirm-based `_standstill_on` continues to track the
-    # post-standstill-clear hold-off for recovery (RECOVERY_AFTER_STANDSTILL).
+    # Standstill gate. raw_standstill fires immediately (no 20-frame confirm)
+    # so engaging while already stopped — or a brief sub-2 mph dip — suppresses
+    # RES in-frame. The confirm-based `_standstill_on` continues to track the
+    # post-standstill-clear hold-off (RECOVERY_AFTER_STANDSTILL).
+    #
+    # iter7: SET is allowed at standstill (pulse-bounded) so cluster_set can
+    # be pulled down toward LOW_SPEED_MARGIN_MPH (20 mph) at red lights,
+    # rather than being frozen wherever the deceleration SET cascade landed
+    # when raw_standstill kicked in (drive #6: cluster frozen at 31 with
+    # user_target=62). RES remains blocked at standstill.
     raw_standstill = (
       v_ego < STANDSTILL_V_EGO_MS
       or standstill_flag
       or (brake_pressed and v_ego < BRAKE_LOW_SPEED_V_EGO_MS)
     )
     standstill = self._update_standstill(v_ego, brake_pressed, standstill_flag)
-    if raw_standstill or standstill:
-      self._reset_tx_cadence()
-      self._left_standstill_at_frame = frame  # keep re-stamping so we can require clean time after exit
+    in_standstill = raw_standstill or standstill
+
+    # Reset SET-pulse counter on each entry to standstill.
+    if in_standstill and not self._was_in_standstill_last_frame:
+      self._standstill_set_pulses = 0
+    self._was_in_standstill_last_frame = in_standstill
+
+    if in_standstill:
+      self._left_standstill_at_frame = frame
+      # Allow SET only when cluster set is meaningfully above the standstill cap.
+      standstill_cap_ms = LOW_SPEED_MARGIN_MPH * MPH_TO_MS
+      set_above_cap = observed_set_speed > standstill_cap_ms + SET_TRIGGER_DEADBAND_MS
+      if (
+        set_above_cap
+        and not gas_pressed
+        and not brake_pressed
+        and self._standstill_set_pulses < STANDSTILL_SET_PULSE_CAP
+        and (frame - self.last_set_frame) >= SET_COOLDOWN_FRAMES
+        and self._consume_global_rate_limit(frame, 1)
+      ):
+        self._standstill_set_pulses += 1
+        self._record_tx(frame, Buttons.SET_DECEL)
+        return self._publish(Buttons.SET_DECEL, STATE_SOFT_CAP_ACTIVE, observed_set_speed)
+      # Don't reset last_set_frame — the cooldown gate above relies on it
+      # to space SET fires properly within the standstill window. The
+      # consequence is up to 1.5 s of self_set_recent post-exit blocking
+      # RES, which is acceptable since vehicle is just leaving stop and
+      # SCC's accel demand will lift cluster_set via the sliding-cap path.
       return self._publish(Buttons.NONE, STATE_STANDSTILL_HOLD, observed_set_speed)
 
     # Driver override windows.
@@ -557,7 +634,7 @@ class EVLimiter:
     # Push DOWN when observed > target_set + deadband (sliding cap violation)
     #   OR when est_power > threshold AND there's a gap to close (load gate).
     # Push UP when observed < target_set - deadband (gentle recovery).
-    margin = self._dynamic_margin_ms(v_ego)
+    margin = self._dynamic_margin_ms(v_ego, est_power_w, power_threshold_w)
     dynamic_ceiling = v_ego + margin
     target_set = min(self.user_target_speed, dynamic_ceiling)
 

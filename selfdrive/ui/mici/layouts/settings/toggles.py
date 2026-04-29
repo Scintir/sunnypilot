@@ -66,7 +66,9 @@ class TogglesLayoutMici(NavScroller):
         ev_power_thr = CyclingIntButton(
           "EV limiter power threshold",
           "EVLimiterPowerThresholdKW",
-          values=[20, 30, 40, 50, 60],
+          # iter7: finer 2 kW step from 20 → 50, wraps at 50 → 20.
+          # Drive #6 user feedback: 10 kW step was too coarse for tuning.
+          values=list(range(20, 51, 2)),
           suffix=" kW",
           default=40,
         )

@@ -33,9 +33,11 @@ from opendbc.sunnypilot.car.hyundai.ev_limiter import (
   DISABLED_RES_ENGAGE_WINDOW_FRAMES,
   HIGH_SPEED_MARGIN_MPH,
   LOW_SPEED_MARGIN_MPH,
+  LOW_LOAD_BONUS_MPH,
   MARGIN_BLEND_END_MPH,
   MPH_TO_MS,
   SET_COOLDOWN_FRAMES,
+  STANDSTILL_SET_PULSE_CAP,
 )
 from opendbc.car.hyundai.values import Buttons
 
@@ -116,25 +118,63 @@ def _step(limiter, frame, cc_enabled, vEgo, observed_mph, button=None,
 
 
 class TestDynamicMargin(unittest.TestCase):
-  """The sliding-cap formula itself."""
+  """The sliding-cap formula. iter7: now takes (vEgo, est_power, threshold).
 
-  def test_standstill_margin(self):
-    self.assertAlmostEqual(EVLimiter._dynamic_margin_ms(0.0),
-                            LOW_SPEED_MARGIN_MPH * MPH_TO_MS, places=4)
+  Tests use load=0 (low load → full bonus) for the base-formula tests, then
+  separate tests cover the load-bonus taper.
+  """
+  THR = 40_000.0  # 40 kW threshold for these tests
 
-  def test_blend_end_margin(self):
-    self.assertAlmostEqual(EVLimiter._dynamic_margin_ms(MARGIN_BLEND_END_MPH * MPH_TO_MS),
-                            HIGH_SPEED_MARGIN_MPH * MPH_TO_MS, places=4)
+  def test_standstill_base_with_full_bonus(self):
+    # Low load → full +10 mph bonus
+    margin = EVLimiter._dynamic_margin_ms(0.0, est_power_w=0.0, power_threshold_w=self.THR)
+    expected_mph = LOW_SPEED_MARGIN_MPH + LOW_LOAD_BONUS_MPH  # 30 mph
+    self.assertAlmostEqual(margin, expected_mph * MPH_TO_MS, places=4)
 
-  def test_high_speed_flat(self):
-    # vEgo well above blend end → still high-speed margin
-    self.assertAlmostEqual(EVLimiter._dynamic_margin_ms(40.0 * MPH_TO_MS),
-                            HIGH_SPEED_MARGIN_MPH * MPH_TO_MS, places=4)
+  def test_blend_end_with_full_bonus(self):
+    margin = EVLimiter._dynamic_margin_ms(MARGIN_BLEND_END_MPH * MPH_TO_MS,
+                                           est_power_w=0.0, power_threshold_w=self.THR)
+    expected_mph = HIGH_SPEED_MARGIN_MPH + LOW_LOAD_BONUS_MPH  # 15 mph
+    self.assertAlmostEqual(margin, expected_mph * MPH_TO_MS, places=4)
 
-  def test_midpoint_linear(self):
-    # vEgo = 15 mph → halfway → margin = (20 + 5) / 2 = 12.5 mph
-    margin = EVLimiter._dynamic_margin_ms(15.0 * MPH_TO_MS)
-    self.assertAlmostEqual(margin, 12.5 * MPH_TO_MS, places=2)
+  def test_high_speed_flat_with_full_bonus(self):
+    margin = EVLimiter._dynamic_margin_ms(40.0 * MPH_TO_MS,
+                                           est_power_w=0.0, power_threshold_w=self.THR)
+    expected_mph = HIGH_SPEED_MARGIN_MPH + LOW_LOAD_BONUS_MPH  # 15 mph
+    self.assertAlmostEqual(margin, expected_mph * MPH_TO_MS, places=4)
+
+  def test_midpoint_linear_base_with_full_bonus(self):
+    # vEgo = 15 mph → base = (20 + 5) / 2 = 12.5 mph; + 10 bonus = 22.5
+    margin = EVLimiter._dynamic_margin_ms(15.0 * MPH_TO_MS,
+                                           est_power_w=0.0, power_threshold_w=self.THR)
+    self.assertAlmostEqual(margin, 22.5 * MPH_TO_MS, places=2)
+
+  def test_low_load_bonus_full_below_40pct(self):
+    # est_power = 30% of threshold = 12 kW → full +10 bonus
+    margin = EVLimiter._dynamic_margin_ms(40.0 * MPH_TO_MS,
+                                           est_power_w=12_000.0, power_threshold_w=self.THR)
+    self.assertAlmostEqual(margin, (HIGH_SPEED_MARGIN_MPH + LOW_LOAD_BONUS_MPH) * MPH_TO_MS, places=2)
+
+  def test_load_bonus_taper_at_60pct(self):
+    # est_power = 60% of threshold = halfway between 40% and 80% → half bonus
+    margin = EVLimiter._dynamic_margin_ms(40.0 * MPH_TO_MS,
+                                           est_power_w=24_000.0, power_threshold_w=self.THR)
+    self.assertAlmostEqual(margin, (HIGH_SPEED_MARGIN_MPH + LOW_LOAD_BONUS_MPH * 0.5) * MPH_TO_MS, places=2)
+
+  def test_load_bonus_zero_above_80pct(self):
+    # est_power = 90% of threshold → no bonus, base only
+    margin = EVLimiter._dynamic_margin_ms(40.0 * MPH_TO_MS,
+                                           est_power_w=36_000.0, power_threshold_w=self.THR)
+    self.assertAlmostEqual(margin, HIGH_SPEED_MARGIN_MPH * MPH_TO_MS, places=2)
+
+  def test_invalid_threshold_no_bonus(self):
+    """Fail-safe: invalid threshold (≤0) gives base margin only, NOT max bonus."""
+    margin = EVLimiter._dynamic_margin_ms(40.0 * MPH_TO_MS,
+                                           est_power_w=0.0, power_threshold_w=0.0)
+    self.assertAlmostEqual(margin, HIGH_SPEED_MARGIN_MPH * MPH_TO_MS, places=2)
+    margin = EVLimiter._dynamic_margin_ms(40.0 * MPH_TO_MS,
+                                           est_power_w=0.0, power_threshold_w=-100.0)
+    self.assertAlmostEqual(margin, HIGH_SPEED_MARGIN_MPH * MPH_TO_MS, places=2)
 
 
 class TestSlidingCapDownTrigger(unittest.TestCase):
@@ -212,49 +252,72 @@ class TestSlidingCapDownTrigger(unittest.TestCase):
 
 
 class TestStandstillSuppression(unittest.TestCase):
-  """Standstill suppresses BOTH SET and RES. Sliding cap takes over
-  immediately on exit-standstill (no hidden cooldown holding back the
-  first SET)."""
+  """Iter7: standstill BLOCKS RES, but ALLOWS SET (pulse-bounded) to pull
+  cluster set down toward LOW_SPEED_MARGIN_MPH (20 mph). Drive #6 retro:
+  iter6 froze cluster_set wherever the deceleration SET cascade landed."""
 
-  def test_standstill_no_buttons(self):
+  def test_standstill_set_fires_when_observed_above_cap(self):
+    """At standstill with cluster_set above 20 mph cap, SET must fire on
+    the engage frame (no cooldown to satisfy yet)."""
     lim = _make_limiter()
-    # Engage at standstill with stored set high
-    for f in range(0, 25):  # > STANDSTILL_CONFIRM_FRAMES
-      _step(lim, f, cc_enabled=False, vEgo=0.0, observed_mph=44.0)
-    btn, _ = _step(lim, 25, cc_enabled=True, vEgo=0.0, observed_mph=44.0,
-                   button=ButtonType.accelCruise)
-    self.assertEqual(btn, Buttons.NONE)
-    # Subsequent frames at standstill: still no buttons
-    for f in range(26, 60):
-      btn, _ = _step(lim, f, cc_enabled=True, vEgo=0.0, observed_mph=44.0)
-      self.assertEqual(btn, Buttons.NONE,
-                        f"Standstill must suppress all buttons at frame {f}")
-
-  def test_exit_standstill_no_hidden_cooldown_blocks_first_set(self):
-    """Drive #5 dwell prevention: the moment standstill clears with stored
-    cluster set well above target, SET must be eligible immediately. There
-    must be NO settle / engage-edge / cooldown hidden delay."""
-    lim = _make_limiter()
-    # Engage at standstill with stored set 44 mph (above any margin at 0 mph)
     for f in range(0, 25):
       _step(lim, f, cc_enabled=False, vEgo=0.0, observed_mph=44.0)
-    _step(lim, 25, cc_enabled=True, vEgo=0.0, observed_mph=44.0,
+    btn, _ = _step(lim, 25, cc_enabled=True, vEgo=0.0, observed_mph=44.0,
+                    button=ButtonType.accelCruise)
+    self.assertEqual(btn, Buttons.SET_DECEL,
+                      "Standstill SET must fire when observed cluster set is above 20 mph cap")
+
+  def test_standstill_no_set_when_at_cap(self):
+    """At standstill with cluster_set already at 20 mph, no SET needed."""
+    lim = _make_limiter()
+    for f in range(0, 25):
+      _step(lim, f, cc_enabled=False, vEgo=0.0, observed_mph=20.0)
+    _step(lim, 25, cc_enabled=True, vEgo=0.0, observed_mph=20.0,
           button=ButtonType.accelCruise)
-    # Hold at standstill long enough to pass STANDSTILL_CONFIRM_FRAMES
+    btn, _ = _step(lim, 26, cc_enabled=True, vEgo=0.0, observed_mph=20.0)
+    self.assertEqual(btn, Buttons.NONE,
+                      "Standstill SET must NOT fire when observed already at cap")
+
+  def test_standstill_brake_blocks_set(self):
+    """Standstill SET must NOT fire if brake is pressed."""
+    lim = _make_limiter()
+    for f in range(0, 25):
+      _step(lim, f, cc_enabled=False, vEgo=0.0, observed_mph=44.0, brake=True)
+    _step(lim, 25, cc_enabled=True, vEgo=0.0, observed_mph=44.0,
+          button=ButtonType.accelCruise, brake=True)
+    btn, _ = _step(lim, 26, cc_enabled=True, vEgo=0.0, observed_mph=44.0, brake=True)
+    self.assertEqual(btn, Buttons.NONE)
+
+  def test_standstill_res_never_fires(self):
+    """Even if cluster_set is below user_target at standstill, RES must
+    NEVER fire (vehicle is stopped)."""
+    lim = _make_limiter()
+    for f in range(0, 25):
+      _step(lim, f, cc_enabled=False, vEgo=0.0, observed_mph=10.0)
+    _step(lim, 25, cc_enabled=True, vEgo=0.0, observed_mph=10.0,
+          button=ButtonType.accelCruise)
+    # user_target seeded from the frozen 10 mph (engage_via_res). Bump it up
+    # via simulated driver presses so the under_target condition would otherwise fire.
+    lim.user_target_speed = 50.0 * MPH_TO_MS
     for f in range(26, 60):
-      _step(lim, f, cc_enabled=True, vEgo=0.0, observed_mph=44.0)
-    # Now exit standstill — vEgo crosses STANDSTILL_EXIT (3 mph). Stored
-    # observed_mph=44, user_target=44, dynamic_ceiling at vEgo=3 is ~18.5 mph,
-    # so target_set=18.5, observed (44) is 25 mph above. set_too_high=True.
-    saw_set_within_5_frames = False
-    for f in range(60, 65):
-      btn, _ = _step(lim, f, cc_enabled=True, vEgo=3.5 * MPH_TO_MS,
-                     observed_mph=44.0, est_power_w=5_000.0, abasis=0.5)
+      btn, _ = _step(lim, f, cc_enabled=True, vEgo=0.0, observed_mph=10.0)
+      self.assertNotEqual(btn, Buttons.RES_ACCEL,
+                           f"Standstill must never fire RES (frame {f})")
+
+  def test_standstill_set_pulse_cap(self):
+    """SET pulse count is bounded per single standstill window."""
+    lim = _make_limiter()
+    for f in range(0, 25):
+      _step(lim, f, cc_enabled=False, vEgo=0.0, observed_mph=80.0)
+    _step(lim, 25, cc_enabled=True, vEgo=0.0, observed_mph=80.0,
+          button=ButtonType.accelCruise)
+    set_count = 0
+    for f in range(26, 26 + 100 * STANDSTILL_SET_PULSE_CAP):  # plenty of frames
+      btn, _ = _step(lim, f, cc_enabled=True, vEgo=0.0, observed_mph=80.0)
       if btn == Buttons.SET_DECEL:
-        saw_set_within_5_frames = True
-        break
-    self.assertTrue(saw_set_within_5_frames,
-                     "First SET must fire within 5 frames of exit-standstill")
+        set_count += 1
+    self.assertLessEqual(set_count, STANDSTILL_SET_PULSE_CAP,
+                          f"Standstill SET pulses must be capped at {STANDSTILL_SET_PULSE_CAP}; got {set_count}")
 
 
 class TestGasBrakePause(unittest.TestCase):
@@ -377,6 +440,82 @@ class TestEngagePathDriveFour(unittest.TestCase):
     engage_frame = 6 + DISABLED_RES_ENGAGE_WINDOW_FRAMES + 5
     _step(self.lim, engage_frame, cc_enabled=True, vEgo=24.0, observed_mph=24.0)
     self.assertAlmostEqual(self.lim.user_target_speed, 24.0 * MPH_TO_MS, places=4)
+
+
+class TestPowerEstimator(unittest.TestCase):
+  """Iter7 power formula: mass·v·(max(0,abasis) + max(0,grade)) + road_load.
+
+  Drive #6 7:40 ICE event proved the iter6 formula was blind in a key regime:
+  abasis=-0.4 (SCC commanding decel) + grade=+0.4 (uphill) yielded
+  max(0, abasis+grade) = max(0, 0) = 0 even though motor was doing real work.
+  Iter7 clamps both terms positive separately, plus adds a road-load baseline.
+  """
+  def setUp(self):
+    # Late import: carstate_ext requires opendbc structs which require numpy
+    from opendbc.sunnypilot.car.hyundai.carstate_ext import (
+      road_load_power_w, VEHICLE_MASS_KG, GRAVITY_MS2,
+    )
+    self.road_load = road_load_power_w
+    self.MASS = VEHICLE_MASS_KG
+    self.G = GRAVITY_MS2
+
+  def _formula(self, abasis, grade_f, v_mph):
+    """Compute the iter7 power formula directly (mirrors carstate_ext logic)."""
+    v = v_mph * MPH_TO_MS
+    abasis_pos = max(0.0, abasis)
+    grade_pos = max(0.0, grade_f)
+    p_accel_grade = self.MASS * v * (abasis_pos + grade_pos)
+    p_road = self.road_load(v)
+    return max(0.0, p_accel_grade + p_road)
+
+  def test_road_load_zero_at_standstill(self):
+    self.assertAlmostEqual(self.road_load(0.0), 0.0, places=2)
+
+  def test_road_load_increases_with_speed(self):
+    # Cubic in speed → highway speeds dominated by aero
+    p_30 = self.road_load(30.0 * MPH_TO_MS)
+    p_60 = self.road_load(60.0 * MPH_TO_MS)
+    p_75 = self.road_load(75.0 * MPH_TO_MS)
+    self.assertLess(p_30, p_60)
+    self.assertLess(p_60, p_75)
+    # Sanity: 75 mph baseline should be 20-30 kW for an SUV
+    self.assertGreater(p_75, 18_000.0)
+    self.assertLess(p_75, 35_000.0)
+
+  def test_drive6_ice_blind_spot_caught(self):
+    """7:40 ICE event scenario: at 73 mph holding speed against grade,
+    iter6 read 0 kW. Iter7 must read above the 37 kW threshold (the lowest
+    user-reasonable threshold), and ideally above the 40 kW default too."""
+    # vEgo=73 mph, abasis=-0.4 (SCC commanding decel), grade=+0.4 (uphill)
+    pwr = self._formula(abasis=-0.4, grade_f=+0.4, v_mph=73.0)
+    self.assertGreater(pwr, 40_000.0,
+                        f"Iter6 ICE blind spot must be caught (got {pwr/1000:.1f} kW)")
+
+  def test_high_speed_cruise_no_grade_below_threshold(self):
+    """At 73 mph holding speed against road load only (no grade), motor
+    power equals road load — should be 20-30 kW, well below 40 kW default."""
+    pwr = self._formula(abasis=-0.4, grade_f=0.0, v_mph=73.0)
+    self.assertGreater(pwr, 18_000.0)
+    self.assertLess(pwr, 32_000.0)
+
+  def test_downhill_does_not_cancel_accel(self):
+    """Negative grade (downhill) must NOT cancel positive aBasis. The
+    protective estimator stays conservative — false positives are OK,
+    false negatives lead to ICE."""
+    # Compare: same abasis+v, with vs without downhill grade
+    pwr_with_downhill = self._formula(abasis=+0.3, grade_f=-0.3, v_mph=60.0)
+    pwr_no_grade = self._formula(abasis=+0.3, grade_f=0.0, v_mph=60.0)
+    # Downhill clamps to 0 in our formula, so power is identical
+    self.assertAlmostEqual(pwr_with_downhill, pwr_no_grade, places=2,
+                            msg="Downhill grade must not change protective power estimate")
+
+  def test_decel_does_not_cancel_grade(self):
+    """SCC commanded decel (negative abasis) must NOT cancel positive grade.
+    This is the iter6 formula bug that drive #6 ICE event exposed."""
+    pwr_with_decel = self._formula(abasis=-0.4, grade_f=+0.4, v_mph=60.0)
+    pwr_no_abasis = self._formula(abasis=0.0, grade_f=+0.4, v_mph=60.0)
+    self.assertAlmostEqual(pwr_with_decel, pwr_no_abasis, places=2,
+                            msg="Negative abasis must not cancel positive grade contribution")
 
 
 if __name__ == "__main__":

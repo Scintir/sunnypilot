@@ -20,13 +20,10 @@ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 # signals (TCS13 aBasis, CLU13 DTE) are absent on a HYBRID car.
 _EV_SIGNALS_MISSING_WARNED = False
 
-# Approximate curb mass of a 2022 Santa Fe PHEV (kg). Used to turn
-# aBasis (m/s^2) + grade contribution + vEgo (m/s) into an estimated
-# propulsion-power demand (W) that's used as the SOFT_CAP trigger:
-#   P ~= mass * max(0, aBasis + max(0, grade_accel)) * vEgo
-# Drag is intentionally NOT modelled — what we want is *marginal* demand
-# above flat-cruise baseline, since flat cruise rarely engages ICE.
+# Approximate curb mass of a 2022 Santa Fe PHEV (kg). Used in the EV power
+# estimator (carstate_ext._update_ev_limiter_signals).
 VEHICLE_MASS_KG = 1950.0
+GRAVITY_MS2 = 9.81
 
 # Grade derivation from CAN-only signals (no openpilot service dependency).
 # Body-frame longitudinal accel (ESP12.LONG_ACCEL) ≈ inertial accel + g·sin(pitch),
@@ -39,6 +36,40 @@ GRADE_FILTER_DT_S = 0.01                  # carstate_ext.update() runs at 100 Hz
 GRADE_FILTER_ALPHA = GRADE_FILTER_DT_S / (GRADE_FILTER_TAU_S + GRADE_FILTER_DT_S)
 GRADE_ACCEL_RAW_CLIP_MS2 = 1.5            # clip raw input before filtering
 GRADE_ACCEL_FILTERED_CLIP_MS2 = 1.0       # clip filtered output (≈10% grade ceiling)
+
+# Steady-state road load (rolling resistance + aero drag). Conservative
+# defaults for a midsize SUV; can be calibrated later from logs. Drive #6
+# 7:40 ICE event exposed an estimator blind spot: at 73 mph holding speed
+# against grade, aBasis was -0.4 (commanded decel) but motor was doing
+# real work (drag + grade hold) ~50 kW. Iter6's marginal-only formula
+# read 0 kW. Iter7 baseline + grade-positive-clamp catches it.
+ROLLING_RESISTANCE_COEFF = 0.011          # Crr (dimensionless)
+AERO_DRAG_COEFF = 0.75                    # CdA (m²); Santa Fe is boxier than typical sedan
+AIR_DENSITY_KG_M3 = 1.225                 # sea level @ 15°C
+
+# Asymmetric LP filter on the published estPowerW. User feedback (drive #6):
+# the IMU-derived grade signal is noisy → estPowerW HUD reads erratically.
+# Fast rise (capture spikes), slow fall (smooth display). Limiter publishes
+# `max(raw, filtered)` so the protective gate can't be lagged by the filter.
+POWER_TAU_RISE_S = 0.15                   # 150 ms tau — spikes captured almost immediately
+POWER_TAU_FALL_S = 2.0                    # 2 s tau — slow decay, stable HUD
+DT_CLAMP_MIN_S = 0.001                    # safety: never let dt blow up alpha
+DT_CLAMP_MAX_S = 0.1                      # 100 ms (10x nominal)
+
+
+def road_load_power_w(v_ego_ms: float) -> float:
+  """Steady-state road load: rolling resistance (linear in v) + aero drag
+  (cubic in v). With current Crr=0.011 and CdA=0.75 constants:
+    33 m/s (74 mph) ≈ 24 kW
+    27 m/s (60 mph) ≈ 14 kW
+    22 m/s (50 mph) ≈ 10 kW
+  Returns watts; never negative.
+  """
+  if v_ego_ms <= 0.0:
+    return 0.0
+  p_roll = ROLLING_RESISTANCE_COEFF * VEHICLE_MASS_KG * GRAVITY_MS2 * v_ego_ms
+  p_aero = 0.5 * AIR_DENSITY_KG_M3 * AERO_DRAG_COEFF * v_ego_ms ** 3
+  return p_roll + p_aero
 
 
 class CarStateExt:
@@ -56,6 +87,9 @@ class CarStateExt:
     self._esp12_zero_warning_logged = False
     self._esp12_first_call_frame = -1
     self._esp12_call_count = 0
+    # Asymmetric LP filter for published estPowerW (iter7).
+    self._power_filtered_w = 0.0
+    self._power_filter_initialized = False
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -178,20 +212,52 @@ class CarStateExt:
       elif grade_f < -GRADE_ACCEL_FILTERED_CLIP_MS2:
         grade_f = -GRADE_ACCEL_FILTERED_CLIP_MS2
       # Only the uphill component contributes to ICE-engagement risk.
-      # max(0, …) is applied AFTER filtering — applying it before would
-      # let positive-side noise bias the filter on flat ground.
+      # Negative SCC accel command (commanded decel) does NOT cancel positive
+      # grade contribution: drive #6's 7:40 ICE event had aBasis=-0.4 with
+      # grade=+0.4, and iter6's `max(0, abasis+grade)` read 0 even though the
+      # motor was doing real work to hold 73 mph against grade. Iter7 clamps
+      # both positive separately so grade always counts and decel never cancels.
       uphill_grade = max(0.0, grade_f)
+      abasis_pos = max(0.0, abasis)
 
-      effective_accel = max(0.0, abasis + uphill_grade)
-      power_w = VEHICLE_MASS_KG * effective_accel * v_ego
+      # Power = mass × v × (commanded-accel + grade-pull) + steady-state road load.
+      # Road load (rolling resistance + aero drag) is the missing baseline iter5/6
+      # ignored — at 73 mph it's ~23 kW alone, dominant enough that without it
+      # the limiter's threshold is comparing apples to oranges.
+      p_accel_grade_w = VEHICLE_MASS_KG * v_ego * (abasis_pos + uphill_grade)
+      p_road_w = road_load_power_w(v_ego)
+      raw_power_w = max(0.0, p_accel_grade_w + p_road_w)
+
+      # Asymmetric LP for HUD smoothness + control responsiveness.
+      # Use max(raw, filtered) for the published value so the protective gate
+      # always sees the higher of the two — fast spike capture, slow HUD decay.
+      if not self._power_filter_initialized:
+        self._power_filtered_w = raw_power_w
+        self._power_filter_initialized = True
+      else:
+        # dt-aware alpha; clamp dt so a timing hiccup can't blow up the filter.
+        dt = GRADE_FILTER_DT_S
+        if dt < DT_CLAMP_MIN_S:
+          dt = DT_CLAMP_MIN_S
+        elif dt > DT_CLAMP_MAX_S:
+          dt = DT_CLAMP_MAX_S
+        if raw_power_w > self._power_filtered_w:
+          alpha = dt / (POWER_TAU_RISE_S + dt)
+        else:
+          alpha = dt / (POWER_TAU_FALL_S + dt)
+        self._power_filtered_w += alpha * (raw_power_w - self._power_filtered_w)
+      power_w_published = max(raw_power_w, self._power_filtered_w)
 
       ret_sp.accelDemand = abasis
-      ret_sp.estPowerW = power_w
-      # Publish the clipped value — that's what consumers should see, and it
-      # matches the schema comment about a ±1.0 m/s² ceiling.
+      ret_sp.estPowerW = power_w_published
+      # Publish the clipped grade value — useful for HUD/debug.
+      # NOTE drive #6 forensic: this field has been observed to publish 0
+      # in practice while estPowerW above publishes correctly. The sequential
+      # writes look identical, root cause unknown. Not blocking iter7 since
+      # consumers (HUD, limiter) read estPowerW; revisit when reproducible.
       ret_sp.evLimiterGradeAccel = float(grade_f)
       self.accel_demand = abasis
-      self.est_power_w = power_w
+      self.est_power_w = power_w_published
     except KeyError as e:
       global _EV_SIGNALS_MISSING_WARNED
       if not _EV_SIGNALS_MISSING_WARNED:

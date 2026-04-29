@@ -11,27 +11,26 @@ Three lines, anchored top-right next to the cluster set-speed circle (which
 lives top-left at ~(21,14)→(183,176)):
 
    User 65 mph          <- driver's stored target (carStateSP.evLimiterUserTargetSpeed)
-   PWR  18 / 40 kW      <- est_power_w / EVLimiterPowerThresholdKW (carStateSP.estPowerW + param)
+   PWR 18 kW            <- est_power_w (filtered, asymmetric LP for stability)
    STATE: LIMITING      <- limiter state (carStateSP.evLimiterState)
 
-Iter6 changes (drive #5 retro):
-- Dropped the SET line (cluster set is already shown on the instrument
-  cluster — redundant).
-- Added PWR line so user can compare against the cluster gauge and notice
-  if the estimator is broken (drive #5: gradeAccel was silently 0 for
-  173k samples and we'd have caught it sooner with HUD visibility).
-- Renamed "EV TGT" → "User" per user clarification request.
-- Box dimensions unchanged (still three lines, same fonts) — User+PWR are
-  the same height as the dropped TGT+SET were.
+Iter7 HUD changes (drive #6 user feedback):
+- PWR line uses the same big font as User (24 pt) — was 16 pt small,
+  user found it too small to glance at.
+- PWR text is white (was green/amber/red ratio coloring) — user found
+  green hard to read in daylight.
+- Dropped "/40 kW" threshold from the PWR text — user has the slider
+  in settings; the live value is what matters for monitoring.
+- estPowerW is asymmetric-LP filtered server-side (carstate_ext.py):
+  fast-rise τ=0.15 s, slow-fall τ=2 s, published as max(raw, filtered)
+  so spikes show immediately but baseline is stable.
 
-Color codes the banner border by state:
+Banner border still color-coded by state:
   green  - IDLE
   amber  - SOFT_CAP_ACTIVE / LIMITING
   blue   - RECOVERY_ACTIVE / RECOVERING
   grey   - DRIVER_OVERRIDE_*
   dark   - DISABLED / STANDSTILL
-PWR text is colored by power-vs-threshold ratio: green <80%, amber 80-100%,
-red >100%. So the user can glance and see "am I in the danger zone."
 """
 import pyray as rl
 
@@ -41,8 +40,8 @@ from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.widgets import Widget
 
 
-FONT_SIZE_BIG = 24     # for User XX mph (was 56 — too big for mici 240 px-tall screen)
-FONT_SIZE_SMALL = 16   # for PWR + STATE labels
+FONT_SIZE_BIG = 24     # for User XX mph + PWR XX kW (iter7: PWR same size as User)
+FONT_SIZE_SMALL = 16   # for STATE label only
 PAD_X = 12
 PAD_Y = 6
 LINE_GAP = 2
@@ -72,45 +71,11 @@ STATE_COLORS = {
   7: rl.Color(0x40, 0x40, 0x40, 0xa0),  # dark - disabled
 }
 
-# Power text color by current/threshold ratio
-PWR_COLOR_GREEN = rl.Color(0x40, 0xc0, 0x40, 0xff)
-PWR_COLOR_AMBER = rl.Color(0xff, 0xc0, 0x40, 0xff)
-PWR_COLOR_RED = rl.Color(0xff, 0x60, 0x40, 0xff)
-
-
-def _power_color(est_kw: float, threshold_kw: float) -> rl.Color:
-  if threshold_kw <= 0:
-    return PWR_COLOR_GREEN
-  ratio = est_kw / threshold_kw
-  if ratio < 0.80:
-    return PWR_COLOR_GREEN
-  if ratio < 1.00:
-    return PWR_COLOR_AMBER
-  return PWR_COLOR_RED
-
-
-def _read_power_threshold_kw() -> int:
-  """Read EVLimiterPowerThresholdKW (default 40) for the PWR line. Wrapped
-  to survive UnknownKeyName on a stale params_pyx.so."""
-  try:
-    from openpilot.common.params import Params
-    raw = Params().get("EVLimiterPowerThresholdKW")
-    if raw is None:
-      return 40
-    return int(raw)
-  except Exception:
-    return 40
-
-
 class EVLimiterIndicator(Widget):
   def __init__(self):
     super().__init__()
     self._font_big = gui_app.font(FontWeight.BOLD)
     self._font_small = gui_app.font(FontWeight.MEDIUM)
-    # Cache the power threshold; re-read every ~1 s to pick up param changes
-    # without paying a Params hit every frame at 60 Hz.
-    self._power_threshold_kw = _read_power_threshold_kw()
-    self._threshold_refresh_counter = 0
 
   def _render(self, rect: rl.Rectangle) -> None:
     try:
@@ -134,11 +99,6 @@ class EVLimiterIndicator(Widget):
     if state == 7 and user_target_ms <= 0.5:
       return
 
-    # Refresh power-threshold param at ~1 Hz (60 frames at 60 fps)
-    self._threshold_refresh_counter = (self._threshold_refresh_counter + 1) % 60
-    if self._threshold_refresh_counter == 0:
-      self._power_threshold_kw = _read_power_threshold_kw()
-
     if ui_state.is_metric:
       conv = 3.6
       unit = "kph"
@@ -148,17 +108,15 @@ class EVLimiterIndicator(Widget):
 
     target_disp = int(round(user_target_ms * conv)) if user_target_ms > 0.5 else 0
     est_kw = max(0.0, est_power_w) / 1000.0
-    threshold_kw = self._power_threshold_kw
 
     user_str = f"User {target_disp} {unit}" if target_disp > 0 else f"User -- {unit}"
-    pwr_str = f"PWR {int(round(est_kw))} / {threshold_kw} kW"
+    pwr_str = f"PWR {int(round(est_kw))} kW"
     state_str = f"STATE: {STATE_NAMES.get(state, str(state))}"
     border_color = STATE_COLORS.get(state, STATE_COLORS[0])
-    pwr_color = _power_color(est_kw, threshold_kw)
 
-    # Measure all three to size the banner
+    # Measure all three to size the banner — User + PWR are now both BIG.
     s_user = measure_text_cached(self._font_big, user_str, FONT_SIZE_BIG)
-    s_pwr = measure_text_cached(self._font_small, pwr_str, FONT_SIZE_SMALL)
+    s_pwr = measure_text_cached(self._font_big, pwr_str, FONT_SIZE_BIG)
     s_state = measure_text_cached(self._font_small, state_str, FONT_SIZE_SMALL)
 
     content_w = max(s_user.x, s_pwr.x, s_state.x)
@@ -185,9 +143,9 @@ class EVLimiterIndicator(Widget):
                     rl.Vector2(box.x + (box_w - s_user.x) / 2, y),
                     FONT_SIZE_BIG, 0, rl.WHITE)
     y += s_user.y + LINE_GAP
-    rl.draw_text_ex(self._font_small, pwr_str,
+    rl.draw_text_ex(self._font_big, pwr_str,
                     rl.Vector2(box.x + (box_w - s_pwr.x) / 2, y),
-                    FONT_SIZE_SMALL, 0, pwr_color)
+                    FONT_SIZE_BIG, 0, rl.WHITE)
     y += s_pwr.y + LINE_GAP
     rl.draw_text_ex(self._font_small, state_str,
                     rl.Vector2(box.x + (box_w - s_state.x) / 2, y),
