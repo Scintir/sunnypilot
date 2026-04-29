@@ -48,6 +48,14 @@ class CarStateExt:
 
     self.aBasis = 0.0
     self.grade_accel_filtered = 0.0  # m/s^2, signed; positive = uphill
+    # ESP12 silent-zero detector — drive #5 had iter5's grade fix publishing
+    # gradeAccel=0 for 173k samples because lazy CANParser registration
+    # failed silently. Now that ESP12 is explicitly subscribed, log once
+    # if it still stays at zero for the first 5 s of operation.
+    self._esp12_seen_nonzero = False
+    self._esp12_zero_warning_logged = False
+    self._esp12_first_call_frame = -1
+    self._esp12_call_count = 0
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -137,6 +145,21 @@ class CarStateExt:
       # car that never has ESP12 at all the filter starts and stays at 0.
       try:
         long_accel = float(cp.vl["ESP12"]["LONG_ACCEL"])
+        # Silent-zero detector: log once if ESP12 stays at exactly 0 for the
+        # first ~5 s of carstate calls. iter5 had this happen unnoticed for
+        # an entire 40 min drive.
+        self._esp12_call_count += 1
+        if long_accel != 0.0:
+          self._esp12_seen_nonzero = True
+        elif (
+          not self._esp12_zero_warning_logged
+          and not self._esp12_seen_nonzero
+          and self._esp12_call_count >= 500   # 5 s at 100 Hz
+        ):
+          print("[ev_limiter] WARNING: ESP12.LONG_ACCEL stuck at 0.0 for 5 s — "
+                "grade-aware power is degraded to flat-only", file=sys.stderr)
+          self._esp12_zero_warning_logged = True
+
         a_ego = float(ret.aEgo)
         grade_accel_raw = long_accel - a_ego
         if grade_accel_raw > GRADE_ACCEL_RAW_CLIP_MS2:

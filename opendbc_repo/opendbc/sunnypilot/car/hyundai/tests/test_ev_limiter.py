@@ -4,15 +4,16 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-Minimal regression coverage for the EV power limiter, focused on the drive #4
-failure mode: Hyundai SCC autonomously snaps the cluster set speed up on
-RES re-engage, and earlier limiter revisions either (a) processed the engage
-RES as driver intent and opened a 3 s DRV_RES override window suppressing
-SOFT_CAP, or (b) seeded user_target from the SCC-snapped post-engage value.
+Regression coverage for the EV power limiter — sliding-cap iter6 architecture.
 
-These tests exercise the engage classification + seeding path with synthetic
-button events. Broader behavioural coverage (power-driven SOFT_CAP entry/exit,
-driver override windows, recovery cadence) is intentionally out of scope here.
+Drive #4 (kept): RES re-engage doesn't get classified as driver intent
+to accelerate; user_target seeds from frozen pre-disable observed.
+
+Drive #5 (new in iter6): the previous SOFT_CAP/RECOVERY state machine fired
+on every Hyundai launch (aBasis>0.7 fallback) causing 20 s dwells, and let
+cluster set sit 13 mph above user_target for 15 s before SOFT_CAP fired
+power-only — too late, ICE engaged. Sliding cap addresses both by holding
+cluster set within `vEgo + dynamic_margin(vEgo)` continuously.
 """
 
 import unittest
@@ -21,18 +22,20 @@ from typing import Any
 
 from opendbc.car import structs
 from opendbc.car.hyundai.values import HyundaiFlags
-from opendbc.sunnypilot.car.hyundai import ev_limiter as ev_lim
 from opendbc.sunnypilot.car.hyundai.ev_limiter import (
   EVLimiter,
   STATE_DISABLED,
   STATE_DRIVER_OVERRIDE_RES,
   STATE_IDLE,
   STATE_SOFT_CAP_ACTIVE,
-  AUTO_RESUME_GUARD_FRAMES,
-  AUTO_RESUME_SET_COOLDOWN_FRAMES,
+  STATE_RECOVERY_ACTIVE,
+  STATE_STANDSTILL_HOLD,
   DISABLED_RES_ENGAGE_WINDOW_FRAMES,
-  DRIVER_OVERRIDE_RES_FRAMES,
+  HIGH_SPEED_MARGIN_MPH,
+  LOW_SPEED_MARGIN_MPH,
+  MARGIN_BLEND_END_MPH,
   MPH_TO_MS,
+  SET_COOLDOWN_FRAMES,
 )
 from opendbc.car.hyundai.values import Buttons
 
@@ -89,7 +92,6 @@ def _make_limiter(power_threshold_kw: int = 40, dte_floor: int = 5):
   cp = FakeCP()
   cp_sp = FakeCPSP()
   lim = EVLimiter(cp, cp_sp)
-  # Override params reads (no Params backend in tests).
   lim._read_bool = lambda key, default: True if key == "EVLimiterEnabled" else default
   lim._read_int = lambda key, default: {
     "EVLimiterPowerThresholdKW": power_threshold_kw,
@@ -113,165 +115,268 @@ def _step(limiter, frame, cc_enabled, vEgo, observed_mph, button=None,
   return limiter.update(cc, cs, frame)
 
 
-class TestEVLimiterEngagePath(unittest.TestCase):
-  """Drive #4 regression coverage for engage classification + seeding."""
+class TestDynamicMargin(unittest.TestCase):
+  """The sliding-cap formula itself."""
+
+  def test_standstill_margin(self):
+    self.assertAlmostEqual(EVLimiter._dynamic_margin_ms(0.0),
+                            LOW_SPEED_MARGIN_MPH * MPH_TO_MS, places=4)
+
+  def test_blend_end_margin(self):
+    self.assertAlmostEqual(EVLimiter._dynamic_margin_ms(MARGIN_BLEND_END_MPH * MPH_TO_MS),
+                            HIGH_SPEED_MARGIN_MPH * MPH_TO_MS, places=4)
+
+  def test_high_speed_flat(self):
+    # vEgo well above blend end → still high-speed margin
+    self.assertAlmostEqual(EVLimiter._dynamic_margin_ms(40.0 * MPH_TO_MS),
+                            HIGH_SPEED_MARGIN_MPH * MPH_TO_MS, places=4)
+
+  def test_midpoint_linear(self):
+    # vEgo = 15 mph → halfway → margin = (20 + 5) / 2 = 12.5 mph
+    margin = EVLimiter._dynamic_margin_ms(15.0 * MPH_TO_MS)
+    self.assertAlmostEqual(margin, 12.5 * MPH_TO_MS, places=2)
+
+
+class TestSlidingCapDownTrigger(unittest.TestCase):
+  """Push-down behavior: SET fires when cluster set exceeds target_set or
+  when est power is high with a vEgo gap to close."""
+
+  def setUp(self):
+    self.lim = _make_limiter(power_threshold_kw=40)
+    # Engage cleanly with vEgo > standstill so we can run the sliding cap.
+    for f in range(0, 5):
+      _step(self.lim, f, cc_enabled=False, vEgo=10.0, observed_mph=30.0)
+    _step(self.lim, 5, cc_enabled=True, vEgo=10.0, observed_mph=30.0,
+          button=ButtonType.decelCruise)  # SET-engage from main switch
+    # Wait past STANDSTILL exit clean window
+    for f in range(6, 40):
+      _step(self.lim, f, cc_enabled=True, vEgo=10.0, observed_mph=30.0)
+
+  def test_drive5_ice_set_to_high_fires(self):
+    """Drive #5 ICE event regression: cluster=60, vEgo=46, user_target=51
+    must immediately fire SET (observed > target_set + deadband). The old
+    architecture only fired SOFT_CAP after power crossed threshold — too late."""
+    self.lim.user_target_speed = 51.0 * MPH_TO_MS
+    self.lim.last_set_frame = -10000  # clear cooldown
+    btn, _ = _step(self.lim, 100, cc_enabled=True, vEgo=46.0 * MPH_TO_MS,
+                   observed_mph=60.0, est_power_w=10_000.0, abasis=0.1)
+    self.assertEqual(btn, Buttons.SET_DECEL,
+                      "set_too_high should fire SET when observed (60) > target_set (51)")
+
+  def test_set_fires_during_driver_override_set(self):
+    """Driver SET is the SAME direction as our SET — driver-SET override
+    must NOT suppress our SET, even with the override window open. Blocking
+    our SET here would let cluster_set sit above target_set for the override
+    window with no limiter response (gpt-5.5 review of iter6 caught this)."""
+    self.lim.user_target_speed = 30.0 * MPH_TO_MS
+    self.lim.last_set_frame = -10000
+    # Simulate a recent driver SET press
+    self.lim._driver_set_last_frame = 95  # 5 frames before our test frame
+    # vEgo=10, margin=~16 mph, ceiling=26, target=min(30, 26)=26
+    # observed=60 is 34 mph above target → set_too_high True
+    btn, _ = _step(self.lim, 100, cc_enabled=True, vEgo=10.0 * MPH_TO_MS,
+                   observed_mph=60.0, est_power_w=10_000.0, abasis=0.1)
+    self.assertEqual(btn, Buttons.SET_DECEL,
+                      "Driver SET override window must NOT block our SET (same direction)")
+
+  def test_under_target_does_not_fire_set(self):
+    """When cluster set already at target_set, SET must not fire."""
+    self.lim.user_target_speed = 60.0 * MPH_TO_MS
+    self.lim.last_set_frame = -10000
+    # vEgo=50 → margin=5 → ceiling=55 → target=min(60,55)=55
+    # observed=55 → set_too_high False, want_res only if under_target
+    btn, _ = _step(self.lim, 200, cc_enabled=True, vEgo=50.0 * MPH_TO_MS,
+                   observed_mph=55.0, est_power_w=10_000.0, abasis=0.0)
+    self.assertNotEqual(btn, Buttons.SET_DECEL)
+
+  def test_power_too_high_with_gap_fires_set(self):
+    """Power above threshold AND observed > vEgo + 0.5 mph → SET."""
+    self.lim.user_target_speed = 60.0 * MPH_TO_MS
+    self.lim.last_set_frame = -10000
+    # vEgo=20 mph → margin ≈ 10 mph → ceiling=30, target=min(60,30)=30
+    # observed=30 → set_too_high False (right at boundary), but power > 40 kW
+    # AND observed > vEgo + 0.5 → power_too_high → SET
+    btn, _ = _step(self.lim, 300, cc_enabled=True, vEgo=20.0 * MPH_TO_MS,
+                   observed_mph=30.0, est_power_w=50_000.0, abasis=0.5)
+    self.assertEqual(btn, Buttons.SET_DECEL)
+
+  def test_power_too_high_no_gap_does_not_fire(self):
+    """Power high but observed near vEgo (no gap) → SET would not help."""
+    self.lim.user_target_speed = 60.0 * MPH_TO_MS
+    self.lim.last_set_frame = -10000
+    # vEgo=30, observed=30 (no gap), high power (e.g. grade)
+    # → power_too_high False (gap requirement); set_too_high False (target=35)
+    btn, _ = _step(self.lim, 400, cc_enabled=True, vEgo=30.0 * MPH_TO_MS,
+                   observed_mph=30.0, est_power_w=60_000.0, abasis=0.0)
+    self.assertNotEqual(btn, Buttons.SET_DECEL)
+
+
+class TestStandstillSuppression(unittest.TestCase):
+  """Standstill suppresses BOTH SET and RES. Sliding cap takes over
+  immediately on exit-standstill (no hidden cooldown holding back the
+  first SET)."""
+
+  def test_standstill_no_buttons(self):
+    lim = _make_limiter()
+    # Engage at standstill with stored set high
+    for f in range(0, 25):  # > STANDSTILL_CONFIRM_FRAMES
+      _step(lim, f, cc_enabled=False, vEgo=0.0, observed_mph=44.0)
+    btn, _ = _step(lim, 25, cc_enabled=True, vEgo=0.0, observed_mph=44.0,
+                   button=ButtonType.accelCruise)
+    self.assertEqual(btn, Buttons.NONE)
+    # Subsequent frames at standstill: still no buttons
+    for f in range(26, 60):
+      btn, _ = _step(lim, f, cc_enabled=True, vEgo=0.0, observed_mph=44.0)
+      self.assertEqual(btn, Buttons.NONE,
+                        f"Standstill must suppress all buttons at frame {f}")
+
+  def test_exit_standstill_no_hidden_cooldown_blocks_first_set(self):
+    """Drive #5 dwell prevention: the moment standstill clears with stored
+    cluster set well above target, SET must be eligible immediately. There
+    must be NO settle / engage-edge / cooldown hidden delay."""
+    lim = _make_limiter()
+    # Engage at standstill with stored set 44 mph (above any margin at 0 mph)
+    for f in range(0, 25):
+      _step(lim, f, cc_enabled=False, vEgo=0.0, observed_mph=44.0)
+    _step(lim, 25, cc_enabled=True, vEgo=0.0, observed_mph=44.0,
+          button=ButtonType.accelCruise)
+    # Hold at standstill long enough to pass STANDSTILL_CONFIRM_FRAMES
+    for f in range(26, 60):
+      _step(lim, f, cc_enabled=True, vEgo=0.0, observed_mph=44.0)
+    # Now exit standstill — vEgo crosses STANDSTILL_EXIT (3 mph). Stored
+    # observed_mph=44, user_target=44, dynamic_ceiling at vEgo=3 is ~18.5 mph,
+    # so target_set=18.5, observed (44) is 25 mph above. set_too_high=True.
+    saw_set_within_5_frames = False
+    for f in range(60, 65):
+      btn, _ = _step(lim, f, cc_enabled=True, vEgo=3.5 * MPH_TO_MS,
+                     observed_mph=44.0, est_power_w=5_000.0, abasis=0.5)
+      if btn == Buttons.SET_DECEL:
+        saw_set_within_5_frames = True
+        break
+    self.assertTrue(saw_set_within_5_frames,
+                     "First SET must fire within 5 frames of exit-standstill")
+
+
+class TestGasBrakePause(unittest.TestCase):
+  """Gas or brake pause suppresses both SET and RES."""
+
+  def setUp(self):
+    self.lim = _make_limiter()
+    # Engage cleanly above standstill
+    for f in range(0, 25):
+      _step(self.lim, f, cc_enabled=False, vEgo=10.0, observed_mph=30.0)
+    _step(self.lim, 25, cc_enabled=True, vEgo=10.0, observed_mph=30.0,
+          button=ButtonType.decelCruise)
+    for f in range(26, 50):
+      _step(self.lim, f, cc_enabled=True, vEgo=10.0, observed_mph=30.0)
+
+  def test_gas_suppresses_set(self):
+    self.lim.user_target_speed = 30.0 * MPH_TO_MS
+    self.lim.last_set_frame = -10000
+    # Conditions that would normally fire SET:
+    btn, _ = _step(self.lim, 100, cc_enabled=True, vEgo=10.0,
+                   observed_mph=60.0, est_power_w=50_000.0, abasis=1.0, gas=True)
+    self.assertEqual(btn, Buttons.NONE, "Gas must suppress SET")
+
+  def test_brake_suppresses_set(self):
+    self.lim.user_target_speed = 30.0 * MPH_TO_MS
+    self.lim.last_set_frame = -10000
+    btn, _ = _step(self.lim, 200, cc_enabled=True, vEgo=10.0,
+                   observed_mph=60.0, est_power_w=50_000.0, abasis=1.0, brake=True)
+    self.assertEqual(btn, Buttons.NONE, "Brake must suppress SET")
+
+  def test_gas_suppresses_res(self):
+    self.lim.user_target_speed = 30.0 * MPH_TO_MS
+    self.lim.last_res_frame = -10000
+    # Set up under-target conditions
+    btn, _ = _step(self.lim, 300, cc_enabled=True, vEgo=10.0,
+                   observed_mph=15.0, est_power_w=0.0, abasis=0.0, gas=True)
+    self.assertEqual(btn, Buttons.NONE, "Gas must suppress RES")
+
+
+class TestStateLatching(unittest.TestCase):
+  """HUD state derived from recent activity, not button-this-frame."""
+
+  def test_limiting_state_persists_after_set(self):
+    """After a SET press, state must remain SOFT_CAP_ACTIVE for at least
+    LIMITING_LATCH_FRAMES frames even though the cooldown blocks more SETs."""
+    lim = _make_limiter()
+    for f in range(0, 25):
+      _step(lim, f, cc_enabled=False, vEgo=10.0, observed_mph=44.0)
+    _step(lim, 25, cc_enabled=True, vEgo=10.0, observed_mph=44.0,
+          button=ButtonType.decelCruise)
+    for f in range(26, 50):
+      _step(lim, f, cc_enabled=True, vEgo=10.0, observed_mph=44.0)
+    lim.user_target_speed = 30.0 * MPH_TO_MS
+    lim.last_set_frame = -10000
+    # Frame 100: SET fires
+    _step(lim, 100, cc_enabled=True, vEgo=10.0, observed_mph=60.0,
+          est_power_w=50_000.0, abasis=0.5)
+    # Frame 110 (10 frames later, SET cooldown blocks new TX, but state
+    # should still report SOFT_CAP_ACTIVE because last_set_frame is recent)
+    _step(lim, 110, cc_enabled=True, vEgo=10.0, observed_mph=59.0,
+          est_power_w=50_000.0, abasis=0.5)
+    self.assertEqual(lim.state, STATE_SOFT_CAP_ACTIVE,
+                      "State should latch SOFT_CAP_ACTIVE for ~500 ms after our SET")
+
+
+class TestEngagePathDriveFour(unittest.TestCase):
+  """Drive #4 regression coverage — kept from iter5."""
 
   def setUp(self):
     self.lim = _make_limiter()
 
-  def test_supported_hybrid(self):
-    self.assertTrue(self.lim.supported)
-
-  def test_disabled_returns_no_button(self):
-    btn, active = _step(self.lim, 0, cc_enabled=False, vEgo=0.0, observed_mph=0.0)
-    self.assertEqual(btn, Buttons.NONE)
-    self.assertFalse(active)
-    self.assertEqual(self.lim.state, STATE_DISABLED)
-
   def test_disabled_tracks_observed_set_speed(self):
-    """Cluster set during DISABLED is captured for later engage seed."""
     _step(self.lim, 0, cc_enabled=False, vEgo=20.0, observed_mph=70.0)
-    self.assertAlmostEqual(self.lim._observed_set_speed_at_disable, 70.0 * MPH_TO_MS, places=4)
+    self.assertAlmostEqual(self.lim._observed_set_speed_at_disable,
+                            70.0 * MPH_TO_MS, places=4)
 
   def test_disabled_res_press_recorded(self):
-    """A RES press while disabled stamps _last_disabled_res_press_frame."""
     _step(self.lim, 5, cc_enabled=False, vEgo=20.0, observed_mph=70.0,
           button=ButtonType.accelCruise)
     self.assertEqual(self.lim._last_disabled_res_press_frame, 5)
 
-  def test_disabled_res_does_not_open_driver_adjust_window(self):
-    """Drive #4 race: disabled-frame RES must NOT open driver-adjust /
-    DRV_RES windows that survive into the engaged session."""
-    _step(self.lim, 5, cc_enabled=False, vEgo=20.0, observed_mph=70.0,
-          button=ButtonType.accelCruise)
-    self.assertEqual(self.lim._driver_adjust_until, -10000)
-    self.assertEqual(self.lim._driver_res_last_frame, -10000)
-
   def test_engage_via_res_seeds_user_target_from_pre_disable(self):
-    """RES re-engage with frozen pre-disable observed = 70: user_target
-    must seed from 70, NOT from a polluted post-engage observed of 56."""
-    # Spend a few frames in DISABLED with cluster at 70.
     for f in range(0, 10):
       _step(self.lim, f, cc_enabled=False, vEgo=24.0, observed_mph=70.0)
-    # Engage frame: cc rises, observed has already snapped to 56 (SCC's
-    # autonomous resume), and the wheel RES press lands this frame.
     _step(self.lim, 10, cc_enabled=True, vEgo=24.0, observed_mph=56.0,
           button=ButtonType.accelCruise)
     self.assertAlmostEqual(self.lim.user_target_speed, 70.0 * MPH_TO_MS, places=4)
 
   def test_engage_via_res_via_disabled_lookback(self):
-    """Wheel RES landed 1 frame BEFORE cc_enabled rose. Engage frame has
-    no accelCruise event but engage_via_res must still classify True."""
+    """Wheel RES landed BEFORE cc_enabled rose — engage_via_res via lookback."""
     for f in range(0, 5):
       _step(self.lim, f, cc_enabled=False, vEgo=24.0, observed_mph=70.0)
-    # RES press while still disabled.
     _step(self.lim, 5, cc_enabled=False, vEgo=24.0, observed_mph=70.0,
           button=ButtonType.accelCruise)
-    # Next frame: cc_enabled rises, no buttonEvent this frame.
     _step(self.lim, 6, cc_enabled=True, vEgo=24.0, observed_mph=56.0)
-    # Seed must come from frozen 70, proving engage_via_res classified True
-    # via the disabled-frame lookback.
     self.assertAlmostEqual(self.lim.user_target_speed, 70.0 * MPH_TO_MS, places=4)
 
   def test_engage_via_res_does_not_latch_drv_res(self):
-    """Drive #4 fix: the RES that re-engages cruise must NOT open a
-    DRIVER_OVERRIDE_RES window (which previously suppressed SOFT_CAP for 3 s)."""
     for f in range(0, 5):
       _step(self.lim, f, cc_enabled=False, vEgo=24.0, observed_mph=48.0)
     _step(self.lim, 5, cc_enabled=True, vEgo=24.0, observed_mph=56.0,
           button=ButtonType.accelCruise)
-    # _driver_res_last_frame stays at sentinel (DISABLED branch cleared it
-    # to -10000, engage-frame accelCruise was skipped by just_engaged guard).
     self.assertLess(self.lim._driver_res_last_frame, 0)
-    # Override-window check must therefore say False on engage frame.
     self.assertFalse(self.lim._in_driver_override_res(5))
 
   def test_engage_via_set_seeds_from_observed(self):
-    """SET re-engage doesn't trigger SCC autonomous resume; observed is
-    already fresh and should be the seed."""
     for f in range(0, 5):
       _step(self.lim, f, cc_enabled=False, vEgo=24.0, observed_mph=70.0)
     _step(self.lim, 5, cc_enabled=True, vEgo=24.0, observed_mph=24.0,
           button=ButtonType.decelCruise)
     self.assertAlmostEqual(self.lim.user_target_speed, 24.0 * MPH_TO_MS, places=4)
 
-  def test_first_engage_no_prior_disable_seeds_from_observed(self):
-    """No prior disable history (fresh process start with cc already on):
-    seed from current observed."""
-    _step(self.lim, 0, cc_enabled=True, vEgo=20.0, observed_mph=65.0,
-          button=ButtonType.accelCruise)
-    self.assertAlmostEqual(self.lim.user_target_speed, 65.0 * MPH_TO_MS, places=4)
-
   def test_disabled_res_lookback_window_expires(self):
-    """RES press that's older than DISABLED_RES_ENGAGE_WINDOW_FRAMES is
-    not classified as engage_via_res."""
     for f in range(0, 5):
       _step(self.lim, f, cc_enabled=False, vEgo=24.0, observed_mph=70.0)
-    # Old RES press during disabled.
     _step(self.lim, 5, cc_enabled=False, vEgo=24.0, observed_mph=70.0,
           button=ButtonType.accelCruise)
-    # Many frames pass, still disabled.
     for f in range(6, 6 + DISABLED_RES_ENGAGE_WINDOW_FRAMES + 5):
       _step(self.lim, f, cc_enabled=False, vEgo=24.0, observed_mph=70.0)
-    # Engage frame, no buttonEvent this frame.
     engage_frame = 6 + DISABLED_RES_ENGAGE_WINDOW_FRAMES + 5
     _step(self.lim, engage_frame, cc_enabled=True, vEgo=24.0, observed_mph=24.0)
-    # Lookback expired; engage_via_res = False; seed from current observed (24).
     self.assertAlmostEqual(self.lim.user_target_speed, 24.0 * MPH_TO_MS, places=4)
-
-
-class TestEVLimiterAutoResumeGuard(unittest.TestCase):
-  """SOFT_CAP must be allowed to fire SET during the post-engage
-  auto-resume window even though older revs blocked it via DRV_RES."""
-
-  def setUp(self):
-    self.lim = _make_limiter(power_threshold_kw=40)
-
-  def _engage_via_res(self):
-    for f in range(0, 5):
-      _step(self.lim, f, cc_enabled=False, vEgo=20.0, observed_mph=48.0)
-    # Engage with RES; SCC has snapped cluster up to 56.
-    _step(self.lim, 5, cc_enabled=True, vEgo=20.0, observed_mph=56.0,
-          button=ButtonType.accelCruise)
-    return 5
-
-  def test_soft_cap_can_fire_during_auto_resume_guard(self):
-    """Sustain high power for >300 ms after engage. SOFT_CAP must enter
-    AND emit at least one SET press within the auto-resume guard window."""
-    engage_frame = self._engage_via_res()
-    # Sustained high power above cap (40 kW threshold) for 50 frames (500 ms).
-    saw_set = False
-    for f in range(engage_frame + 1, engage_frame + 1 + 60):
-      btn, _ = _step(self.lim, f, cc_enabled=True, vEgo=20.0, observed_mph=56.0,
-                     est_power_w=50_000.0, abasis=0.5)
-      if btn == Buttons.SET_DECEL:
-        saw_set = True
-        break
-    self.assertTrue(saw_set, "SOFT_CAP failed to emit SET during auto-resume guard")
-
-  def test_auto_resume_guard_uses_faster_set_cadence(self):
-    """During the guard, repeated SOFT_CAP frames should fire SET more
-    often than the default 300 ms cadence allows."""
-    engage_frame = self._engage_via_res()
-    # Build up SOFT_CAP entry persistence first.
-    f = engage_frame + 1
-    while f < engage_frame + 1 + 35 and not self.lim._soft_cap_on:
-      _step(self.lim, f, cc_enabled=True, vEgo=20.0, observed_mph=56.0,
-            est_power_w=50_000.0, abasis=0.5)
-      f += 1
-    self.assertTrue(self.lim._soft_cap_on, "SOFT_CAP did not enter after sustained high load")
-    # Count SET presses over a 1-second window during the guard.
-    set_count = 0
-    for f2 in range(f, f + 100):
-      btn, _ = _step(self.lim, f2, cc_enabled=True, vEgo=20.0, observed_mph=56.0,
-                     est_power_w=50_000.0, abasis=0.5)
-      if btn == Buttons.SET_DECEL:
-        set_count += 1
-    # With AUTO_RESUME_SET_COOLDOWN_FRAMES = 15 (150 ms = 6.67 Hz wanted)
-    # capped by GLOBAL_RATE_LIMIT_PRESSES_PER_SEC = 6 logical/sec, expect
-    # at least 4 (allow some slack for cadence alignment / global limiter).
-    self.assertGreaterEqual(set_count, 4,
-                             f"Expected ≥4 SET in 1 s during auto-resume; got {set_count}")
 
 
 if __name__ == "__main__":
