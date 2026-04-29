@@ -37,7 +37,12 @@ from opendbc.sunnypilot.car.hyundai.ev_limiter import (
   MARGIN_BLEND_END_MPH,
   MPH_TO_MS,
   SET_COOLDOWN_FRAMES,
+  SET_COOLDOWN_DECEL_FAST_FRAMES,
   STANDSTILL_SET_PULSE_CAP,
+  DECEL_FAST_VEGO_THRESHOLD_MS,
+  DECEL_FAST_AEGO_MS2,
+  DECEL_FAST_RATE_LIMIT_PRESSES_PER_SEC,
+  GLOBAL_RATE_LIMIT_PRESSES_PER_SEC,
 )
 from opendbc.car.hyundai.values import Buttons
 
@@ -103,9 +108,10 @@ def _make_limiter(power_threshold_kw: int = 40, dte_floor: int = 5):
 
 
 def _step(limiter, frame, cc_enabled, vEgo, observed_mph, button=None,
-          est_power_w=0.0, abasis=0.0, brake=False, gas=False):
+          est_power_w=0.0, abasis=0.0, brake=False, gas=False, aEgo=0.0):
   cs = FakeCS()
   cs.out.vEgo = vEgo
+  cs.out.aEgo = aEgo
   cs.out.cruiseState.speed = observed_mph * MPH_TO_MS
   cs.out.brakePressed = brake
   cs.out.gasPressed = gas
@@ -516,6 +522,112 @@ class TestPowerEstimator(unittest.TestCase):
     pwr_no_abasis = self._formula(abasis=0.0, grade_f=+0.4, v_mph=60.0)
     self.assertAlmostEqual(pwr_with_decel, pwr_no_abasis, places=2,
                             msg="Negative abasis must not cancel positive grade contribution")
+
+
+class TestDecelFastCadence(unittest.TestCase):
+  """iter8: SET cadence shortened during low-speed deceleration so cluster
+  can be pulled toward target_set faster than default 6.7 mph/s rate. Drive
+  #6 7:34 retro: hard decel from cruise to red light left cluster set frozen
+  high because default cadence lost the race.
+  """
+
+  def setUp(self):
+    self.lim = _make_limiter()
+    # Engage at moderate speed so we have a clean baseline above standstill
+    for f in range(0, 25):
+      _step(self.lim, f, cc_enabled=False, vEgo=10.0, observed_mph=44.0)
+    _step(self.lim, 25, cc_enabled=True, vEgo=10.0, observed_mph=44.0,
+          button=ButtonType.decelCruise)
+    # Settle past standstill exit hold-off
+    for f in range(26, 60):
+      _step(self.lim, f, cc_enabled=True, vEgo=10.0, observed_mph=44.0,
+            est_power_w=0.0, abasis=0.0, aEgo=0.0)
+    self.lim.user_target_speed = 50.0 * MPH_TO_MS
+
+  def test_decel_fast_set_cooldown_active(self):
+    """vEgo < 30 mph + aEgo < -0.5 m/s² → SET fires at faster cadence."""
+    # Force conditions: low vEgo (10 m/s ≈ 22 mph, < 30), strong decel
+    # (aEgo = -1.0). cluster=44 vs target_set=22+margin
+    self.lim.last_set_frame = -10000
+    # First SET on frame 100
+    btn1, _ = _step(self.lim, 100, cc_enabled=True, vEgo=10.0,
+                    observed_mph=44.0, est_power_w=5_000.0, abasis=0.0,
+                    aEgo=-1.0)
+    self.assertEqual(btn1, Buttons.SET_DECEL)
+    # 7 frames later (70 ms) — should fire if decel-fast cadence (6 frames)
+    # is active, would NOT fire under default cadence (15 frames)
+    btn2, _ = _step(self.lim, 107, cc_enabled=True, vEgo=10.0,
+                    observed_mph=43.0, est_power_w=5_000.0, abasis=0.0,
+                    aEgo=-1.0)
+    self.assertEqual(btn2, Buttons.SET_DECEL,
+                      "Decel-fast: SET should fire at 60 ms cadence (got NONE — using default 150 ms?)")
+
+  def test_decel_fast_inactive_at_high_speed(self):
+    """vEgo >= 30 mph → default cadence even with strong decel."""
+    self.lim.last_set_frame = -10000
+    # vEgo = 50 mph (= 22.4 m/s, above the 30 mph threshold) with decel
+    btn1, _ = _step(self.lim, 200, cc_enabled=True, vEgo=22.4,
+                    observed_mph=80.0, est_power_w=5_000.0, abasis=0.0,
+                    aEgo=-1.0)
+    self.assertEqual(btn1, Buttons.SET_DECEL)
+    # 7 frames later — should NOT fire (default cadence is 15)
+    btn2, _ = _step(self.lim, 207, cc_enabled=True, vEgo=22.4,
+                    observed_mph=80.0, est_power_w=5_000.0, abasis=0.0,
+                    aEgo=-1.0)
+    self.assertEqual(btn2, Buttons.NONE,
+                      "At highway speed, default 150 ms cadence must apply (got SET)")
+
+  def test_decel_fast_inactive_when_not_decelerating(self):
+    """vEgo < 30 mph but aEgo ~ 0 → default cadence (low-speed cruising
+    isn't a brake-decel scenario)."""
+    self.lim.last_set_frame = -10000
+    btn1, _ = _step(self.lim, 300, cc_enabled=True, vEgo=10.0,
+                    observed_mph=44.0, est_power_w=5_000.0, abasis=0.0,
+                    aEgo=0.0)
+    self.assertEqual(btn1, Buttons.SET_DECEL)
+    # 7 frames later — no decel, default cadence
+    btn2, _ = _step(self.lim, 307, cc_enabled=True, vEgo=10.0,
+                    observed_mph=44.0, est_power_w=5_000.0, abasis=0.0,
+                    aEgo=0.0)
+    self.assertEqual(btn2, Buttons.NONE)
+
+  def test_decel_fast_rate_limit_allows_higher_rate(self):
+    """During decel-fast, 12 Hz rate limit allows faster sustained SET
+    than the default 6 Hz would."""
+    # Pre-fill rate limit history with 6 presses in last second to saturate
+    # the default limit; verify a 7th still fires under decel-fast.
+    self.lim.last_set_frame = -10000
+    f = 1000
+    for _ in range(6):
+      btn, _ = _step(self.lim, f, cc_enabled=True, vEgo=10.0,
+                     observed_mph=44.0, est_power_w=5_000.0, abasis=0.0,
+                     aEgo=-1.0)
+      self.assertEqual(btn, Buttons.SET_DECEL)
+      f += SET_COOLDOWN_DECEL_FAST_FRAMES
+    # 6 SETs fired in ~36 frames (360 ms). 7th press 6 frames later — under
+    # default 6 Hz limit this would be blocked, under decel-fast 12 Hz it fires.
+    btn7, _ = _step(self.lim, f, cc_enabled=True, vEgo=10.0,
+                    observed_mph=44.0, est_power_w=5_000.0, abasis=0.0,
+                    aEgo=-1.0)
+    self.assertEqual(btn7, Buttons.SET_DECEL,
+                      "Decel-fast 12 Hz limit must allow >6 SETs/sec")
+
+  def test_standstill_pulse_cap_lowered_to_10(self):
+    """iter8: STANDSTILL_SET_PULSE_CAP reduced 30 → 10."""
+    self.assertEqual(STANDSTILL_SET_PULSE_CAP, 10)
+    lim = _make_limiter()
+    for f in range(0, 25):
+      _step(lim, f, cc_enabled=False, vEgo=0.0, observed_mph=80.0)
+    _step(lim, 25, cc_enabled=True, vEgo=0.0, observed_mph=80.0,
+          button=ButtonType.accelCruise)
+    set_count = 0
+    for f in range(26, 26 + 50 * STANDSTILL_SET_PULSE_CAP):
+      btn, _ = _step(lim, f, cc_enabled=True, vEgo=0.0, observed_mph=80.0)
+      if btn == Buttons.SET_DECEL:
+        set_count += 1
+    self.assertLessEqual(set_count, STANDSTILL_SET_PULSE_CAP)
+    # Also make sure we hit the cap (not under-firing)
+    self.assertGreaterEqual(set_count, STANDSTILL_SET_PULSE_CAP - 1)
 
 
 if __name__ == "__main__":

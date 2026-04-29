@@ -160,13 +160,31 @@ LOAD_BONUS_LOW_FRAC = 0.4                # below 40% of threshold = full bonus
 LOAD_BONUS_HIGH_FRAC = 0.8               # above 80% of threshold = no bonus
                                           # (linear taper between)
 
-# Standstill SET (iter7). Drive #6: hard decel from cruise to red light
-# left cluster_set frozen mid-pulldown when raw_standstill kicked in (e.g.
-# stored 62 mph, cluster frozen at 31 because SET cascade lost the race).
-# Iter7 allows SET-only at standstill to pull set down toward the
-# LOW_SPEED_MARGIN cap of 20 mph. Bounded pulse count prevents runaway TX
-# if Hyundai SCC ignores SET at vEgo=0.
-STANDSTILL_SET_PULSE_CAP = 30            # max synthetic SETs per single standstill window
+# Standstill SET. Iter7 added SET-only-at-standstill (pull set toward 20 mph
+# cap when stopped); iter8 lowered the pulse cap from 30 → 10 because the
+# drive #6 simulation suggested Hyundai SCC may ignore subsequent SETs at
+# vEgo=0 (real iter6 fired 1 SET → cluster dropped 1 mph → no further
+# response observed). Decel-fast cadence (below) does the actual cluster
+# pull-down work BEFORE standstill latches, so 10 pulses is plenty as the
+# residual safety net.
+STANDSTILL_SET_PULSE_CAP = 10            # max synthetic SETs per single standstill window
+
+# Decel-fast SET regime (iter8). When vEgo is in the low-speed range AND
+# decelerating, SCC pulls cluster set down via our SET cascade. The default
+# 150 ms SET cadence (= 6.7 mph/s pull-down rate) loses the race against
+# typical brake-decel of 8-15 mph/s, leaving cluster set high when
+# raw_standstill latches. During decel-fast we use a tighter cadence and a
+# higher rate-limit ceiling so cluster keeps up with vEgo. Outside this
+# regime, default cadence + rate limit apply.
+DECEL_FAST_VEGO_THRESHOLD_MS = 30.0 * 0.44704     # below 30 mph
+DECEL_FAST_AEGO_MS2 = -0.5                          # noticeable decel (negative aEgo)
+SET_COOLDOWN_DECEL_FAST_FRAMES = 6                  # 60 ms minimum spacing between SETs
+DECEL_FAST_RATE_LIMIT_PRESSES_PER_SEC = 12          # sustained 12 SETs/sec (=12 mph/s pull-down
+                                                     # rate, vs default 6 mph/s); minimum
+                                                     # spacing of 60 ms is below this and the
+                                                     # rate limit is the binding constraint.
+                                                     # Active only during decel-fast — RES
+                                                     # isn't fired during decel so no conflict.
 
 # Down-trigger (SET) deadbands
 SET_TRIGGER_DEADBAND_MS = 0.5 * 0.44704  # 0.5 mph above target_set before we push down
@@ -294,18 +312,23 @@ class EVLimiter:
 
   # ----- Helpers ----------------------------------------------------------
 
-  def _consume_global_rate_limit(self, frame: int, n_logical: int) -> bool:
+  def _consume_global_rate_limit(self, frame: int, n_logical: int,
+                                  limit: int = GLOBAL_RATE_LIMIT_PRESSES_PER_SEC) -> bool:
     """Return True and record the TX if adding `n_logical` logical button
-    commands in the last 1 s stays at or under GLOBAL_RATE_LIMIT_PRESSES_PER_SEC.
+    commands in the last 1 s stays at or under `limit`.
 
     Burst copies are reliability duplicates (same logical press repeated for
     the cluster to see), so callers pass 1 per logical command — not BURST_COPIES.
+
+    iter8: callers can pass a higher `limit` during the decel-fast regime
+    (DECEL_FAST_RATE_LIMIT_PRESSES_PER_SEC = 12) so cluster pull-down can
+    keep up with hard braking. Default behavior unchanged.
     """
     cutoff = frame - FRAMES_PER_SEC
     while self.press_history and self.press_history[0][0] < cutoff:
       self.press_history.popleft()
     total = sum(c for _, c in self.press_history)
-    if total + n_logical > GLOBAL_RATE_LIMIT_PRESSES_PER_SEC:
+    if total + n_logical > limit:
       return False
     self.press_history.append((frame, n_logical))
     return True
@@ -482,6 +505,7 @@ class EVLimiter:
     # Inputs
     cc_enabled = bool(CC.enabled)
     v_ego = float(CS.out.vEgo)
+    a_ego = float(CS.out.aEgo)
     observed_set_speed = float(CS.out.cruiseState.speed)
     brake_pressed = bool(CS.out.brakePressed)
     gas_pressed = bool(CS.out.gasPressed)
@@ -629,6 +653,17 @@ class EVLimiter:
     self_set_recent = (frame - self.last_set_frame) < LIMITER_OPPOSITE_DIR_BLOCK_FRAMES
     self_res_recent = (frame - self.last_res_frame) < LIMITER_OPPOSITE_DIR_BLOCK_FRAMES
 
+    # iter8: decel-fast regime. When in low-speed range AND decelerating, use
+    # tighter SET cadence + higher rate-limit so cluster pull-down keeps up
+    # with brake decel (typical 8-15 mph/s). Default 6.7 mph/s pull-down lost
+    # the race in drive #6 (cluster frozen at 31 when raw_standstill latched).
+    # Note: aEgo is the kinematic ground-frame accel from wheel speed, so a
+    # negative value means actual decel regardless of cause (driver brake,
+    # SCC command, coasting downhill).
+    decel_active = (v_ego < DECEL_FAST_VEGO_THRESHOLD_MS) and (a_ego < DECEL_FAST_AEGO_MS2)
+    set_cooldown_frames = SET_COOLDOWN_DECEL_FAST_FRAMES if decel_active else SET_COOLDOWN_FRAMES
+    rate_limit = DECEL_FAST_RATE_LIMIT_PRESSES_PER_SEC if decel_active else GLOBAL_RATE_LIMIT_PRESSES_PER_SEC
+
     # Sliding cap (iter6 core). Cluster set is held within
     #   target_set = min(user_target, vEgo + dynamic_margin(vEgo))
     # Push DOWN when observed > target_set + deadband (sliding cap violation)
@@ -675,8 +710,8 @@ class EVLimiter:
     )
 
     button = Buttons.NONE
-    if want_set and (frame - self.last_set_frame) >= SET_COOLDOWN_FRAMES:
-      if self._consume_global_rate_limit(frame, 1):
+    if want_set and (frame - self.last_set_frame) >= set_cooldown_frames:
+      if self._consume_global_rate_limit(frame, 1, limit=rate_limit):
         button = Buttons.SET_DECEL
     elif want_res and (frame - self.last_res_frame) >= RES_COOLDOWN_FRAMES:
       if self._consume_global_rate_limit(frame, 1):
