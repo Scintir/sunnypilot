@@ -49,12 +49,23 @@ AIR_DENSITY_KG_M3 = 1.225                 # sea level @ 15°C
 
 # Asymmetric LP filter on the published estPowerW. User feedback (drive #6):
 # the IMU-derived grade signal is noisy → estPowerW HUD reads erratically.
-# Fast rise (capture spikes), slow fall (smooth display). Limiter publishes
-# `max(raw, filtered)` so the protective gate can't be lagged by the filter.
+# Fast rise (capture spikes), slow fall (smooth display).
+# iter9: drive #7 showed `max(raw, filtered)` was locking in positive
+# transients from grade noise — published value ran ~2x actual motor power
+# on highway. Now publish filtered only; the ~150 ms rise lag is acceptable
+# since SCC's accel demand doesn't ramp instantaneously.
 POWER_TAU_RISE_S = 0.15                   # 150 ms tau — spikes captured almost immediately
 POWER_TAU_FALL_S = 2.0                    # 2 s tau — slow decay, stable HUD
 DT_CLAMP_MIN_S = 0.001                    # safety: never let dt blow up alpha
 DT_CLAMP_MAX_S = 0.1                      # 100 ms (10x nominal)
+
+# Grade dead-band (iter9). Drive #7 forensics: `(LONG_ACCEL - aEgo)` has
+# a +0.025 m/s² mean bias and p90 of +0.38, which the asymmetric LP +
+# max(raw, filtered) pipeline locked in as ~22 kW phantom grade contribution
+# on flat highway. Subtract a 0.10 m/s² floor (≈0.6° grade) before adding
+# grade to power; sub-0.6° grades shouldn't be triggering the limiter
+# (gentle highway slopes don't push motor power into ICE territory anyway).
+GRADE_DEADBAND_MS2 = 0.10
 
 
 def road_load_power_w(v_ego_ms: float) -> float:
@@ -217,7 +228,10 @@ class CarStateExt:
       # grade=+0.4, and iter6's `max(0, abasis+grade)` read 0 even though the
       # motor was doing real work to hold 73 mph against grade. Iter7 clamps
       # both positive separately so grade always counts and decel never cancels.
-      uphill_grade = max(0.0, grade_f)
+      # iter9: subtract GRADE_DEADBAND_MS2 floor before counting — kills the
+      # +0.025 m/s² bias from LONG_ACCEL-aEgo derivation that produced ~22 kW
+      # phantom grade contribution on flat highway in drive #7.
+      uphill_grade = max(0.0, grade_f - GRADE_DEADBAND_MS2)
       abasis_pos = max(0.0, abasis)
 
       # Power = mass × v × (commanded-accel + grade-pull) + steady-state road load.
@@ -229,8 +243,11 @@ class CarStateExt:
       raw_power_w = max(0.0, p_accel_grade_w + p_road_w)
 
       # Asymmetric LP for HUD smoothness + control responsiveness.
-      # Use max(raw, filtered) for the published value so the protective gate
-      # always sees the higher of the two — fast spike capture, slow HUD decay.
+      # iter9: publish filtered only (was max(raw, filtered)) — drive #7
+      # showed the max() pipeline locked in positive grade-noise transients,
+      # producing ~2x phantom power on highway. The fast-rise tau (150 ms)
+      # is short enough that a real power spike still drives protective
+      # action quickly; the slow-fall tau (2 s) keeps HUD readable.
       if not self._power_filter_initialized:
         self._power_filtered_w = raw_power_w
         self._power_filter_initialized = True
@@ -246,7 +263,7 @@ class CarStateExt:
         else:
           alpha = dt / (POWER_TAU_FALL_S + dt)
         self._power_filtered_w += alpha * (raw_power_w - self._power_filtered_w)
-      power_w_published = max(raw_power_w, self._power_filtered_w)
+      power_w_published = self._power_filtered_w
 
       ret_sp.accelDemand = abasis
       ret_sp.estPowerW = power_w_published

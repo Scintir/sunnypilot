@@ -70,8 +70,16 @@ class CyclingIntButton(BigButton):
     else:
       idx = min(range(len(self._values)), key=lambda i: abs(self._values[i] - cur))
     nxt = self._values[(idx + 1) % len(self._values)]
+    # Drive #7 UI crash root cause: passing `str(nxt)` to an INT-typed param
+    # raises TypeError in params_pyx (proposed_type=str, expected_type=INT).
+    # The exception propagated, killing the UI process. Fix: pass int directly
+    # — params_pyx's (int, INT) cast handles the conversion. Catch TypeError
+    # too as defense-in-depth so a future param-type mismatch doesn't crash UI.
     try:
-      self._params.put(self._param, str(nxt))
+      self._params.put(self._param, nxt)
     except UnknownKeyName:
+      self._reachable = False
+    except TypeError as e:
+      print(f"[CyclingIntButton] put({self._param}={nxt}) failed: {e}")
       self._reachable = False
     self._refresh_display()

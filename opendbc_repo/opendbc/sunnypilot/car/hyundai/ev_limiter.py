@@ -687,20 +687,29 @@ class EVLimiter:
     # - DRIVER_OVERRIDE_SET: driver SET is the SAME direction as our SET,
     #   so silencing our SET during a driver-SET window would just leave a
     #   gap if conditions still warrant pulling cluster set down
-    # Self-RES suppression and gas/brake pause apply.
+    # iter9: anti-oscillation block (`self_res_recent`) is bypassed when
+    # `power_too_high` — drive #7 forensics showed 53% of high-power frames
+    # were stuck in RECOVERY because the limiter had recently pressed RES,
+    # while estPowerW was already in ICE territory. Power protection beats
+    # cosmetic anti-oscillation.
+    suppress_set = self_res_recent and not power_too_high
     want_set = (
       (set_too_high or power_too_high)
-      and not self_res_recent
+      and not suppress_set
       and not gas_pressed
       and not brake_pressed
     )
 
     # Up-trigger: gentle recovery toward target_set when below. Mutually
-    # exclusive with want_set — never both same frame.
+    # exclusive with want_set — never both same frame. Also explicitly
+    # cancelled by power_too_high (defense-in-depth: even if some other
+    # gate cleared want_set, RES toward user_target is wrong when motor
+    # is already at ICE-territory power).
     standstill_clear = (frame - self._left_standstill_at_frame) >= RECOVERY_AFTER_STANDSTILL_FRAMES
     want_res = (
       under_target
       and not want_set
+      and not power_too_high
       and not in_override_set
       and not self_set_recent
       and not gas_pressed

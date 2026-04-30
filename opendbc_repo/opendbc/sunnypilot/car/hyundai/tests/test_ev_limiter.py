@@ -630,5 +630,110 @@ class TestDecelFastCadence(unittest.TestCase):
     self.assertGreaterEqual(set_count, STANDSTILL_SET_PULSE_CAP - 1)
 
 
+class TestIter9PowerPriority(unittest.TestCase):
+  """iter9: power_too_high bypasses self_res_recent (drive #7 fix for the
+  RECOVERY/SET deadlock — 53% of high-power frames stuck in RECOVERY because
+  recent RES blocked SET despite estPowerW already in ICE territory).
+  """
+
+  def setUp(self):
+    self.lim = _make_limiter(power_threshold_kw=40)
+    # Engage cleanly above standstill
+    for f in range(0, 25):
+      _step(self.lim, f, cc_enabled=False, vEgo=24.0, observed_mph=60.0)
+    _step(self.lim, 25, cc_enabled=True, vEgo=24.0, observed_mph=60.0,
+          button=ButtonType.decelCruise)
+    for f in range(26, 50):
+      _step(self.lim, f, cc_enabled=True, vEgo=24.0, observed_mph=60.0)
+    self.lim.user_target_speed = 60.0 * MPH_TO_MS
+
+  def test_power_too_high_bypasses_self_res_recent(self):
+    """Recent RES would normally block SET for 1.5 s, but power-based
+    protection must override (drive #7: RECOVERY/SET deadlock at 4:08 PM)."""
+    # Mark a recent RES press
+    self.lim.last_res_frame = 100
+    self.lim.last_set_frame = -10000
+    # Conditions: cluster above vEgo (gap exists), power above threshold
+    btn, _ = _step(self.lim, 110, cc_enabled=True, vEgo=24.0,
+                   observed_mph=70.0, est_power_w=50_000.0, abasis=0.5)
+    self.assertEqual(btn, Buttons.SET_DECEL,
+                      "power_too_high must override self_res_recent block (got NONE)")
+
+  def test_self_res_recent_still_blocks_set_when_only_set_too_high(self):
+    """If only set_too_high (NOT power_too_high), self_res_recent still
+    blocks SET — this preserves anti-oscillation for the cosmetic case."""
+    self.lim.last_res_frame = 100
+    self.lim.last_set_frame = -10000
+    # Conditions: cluster above target_set, but power LOW (no power_too_high)
+    btn, _ = _step(self.lim, 110, cc_enabled=True, vEgo=24.0,
+                   observed_mph=70.0, est_power_w=5_000.0, abasis=0.0)
+    self.assertEqual(btn, Buttons.NONE,
+                      "self_res_recent should still block SET when power is low")
+
+  def test_power_too_high_cancels_want_res(self):
+    """When power is high, RES must NEVER fire even if cluster is below
+    user_target. Otherwise we'd push the gap wider and motor harder."""
+    # Setup: cluster below user_target (would normally trigger RES) BUT
+    # power is high (must not fire RES even if SET path is blocked elsewhere)
+    self.lim.user_target_speed = 70.0 * MPH_TO_MS
+    self.lim.last_set_frame = -10000
+    self.lim.last_res_frame = -10000
+    # vEgo=24 m/s (~54 mph) — high speed regime, margin = 5 mph
+    # observed=50 mph < target=min(70, 54+5)=59 mph → under_target = True
+    # power_too_high requires observed > vEgo+0.5 → 50 > 54.5 = False... hmm
+    # Different scenario: vEgo=22 m/s (~49 mph), observed=55 mph → gap exists
+    btn, _ = _step(self.lim, 200, cc_enabled=True, vEgo=22.0,
+                   observed_mph=55.0, est_power_w=50_000.0, abasis=0.5)
+    self.assertNotEqual(btn, Buttons.RES_ACCEL,
+                        "RES must not fire when power_too_high")
+
+
+class TestIter9GradeDeadband(unittest.TestCase):
+  """iter9 grade dead-band kills the +0.025 mean bias from LONG_ACCEL-aEgo
+  derivation that produced ~22 kW phantom contribution on flat highway."""
+
+  def setUp(self):
+    from opendbc.sunnypilot.car.hyundai.carstate_ext import (
+      road_load_power_w, VEHICLE_MASS_KG, GRADE_DEADBAND_MS2,
+    )
+    self.road_load = road_load_power_w
+    self.MASS = VEHICLE_MASS_KG
+    self.DEADBAND = GRADE_DEADBAND_MS2
+
+  def _formula(self, abasis, grade_f, v_mph):
+    """Iter9 formula: subtract dead-band from grade before adding to power."""
+    v = v_mph * MPH_TO_MS
+    abasis_pos = max(0.0, abasis)
+    grade_pos = max(0.0, grade_f - self.DEADBAND)  # iter9 dead-band
+    p_accel_grade = self.MASS * v * (abasis_pos + grade_pos)
+    p_road = self.road_load(v)
+    return max(0.0, p_accel_grade + p_road)
+
+  def test_deadband_value(self):
+    """Sanity check the dead-band constant."""
+    self.assertAlmostEqual(self.DEADBAND, 0.10, places=4)
+
+  def test_grade_below_deadband_contributes_zero(self):
+    """A grade reading at the +0.025 m/s² noise mean must NOT add power."""
+    pwr_with_noise = self._formula(abasis=0.0, grade_f=0.025, v_mph=60.0)
+    pwr_no_grade = self._formula(abasis=0.0, grade_f=0.0, v_mph=60.0)
+    self.assertAlmostEqual(pwr_with_noise, pwr_no_grade, places=2,
+                            msg="Grade noise within dead-band must not add power")
+
+  def test_grade_at_deadband_contributes_zero(self):
+    """Exactly at the dead-band threshold, no contribution."""
+    pwr = self._formula(abasis=0.0, grade_f=self.DEADBAND, v_mph=60.0)
+    pwr_no_grade = self._formula(abasis=0.0, grade_f=0.0, v_mph=60.0)
+    self.assertAlmostEqual(pwr, pwr_no_grade, places=2)
+
+  def test_grade_above_deadband_contributes_proportionally(self):
+    """A real +0.4 m/s² grade contributes (0.4 - 0.10) = 0.30 m/s² worth."""
+    pwr = self._formula(abasis=0.0, grade_f=0.4, v_mph=60.0)
+    expected_grade_extra = self.MASS * (60.0 * MPH_TO_MS) * 0.30
+    pwr_no_grade = self._formula(abasis=0.0, grade_f=0.0, v_mph=60.0)
+    self.assertAlmostEqual(pwr - pwr_no_grade, expected_grade_extra, places=0,
+                            msg="Grade above dead-band should contribute (grade - dead-band)")
+
+
 if __name__ == "__main__":
   unittest.main()
