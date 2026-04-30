@@ -35,7 +35,14 @@ GRADE_FILTER_TAU_S = 1.0                  # ~1 s LP for grade — slow grade vs 
 GRADE_FILTER_DT_S = 0.01                  # carstate_ext.update() runs at 100 Hz (card.py Ratekeeper)
 GRADE_FILTER_ALPHA = GRADE_FILTER_DT_S / (GRADE_FILTER_TAU_S + GRADE_FILTER_DT_S)
 GRADE_ACCEL_RAW_CLIP_MS2 = 1.5            # clip raw input before filtering
-GRADE_ACCEL_FILTERED_CLIP_MS2 = 1.0       # clip filtered output (≈10% grade ceiling)
+# iter10 (drive #8): lowered from 1.0 to 0.5 m/s² (≈5% grade ceiling). The
+# 1.0 ceiling allowed grade contribution alone to reach 64 kW at 73 mph, which
+# combined with road_load and abasis produced HUD readings >80 kW on a motor
+# that physically caps at ~50-60 kW EV-only. 0.5 m/s² ≈ 5% grade is sufficient
+# for any sustained Loveland-area highway grade; sustained 7% climbs (≈0.69
+# m/s²) will under-read by ~20 kW but should still trigger via abasis +
+# road_load reaching the power_too_high threshold.
+GRADE_ACCEL_FILTERED_CLIP_MS2 = 0.5
 
 # Steady-state road load (rolling resistance + aero drag). Conservative
 # defaults for a midsize SUV; can be calibrated later from logs. Drive #6
@@ -45,7 +52,11 @@ GRADE_ACCEL_FILTERED_CLIP_MS2 = 1.0       # clip filtered output (≈10% grade c
 # read 0 kW. Iter7 baseline + grade-positive-clamp catches it.
 ROLLING_RESISTANCE_COEFF = 0.011          # Crr (dimensionless)
 AERO_DRAG_COEFF = 0.75                    # CdA (m²); Santa Fe is boxier than typical sedan
-AIR_DENSITY_KG_M3 = 1.225                 # sea level @ 15°C
+# iter10 (drive #8): lowered default from 1.225 (sea level) to 1.10 kg/m³,
+# tuned for ~1500 m elevation (Loveland CO). At 73 mph this cuts the aero
+# component by ~10% (16.5 → 14.8 kW). iter10b will switch to elevation-aware
+# air density via liveLocationKalman.positionGeodetic.value[2] altitude.
+AIR_DENSITY_KG_M3 = 1.10
 
 # Asymmetric LP filter on the published estPowerW. User feedback (drive #6):
 # the IMU-derived grade signal is noisy → estPowerW HUD reads erratically.
@@ -101,6 +112,19 @@ class CarStateExt:
     # Asymmetric LP filter for published estPowerW (iter7).
     self._power_filtered_w = 0.0
     self._power_filter_initialized = False
+    # iter10 (drive #8): post-filter zero detector. Drive #8 had 203k
+    # frames of evLimiterGradeAccel=0.0 published while estPowerW varied
+    # normally — meaning either grade_f truly stuck at 0 (ESP12 silently
+    # missing despite registration) or sequential-write bug. Track filter
+    # output independently to disambiguate.
+    self._grade_filter_seen_nonzero = False
+    self._grade_filter_zero_warning_logged = False
+    self._grade_filter_call_count = 0
+    # iter10 Layer 3a: external grade source (liveLocationKalman pitch).
+    # Set by card.py before each CI.update() call. None = use legacy
+    # LONG_ACCEL-aEgo derivation. Set to a finite m/s² value when
+    # liveLocationKalman is calibrated and inputsOK.
+    self.grade_accel_external_ms2 = None
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -179,49 +203,84 @@ class CarStateExt:
       abasis = float(cp.vl["TCS13"]["aBasis"])
       v_ego = float(ret.vEgo)
 
-      # Grade derivation (sign verified, drive #4 logs):
-      #   body-frame LONG_ACCEL ≈ inertial accel + g·sin(pitch)
-      #   ground-frame aEgo     ≈ inertial accel
-      # So grade_accel ≈ LONG_ACCEL - aEgo, positive on uphill.
-      # ESP12 is missing on some Hyundai PT buses (lazy `cp.vl[...]` access
-      # raises AssertionError when the DBC doesn't define the message). On
-      # miss we hold the last filter value rather than resetting — for a
-      # transient miss after a valid history that stays conservative; on a
-      # car that never has ESP12 at all the filter starts and stays at 0.
-      try:
-        long_accel = float(cp.vl["ESP12"]["LONG_ACCEL"])
-        # Silent-zero detector: log once if ESP12 stays at exactly 0 for the
-        # first ~5 s of carstate calls. iter5 had this happen unnoticed for
-        # an entire 40 min drive.
-        self._esp12_call_count += 1
-        if long_accel != 0.0:
-          self._esp12_seen_nonzero = True
-        elif (
-          not self._esp12_zero_warning_logged
-          and not self._esp12_seen_nonzero
-          and self._esp12_call_count >= 500   # 5 s at 100 Hz
-        ):
-          print("[ev_limiter] WARNING: ESP12.LONG_ACCEL stuck at 0.0 for 5 s — "
-                "grade-aware power is degraded to flat-only", file=sys.stderr)
-          self._esp12_zero_warning_logged = True
+      # iter10 Layer 3a: prefer kalman pitch source when available.
+      # `grade_accel_external_ms2` is set by card.py from
+      # liveLocationKalman.calibratedOrientationNED.value[1] (pitch radians)
+      # converted to grade accel via g*sin(pitch). The kalman fuses IMU+camera
+      # odometry and explicitly estimates accel_bias and gyro_bias, so it is
+      # vastly less noisy than the LONG_ACCEL-aEgo derivation. When set
+      # (kalman calibrated and inputsOK), bypass the legacy filter; the
+      # kalman is already a fused estimate, no LP filter needed.
+      if self.grade_accel_external_ms2 is not None:
+        # Trust the kalman; clip and use directly.
+        grade_f = self.grade_accel_external_ms2
+        if grade_f > GRADE_ACCEL_FILTERED_CLIP_MS2:
+          grade_f = GRADE_ACCEL_FILTERED_CLIP_MS2
+        elif grade_f < -GRADE_ACCEL_FILTERED_CLIP_MS2:
+          grade_f = -GRADE_ACCEL_FILTERED_CLIP_MS2
+        # Mirror into self.grade_accel_filtered so legacy consumers and the
+        # post-filter zero detector see the kalman-derived value.
+        self.grade_accel_filtered = grade_f
+      else:
+        # Legacy fallback: LONG_ACCEL - aEgo derivation.
+        # Sign verified empirically in drive #4 (corr +0.65 across 17.6k samples;
+        # bin analysis: ratio ≈ 0.94 of geometric expectation across pitch range).
+        # ESP12 is missing on some Hyundai PT buses (lazy `cp.vl[...]` access
+        # raises AssertionError when the DBC doesn't define the message). On
+        # miss we hold the last filter value rather than resetting — for a
+        # transient miss after a valid history that stays conservative; on a
+        # car that never has ESP12 at all the filter starts and stays at 0.
+        try:
+          long_accel = float(cp.vl["ESP12"]["LONG_ACCEL"])
+          # Silent-zero detector: log once if ESP12 stays at exactly 0 for the
+          # first ~5 s of carstate calls. iter5 had this happen unnoticed for
+          # an entire 40 min drive.
+          self._esp12_call_count += 1
+          if long_accel != 0.0:
+            self._esp12_seen_nonzero = True
+          elif (
+            not self._esp12_zero_warning_logged
+            and not self._esp12_seen_nonzero
+            and self._esp12_call_count >= 500   # 5 s at 100 Hz
+          ):
+            print("[ev_limiter] WARNING: ESP12.LONG_ACCEL stuck at 0.0 for 5 s — "
+                  "grade-aware power is degraded to flat-only", file=sys.stderr)
+            self._esp12_zero_warning_logged = True
 
-        a_ego = float(ret.aEgo)
-        grade_accel_raw = long_accel - a_ego
-        if grade_accel_raw > GRADE_ACCEL_RAW_CLIP_MS2:
-          grade_accel_raw = GRADE_ACCEL_RAW_CLIP_MS2
-        elif grade_accel_raw < -GRADE_ACCEL_RAW_CLIP_MS2:
-          grade_accel_raw = -GRADE_ACCEL_RAW_CLIP_MS2
-        # First-order LP at ~1 s τ to smooth axle/IMU noise; sign retained
-        # so consumers can see downhill grades for HUD/debug.
-        self.grade_accel_filtered += GRADE_FILTER_ALPHA * (grade_accel_raw - self.grade_accel_filtered)
-      except (KeyError, AssertionError):
-        pass
+          a_ego = float(ret.aEgo)
+          grade_accel_raw = long_accel - a_ego
+          if grade_accel_raw > GRADE_ACCEL_RAW_CLIP_MS2:
+            grade_accel_raw = GRADE_ACCEL_RAW_CLIP_MS2
+          elif grade_accel_raw < -GRADE_ACCEL_RAW_CLIP_MS2:
+            grade_accel_raw = -GRADE_ACCEL_RAW_CLIP_MS2
+          # First-order LP at ~1 s τ to smooth axle/IMU noise; sign retained
+          # so consumers can see downhill grades for HUD/debug.
+          self.grade_accel_filtered += GRADE_FILTER_ALPHA * (grade_accel_raw - self.grade_accel_filtered)
+        except (KeyError, AssertionError):
+          pass
 
-      grade_f = self.grade_accel_filtered
-      if grade_f > GRADE_ACCEL_FILTERED_CLIP_MS2:
-        grade_f = GRADE_ACCEL_FILTERED_CLIP_MS2
-      elif grade_f < -GRADE_ACCEL_FILTERED_CLIP_MS2:
-        grade_f = -GRADE_ACCEL_FILTERED_CLIP_MS2
+        grade_f = self.grade_accel_filtered
+        if grade_f > GRADE_ACCEL_FILTERED_CLIP_MS2:
+          grade_f = GRADE_ACCEL_FILTERED_CLIP_MS2
+        elif grade_f < -GRADE_ACCEL_FILTERED_CLIP_MS2:
+          grade_f = -GRADE_ACCEL_FILTERED_CLIP_MS2
+
+      # iter10 (drive #8): post-filter zero detector. If grade_f never moves
+      # off zero across many calls while estPowerW publishes correctly, this
+      # indicates broken grade detection (legacy ESP12 path) or unset external
+      # source (kalman path). Logged once per process for forensics.
+      self._grade_filter_call_count += 1
+      if grade_f != 0.0:
+        self._grade_filter_seen_nonzero = True
+      elif (
+        not self._grade_filter_zero_warning_logged
+        and not self._grade_filter_seen_nonzero
+        and self._grade_filter_call_count >= 1000   # 10 s at 100 Hz
+      ):
+        src = "kalman" if self.grade_accel_external_ms2 is not None else "ESP12-aEgo"
+        print(f"[ev_limiter] WARNING: grade_filter ({src}) stuck at 0.0 for 10 s — "
+              "grade-aware power is degraded to flat-only", file=sys.stderr)
+        self._grade_filter_zero_warning_logged = True
       # Only the uphill component contributes to ICE-engagement risk.
       # Negative SCC accel command (commanded decel) does NOT cancel positive
       # grade contribution: drive #6's 7:40 ICE event had aBasis=-0.4 with

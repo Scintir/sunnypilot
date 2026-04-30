@@ -201,6 +201,55 @@ RECOVERY_V_EGO_FLOOR_MS = 3 * 0.44704    # must be moving (matches former soft-c
 LIMITING_LATCH_FRAMES = 50               # 500 ms after our last SET counts as LIMITING
 RECOVERING_LATCH_FRAMES = 100            # 1 s after our last RES counts as RECOVERING
 
+# iter10 (drive #8) Layer 2: state machine dwell + hysteresis. Drive #8
+# 7:36-7:45 oscillation period had 96 state transitions in 9 minutes
+# (10.7/min). Without dwell, the soft-cap ↔ recovery loop fires whenever
+# estPowerW crosses threshold, which happens ~once/s on grade with the
+# noisy LP-filtered observer.
+#
+# Semantics:
+#   IDLE → active state: governed by ENTER_SUSTAIN_FRAMES only (no min-dwell).
+#     EXCEPTION: power_too_high bypasses entry sustain → immediate SOFT_CAP
+#     entry. Preserves iter9 fast-protection.
+#   active → IDLE: requires (time-in-state ≥ MIN_ACTIVE_STATE_DWELL_FRAMES)
+#     AND (clear sustained for EXIT_SUSTAIN_FRAMES).
+#   active ↔ active (cap ↔ recovery): allowed only after MIN_ACTIVE_STATE_DWELL.
+#   any → STANDSTILL_HOLD / DRIVER_OVERRIDE_* / DISABLED: immediate (driver
+#     priority states bypass all timers).
+#   Sustain counter reset rule: increments while predicate true, resets to 0
+#     when predicate false.
+#   Cross-predicate priority: if set_too_high AND under_target both true
+#     simultaneously after governor clamp, SOFT_CAP wins (down has priority).
+MIN_ACTIVE_STATE_DWELL_FRAMES = 200      # 2.0 s minimum in any active state before exit
+SOFT_CAP_ENTER_SUSTAIN_FRAMES = 30       # 0.3 s of (set_too_high or power_too_high)
+SOFT_CAP_EXIT_SUSTAIN_FRAMES = 200       # 2.0 s of clear before allowing exit
+RECOVERY_ENTER_SUSTAIN_FRAMES = 20       # 0.2 s of under_target
+RECOVERY_EXIT_SUSTAIN_FRAMES = 100       # 1.0 s of at-target before allowing exit
+
+# iter10 (drive #8) Layer 1: bounded reference governor.
+# Replaces iter9's blanket `gas_pressed` block on want_res with mode-based
+# bound computation. Prevents Event A (dwell at 21 mph) and Event B
+# (cluster < vEgo oscillation) by construction.
+#
+# Modes (selected exclusively each tick):
+GOVERNOR_MODE_NORMAL       = 0   # default: max-deficit + no-below-vEgo invariants
+GOVERNOR_MODE_GAS_CATCHUP  = 1   # driver pressing gas — cluster tracks vEgo upward
+GOVERNOR_MODE_DECEL        = 2   # SCC commanding decel (lead, brake-recent) — let cluster dip
+GOVERNOR_MODE_BRAKE        = 3   # brake pressed — limiter should not act
+GOVERNOR_MODE_STANDSTILL   = 4   # at/near standstill — STANDSTILL_HOLD owns it
+
+MAX_DEFICIT_DEFAULT_MPH = 7.0    # default cap on (user_target - cluster_set), UI-tunable
+GAS_HEADROOM_MPH = 2.0           # while gas pressed, cluster ≤ vEgo + 2
+GAS_CATCHUP_MIN_DEFICIT_MPH = 3.0  # arming: cluster < user_target - 3 mph
+GAS_HOLD_MIN_FRAMES = 50         # 0.5 s @ 100 Hz before catch-up arms
+SCC_DECEL_DETECT_MS2 = -0.5      # accelDemand below this = SCC commanding decel
+SCC_DECEL_PERSIST_FRAMES = 50    # 0.5 s sustain to qualify as decel intent
+BRAKE_RECENT_FRAMES = 100        # 1 s after brake release still counts as decel intent
+GAS_RES_INTERVAL_FRAMES = 150    # 1.5 s between RES presses while gas held
+
+# UI-tunable param key for max deficit
+MAX_DEFICIT_PARAM = "EvLimiterMaxDeficitMph"
+
 # One-direction-at-a-time cooldowns to prevent visible oscillation
 LIMITER_OPPOSITE_DIR_BLOCK_FRAMES = 150  # after our SET, block our RES for 1.5 s, and vice versa
 
@@ -216,6 +265,10 @@ TX_ECHO_ATTRIBUTION_FRAMES = 20          # 200 ms — observed changes within th
 MPH_TO_MS = 0.44704
 USER_TARGET_MIN_MS = 0.0
 USER_TARGET_MAX_MS = 95.0 * MPH_TO_MS
+
+# iter10: governor constants (require MPH_TO_MS, defined here)
+EGO_SLOP_MS = 0.5                # 1.1 mph slop on "cluster ≥ vEgo" invariant
+STANDSTILL_V_THRESHOLD_MS = 2 * MPH_TO_MS    # below this = STANDSTILL mode
 
 
 # Module-level singleton so the CarState-side publisher (carstate_ext) can
@@ -288,6 +341,27 @@ class EVLimiter:
 
     # Debug state (for logging)
     self.state = STATE_DISABLED
+
+    # iter10 Layer 2: state machine dwell + hysteresis (drive #8 Event B fix).
+    # Tracks frame of last state transition + sustain counters for predicate
+    # debouncing. Resets to 0 when entering states / when predicate clears.
+    self._state_entered_frame = 0
+    self._softcap_enter_sustain = 0   # increments while (set_too_high or power_too_high)
+    self._softcap_exit_sustain = 0    # increments while NOT (set_too_high or power_too_high)
+    self._recovery_enter_sustain = 0  # increments while under_target
+    self._recovery_exit_sustain = 0   # increments while NOT under_target
+
+    # iter10 Layer 1: bounded reference governor state.
+    # Track gas-hold duration (catch-up arming), brake recency, SCC sustained
+    # decel (lead-following / commanded slowdown intent), and last cluster set
+    # we committed to (gas-catchup lower-bound anchor).
+    self._gas_hold_frames = 0
+    self._last_brake_frame = -10000
+    self._scc_decel_persistent_frames = 0
+    self._last_committed_observed_set = 0.0
+    # Diagnostic: count bound inversions detected in NORMAL/DECEL modes.
+    # MODE_GAS_CATCHUP is non-inverting by construction.
+    self._bound_inversion_count = 0
 
   # ----- Params helpers ---------------------------------------------------
 
@@ -486,6 +560,104 @@ class EVLimiter:
     self.last_set_frame = -10000
     self.last_res_frame = -10000
 
+  # ----- iter10 Layer 1: bounded reference governor -----------------------
+
+  def _has_decel_intent(self, frame: int) -> bool:
+    """Return True iff POSITIVE evidence of intentional decel.
+    Conservative: uncertain → False (caller defaults to MODE_NORMAL, which
+    enforces the no-cluster-below-vEgo invariant). v2 critique resolved.
+    Lead-radar TTC clause is plumbed via radar_decel_intent set by card.py
+    (defaults to None when unavailable on classic-CAN HYBRID).
+    """
+    if (frame - self._last_brake_frame) < BRAKE_RECENT_FRAMES:
+      return True
+    if self._scc_decel_persistent_frames >= SCC_DECEL_PERSIST_FRAMES:
+      return True
+    return False
+
+  def _select_governor_mode(self, frame: int, v_ego: float, gas_pressed: bool,
+                             brake_pressed: bool, in_standstill: bool,
+                             observed_set_speed: float) -> int:
+    """Select exclusive governor mode for this tick. Order matters:
+    standstill > brake > gas-catchup (if armed) > decel-intent > normal."""
+    if in_standstill or v_ego < STANDSTILL_V_THRESHOLD_MS:
+      return GOVERNOR_MODE_STANDSTILL
+    if brake_pressed:
+      return GOVERNOR_MODE_BRAKE
+    deficit_ms = self.user_target_speed - observed_set_speed
+    catchup_armed = (
+      gas_pressed
+      and self._gas_hold_frames >= GAS_HOLD_MIN_FRAMES
+      and deficit_ms > GAS_CATCHUP_MIN_DEFICIT_MPH * MPH_TO_MS
+    )
+    if catchup_armed:
+      return GOVERNOR_MODE_GAS_CATCHUP
+    if self._has_decel_intent(frame):
+      return GOVERNOR_MODE_DECEL
+    return GOVERNOR_MODE_NORMAL
+
+  def _compute_governor_bounds(self, mode: int, v_ego: float,
+                                observed_set_speed: float,
+                                dynamic_ceiling: float) -> tuple[float, float]:
+    """Compute (lower_bound, upper_bound) for cluster_set this tick.
+    Non-inverting by construction in MODE_GAS_CATCHUP. NORMAL/DECEL bounds
+    can theoretically invert if user_target < vEgo - max_deficit (rare); a
+    diagnostic counter tracks this for forensic review.
+
+    `dynamic_ceiling` = vEgo + sliding-cap margin. Used to detect the low-speed
+    regime where sliding cap legitimately wants cluster < (user_target -
+    max_deficit). In that regime, max-deficit floor is suppressed so the
+    sliding cap can operate.
+    """
+    upper_bound = self.user_target_speed
+    max_deficit_mph = self._read_int(MAX_DEFICIT_PARAM, int(MAX_DEFICIT_DEFAULT_MPH))
+    default_lower = max(USER_TARGET_MIN_MS, self.user_target_speed - max_deficit_mph * MPH_TO_MS)
+
+    if mode == GOVERNOR_MODE_NORMAL:
+      # Max-deficit floor only applies when sliding cap would otherwise allow
+      # cluster at user_target (i.e. dynamic_ceiling >= user_target). At low
+      # speed where sliding cap clamps below user_target, deep cuts are the
+      # sliding cap doing its job — let it through.
+      if dynamic_ceiling >= self.user_target_speed:
+        lower_bound = default_lower
+      else:
+        lower_bound = USER_TARGET_MIN_MS
+      # Invariant: never command cluster < vEgo - slop when user_target above ego.
+      # Prevents Event B (cluster<vEgo oscillation) regardless of mode.
+      if self.user_target_speed > v_ego + EGO_SLOP_MS:
+        lower_bound = max(lower_bound, v_ego - EGO_SLOP_MS)
+        # If user_target is between vEgo and (vEgo + EGO_SLOP_MS), allow upper
+        # to relax to avoid inversion.
+        if upper_bound < lower_bound:
+          upper_bound = lower_bound
+          self._bound_inversion_count += 1
+
+    elif mode == GOVERNOR_MODE_GAS_CATCHUP:
+      # v2 fix: non-inverting by construction.
+      default_upper = min(self.user_target_speed, v_ego + GAS_HEADROOM_MPH * MPH_TO_MS)
+      lower_bound = max(USER_TARGET_MIN_MS, observed_set_speed)
+      upper_bound = max(default_upper, observed_set_speed)
+      # If cluster < vEgo+headroom: upper=vEgo+2, lower=observed → catch-up via RES (Event A).
+      # If cluster > vEgo+headroom: upper=lower=observed → cluster holds (no RES, no SET).
+
+    elif mode == GOVERNOR_MODE_DECEL:
+      # SCC commanding decel — let cluster dip below vEgo for legitimate slowdown.
+      lower_bound = USER_TARGET_MIN_MS
+
+    elif mode == GOVERNOR_MODE_BRAKE:
+      lower_bound = USER_TARGET_MIN_MS
+
+    else:  # GOVERNOR_MODE_STANDSTILL
+      lower_bound = USER_TARGET_MIN_MS
+
+    if lower_bound > upper_bound:
+      # Defensive: should only happen in NORMAL with degenerate user_target/vEgo.
+      # Saturate to permissive bounds and log.
+      self._bound_inversion_count += 1
+      lower_bound = USER_TARGET_MIN_MS
+
+    return lower_bound, upper_bound
+
   # ----- Main update ------------------------------------------------------
 
   def update(self, CC, CS, frame: int) -> tuple[int, bool]:
@@ -664,6 +836,21 @@ class EVLimiter:
     set_cooldown_frames = SET_COOLDOWN_DECEL_FAST_FRAMES if decel_active else SET_COOLDOWN_FRAMES
     rate_limit = DECEL_FAST_RATE_LIMIT_PRESSES_PER_SEC if decel_active else GLOBAL_RATE_LIMIT_PRESSES_PER_SEC
 
+    # iter10 Layer 1: update governor state-tracking counters every tick.
+    if gas_pressed:
+      self._gas_hold_frames += 1
+    else:
+      self._gas_hold_frames = 0
+    if brake_pressed:
+      self._last_brake_frame = frame
+    # SCC decel detected via accelDemand (TCS13.aBasis aggregate). Available
+    # on CarState.accel_demand — extracted by carstate_ext upstream.
+    abasis_signal = float(getattr(CS, "accel_demand", 0.0))
+    if abasis_signal < SCC_DECEL_DETECT_MS2:
+      self._scc_decel_persistent_frames += 1
+    else:
+      self._scc_decel_persistent_frames = 0
+
     # Sliding cap (iter6 core). Cluster set is held within
     #   target_set = min(user_target, vEgo + dynamic_margin(vEgo))
     # Push DOWN when observed > target_set + deadband (sliding cap violation)
@@ -672,6 +859,17 @@ class EVLimiter:
     margin = self._dynamic_margin_ms(v_ego, est_power_w, power_threshold_w)
     dynamic_ceiling = v_ego + margin
     target_set = min(self.user_target_speed, dynamic_ceiling)
+
+    # iter10 Layer 1: clamp target_set to bounded-governor [lower, upper].
+    # Mode selection runs each tick; bounds enforce invariants that prevent
+    # Event A (dwell) and Event B (cluster < vEgo) by construction.
+    governor_mode = self._select_governor_mode(
+      frame, v_ego, gas_pressed, brake_pressed, in_standstill, observed_set_speed
+    )
+    lower_bound, upper_bound = self._compute_governor_bounds(
+      governor_mode, v_ego, observed_set_speed, dynamic_ceiling
+    )
+    target_set = max(lower_bound, min(upper_bound, target_set))
 
     set_too_high = observed_set_speed > target_set + SET_TRIGGER_DEADBAND_MS
     power_too_high = (
@@ -705,6 +903,10 @@ class EVLimiter:
     # cancelled by power_too_high (defense-in-depth: even if some other
     # gate cleared want_set, RES toward user_target is wrong when motor
     # is already at ICE-territory power).
+    # iter10 Layer 1: removed `not gas_pressed` from this chain. Gas behavior
+    # is now governed by mode selection + bound clamping (Event A fix). The
+    # MODE_GAS_CATCHUP upper-bound (vEgo + 2 mph) prevents over-recovery while
+    # gas is held — RES will track vEgo upward but won't overshoot.
     standstill_clear = (frame - self._left_standstill_at_frame) >= RECOVERY_AFTER_STANDSTILL_FRAMES
     want_res = (
       under_target
@@ -712,11 +914,18 @@ class EVLimiter:
       and not power_too_high
       and not in_override_set
       and not self_set_recent
-      and not gas_pressed
       and not brake_pressed
       and v_ego > RECOVERY_V_EGO_FLOOR_MS
       and standstill_clear
     )
+
+    # iter10 Layer 1: gas-time RES rate cap. While gas held, throttle RES
+    # cadence to one press per 1.5 s (vs 6/s normal global limit) so cluster
+    # ratchets slowly behind vEgo, not in lockstep. Prevents over-recovery /
+    # cluster jumping ahead.
+    if want_res and gas_pressed:
+      if (frame - self.last_res_frame) < GAS_RES_INTERVAL_FRAMES:
+        want_res = False
 
     button = Buttons.NONE
     if want_set and (frame - self.last_set_frame) >= set_cooldown_frames:
@@ -729,25 +938,96 @@ class EVLimiter:
     if button != Buttons.NONE:
       self._record_tx(frame, button)
 
-    # Derive HUD/log state from RECENT activity (not just this frame's button)
-    # so display doesn't flicker between IDLE and active on non-press frames.
-    # SOFT_CAP_ACTIVE has higher priority than override windows because it
-    # reflects active control intent — the limiter IS pushing down, regardless
-    # of whether driver pressed RES recently.
-    limiting_active = want_set or (frame - self.last_set_frame) < LIMITING_LATCH_FRAMES
-    recovering_active = want_res or (frame - self.last_res_frame) < RECOVERING_LATCH_FRAMES
-    if limiting_active:
-      state = STATE_SOFT_CAP_ACTIVE
-    elif in_override_set:
-      state = STATE_DRIVER_OVERRIDE_SET
-    elif recovering_active:
-      state = STATE_RECOVERY_ACTIVE
-    elif in_override_res:
-      state = STATE_DRIVER_OVERRIDE_RES
+    # iter10 Layer 2: dwell + hysteresis state derivation.
+    # Update sustain counters every frame.
+    softcap_pred = set_too_high or power_too_high
+    recovery_pred = under_target and not softcap_pred
+    if softcap_pred:
+      self._softcap_enter_sustain += 1
+      self._softcap_exit_sustain = 0
     else:
-      state = STATE_IDLE
+      self._softcap_enter_sustain = 0
+      self._softcap_exit_sustain += 1
+    if recovery_pred:
+      self._recovery_enter_sustain += 1
+      self._recovery_exit_sustain = 0
+    else:
+      self._recovery_enter_sustain = 0
+      self._recovery_exit_sustain += 1
 
-    return self._publish(button, state, observed_set_speed)
+    cur_state = self.state
+    time_in_state = frame - self._state_entered_frame
+    new_state = cur_state  # default: hold
+
+    # Driver-priority states bypass dwell/sustain entirely (immediate).
+    # IDLE → active uses sustain only (no min-dwell delay on entry).
+    # active → IDLE/active needs (min-dwell) AND (exit sustain).
+    # If we reach this block coming from DISABLED/STANDSTILL_HOLD/BUS_FAULT,
+    # we just left those (engage / left-standstill / bus-recovery) — treat
+    # like IDLE-entry for state derivation purposes.
+    if cur_state in (STATE_DISABLED, STATE_STANDSTILL_HOLD, STATE_BUS_FAULT_HOLD):
+      cur_state = STATE_IDLE
+
+    if cur_state == STATE_IDLE:
+      # Power-too-high bypasses entry sustain — preserves iter9 fast-protect.
+      if want_set or (frame - self.last_set_frame) < LIMITING_LATCH_FRAMES:
+        new_state = STATE_SOFT_CAP_ACTIVE
+      elif power_too_high:
+        new_state = STATE_SOFT_CAP_ACTIVE
+      elif self._softcap_enter_sustain >= SOFT_CAP_ENTER_SUSTAIN_FRAMES:
+        new_state = STATE_SOFT_CAP_ACTIVE
+      elif want_res or (frame - self.last_res_frame) < RECOVERING_LATCH_FRAMES:
+        new_state = STATE_RECOVERY_ACTIVE
+      elif self._recovery_enter_sustain >= RECOVERY_ENTER_SUSTAIN_FRAMES:
+        new_state = STATE_RECOVERY_ACTIVE
+      elif in_override_set:
+        new_state = STATE_DRIVER_OVERRIDE_SET
+      elif in_override_res:
+        new_state = STATE_DRIVER_OVERRIDE_RES
+
+    elif cur_state == STATE_SOFT_CAP_ACTIVE:
+      # Driver/override states: immediate (priority).
+      if in_override_set:
+        new_state = STATE_DRIVER_OVERRIDE_SET
+      # Min-dwell + exit-sustain required to leave SOFT_CAP.
+      elif (time_in_state >= MIN_ACTIVE_STATE_DWELL_FRAMES
+            and self._softcap_exit_sustain >= SOFT_CAP_EXIT_SUSTAIN_FRAMES):
+        # Exit allowed: prefer RECOVERY if predicate sustained, else IDLE.
+        if self._recovery_enter_sustain >= RECOVERY_ENTER_SUSTAIN_FRAMES:
+          new_state = STATE_RECOVERY_ACTIVE
+        else:
+          new_state = STATE_IDLE
+
+    elif cur_state == STATE_RECOVERY_ACTIVE:
+      # Driver SET (immediate) or sustained SOFT_CAP predicate trumps recovery.
+      if in_override_set:
+        new_state = STATE_DRIVER_OVERRIDE_SET
+      elif power_too_high:
+        # Immediate SOFT_CAP entry on power excess (preserves fast-protect).
+        new_state = STATE_SOFT_CAP_ACTIVE
+      elif (time_in_state >= MIN_ACTIVE_STATE_DWELL_FRAMES
+            and self._recovery_exit_sustain >= RECOVERY_EXIT_SUSTAIN_FRAMES):
+        if self._softcap_enter_sustain >= SOFT_CAP_ENTER_SUSTAIN_FRAMES:
+          new_state = STATE_SOFT_CAP_ACTIVE
+        else:
+          new_state = STATE_IDLE
+
+    elif cur_state == STATE_DRIVER_OVERRIDE_SET:
+      # Override windows are external-driven; let existing latch decide.
+      if not in_override_set:
+        new_state = STATE_IDLE
+
+    elif cur_state == STATE_DRIVER_OVERRIDE_RES:
+      if not in_override_res:
+        new_state = STATE_IDLE
+
+    # else (STANDSTILL_HOLD, DISABLED, BUS_FAULT_HOLD): handled before this
+    # block returns from earlier branches in update().
+
+    if new_state != cur_state:
+      self._state_entered_frame = frame
+
+    return self._publish(button, new_state, observed_set_speed)
 
   # ----- Publish ----------------------------------------------------------
 

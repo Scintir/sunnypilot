@@ -70,7 +70,13 @@ class Car:
 
   def __init__(self, CI=None, RI=None) -> None:
     self.can_sock = messaging.sub_sock('can', timeout=20)
-    self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents'] + ['carControlSP', 'longitudinalPlanSP'])
+    # iter10 Layer 3a: subscribe to liveLocationKalman for fused pitch (grade
+    # source). EV power limiter (Hyundai HYBRID) reads
+    # calibratedOrientationNED.value[1] from carstate_ext to override the
+    # noisy ESP12.LONG_ACCEL - aEgo derivation.
+    self.sm = messaging.SubMaster(
+      ['pandaStates', 'carControl', 'onroadEvents',
+       'carControlSP', 'longitudinalPlanSP', 'liveLocationKalman'])
     self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'liveTracks'] + ['carParamsSP', 'carStateSP'])
 
     self.can_rcv_cum_timeout_counter = 0
@@ -193,6 +199,29 @@ class Car:
 
     can_strs = messaging.drain_sock_raw(self.can_sock, wait_for_one=True)
     can_list = can_capnp_to_list(can_strs)
+
+    # iter10 Layer 3a: feed kalman pitch into CarState for ev_limiter grade
+    # estimation. Set BEFORE CI.update() so carstate_ext sees it during this
+    # tick. None = use legacy LONG_ACCEL-aEgo fallback in carstate_ext.
+    # Carstate_ext is HYBRID-only and reads via getattr — safe to set on any
+    # CarState even when ev_limiter isn't running.
+    grade_accel_external = None
+    if self.sm.valid['liveLocationKalman'] and self.sm.alive['liveLocationKalman']:
+      llk = self.sm['liveLocationKalman']
+      cal_ned = llk.calibratedOrientationNED
+      # Status enum: valid == 2 (uninitialized=0, uncalibrated=1, valid=2)
+      if (llk.status == 2
+          and cal_ned.valid
+          and llk.inputsOK
+          and llk.sensorsOK
+          and len(cal_ned.value) >= 2):
+        import math
+        pitch_rad = float(cal_ned.value[1])  # NED euler [roll, pitch, yaw]
+        # NED: nose-up positive pitch → uphill grade. g·sin(pitch).
+        # Sanity: clamp to ±45° (vehicle body pitch beyond this is sensor fault).
+        if -math.pi/4 < pitch_rad < math.pi/4:
+          grade_accel_external = 9.81 * math.sin(pitch_rad)
+    self.CI.CS.grade_accel_external_ms2 = grade_accel_external
 
     # Update carState from CAN
     CS, CS_SP = self.CI.update(can_list)

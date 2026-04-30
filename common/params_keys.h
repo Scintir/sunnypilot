@@ -265,6 +265,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"EVLimiterPowerThresholdKW", {PERSISTENT, INT, "40"}},
     {"EVLimiterDTEFloor", {PERSISTENT, INT, "5"}},
     {"EVLimiterMaxGapMph", {PERSISTENT, INT, "5"}},
+    {"EvLimiterMaxDeficitMph", {PERSISTENT, INT, "7"}},   // iter10 Layer 1: bounded governor max-deficit floor
 
     // Calibration box-check bypass + reset signaling (re-applied from older branch).
     // CalibrationBoxCheckDisabled: when true, is_calibration_valid() returns True

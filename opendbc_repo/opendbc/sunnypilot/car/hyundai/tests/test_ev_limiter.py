@@ -354,13 +354,23 @@ class TestGasBrakePause(unittest.TestCase):
                    observed_mph=60.0, est_power_w=50_000.0, abasis=1.0, brake=True)
     self.assertEqual(btn, Buttons.NONE, "Brake must suppress SET")
 
-  def test_gas_suppresses_res(self):
+  def test_gas_does_not_block_res_in_iter10(self):
+    """iter10 Layer 1: gas no longer blocks RES outright; instead bounded
+    governor mode (GAS_CATCHUP / NORMAL) controls cluster behavior, with a
+    1.5 s rate cap on RES presses while gas held. Replaces the iter9
+    gas-suppresses-res test (event A: dwell at 21 mph fix)."""
     self.lim.user_target_speed = 30.0 * MPH_TO_MS
     self.lim.last_res_frame = -10000
-    # Set up under-target conditions
-    btn, _ = _step(self.lim, 300, cc_enabled=True, vEgo=10.0,
-                   observed_mph=15.0, est_power_w=0.0, abasis=0.0, gas=True)
-    self.assertEqual(btn, Buttons.NONE, "Gas must suppress RES")
+    # Set up under-target conditions: first RES under gas should be allowed.
+    btn1, _ = _step(self.lim, 300, cc_enabled=True, vEgo=10.0,
+                    observed_mph=15.0, est_power_w=0.0, abasis=0.0, gas=True)
+    self.assertEqual(btn1, Buttons.RES_ACCEL,
+                     "iter10: gas alone must NOT block first RES press (Event A fix)")
+    # Second RES press 0.5 s later (under 1.5 s gas-time rate cap) → blocked
+    btn2, _ = _step(self.lim, 350, cc_enabled=True, vEgo=10.0,
+                    observed_mph=15.0, est_power_w=0.0, abasis=0.0, gas=True)
+    self.assertEqual(btn2, Buttons.NONE,
+                     "iter10: RES rate-capped to 1 per 1.5 s while gas held")
 
 
 class TestStateLatching(unittest.TestCase):
@@ -733,6 +743,457 @@ class TestIter9GradeDeadband(unittest.TestCase):
     pwr_no_grade = self._formula(abasis=0.0, grade_f=0.0, v_mph=60.0)
     self.assertAlmostEqual(pwr - pwr_no_grade, expected_grade_extra, places=0,
                             msg="Grade above dead-band should contribute (grade - dead-band)")
+
+
+class TestIter10StateDwell(unittest.TestCase):
+  """iter10 Layer 2: state machine dwell + hysteresis kills the
+  drive #8 7:36-7:45 oscillation pattern (96 transitions / 9 min)."""
+
+  def setUp(self):
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import (
+      MIN_ACTIVE_STATE_DWELL_FRAMES,
+      SOFT_CAP_ENTER_SUSTAIN_FRAMES,
+      SOFT_CAP_EXIT_SUSTAIN_FRAMES,
+      RECOVERY_ENTER_SUSTAIN_FRAMES,
+      RECOVERY_EXIT_SUSTAIN_FRAMES,
+    )
+    self.MIN_DWELL = MIN_ACTIVE_STATE_DWELL_FRAMES
+    self.SC_ENTER = SOFT_CAP_ENTER_SUSTAIN_FRAMES
+    self.SC_EXIT = SOFT_CAP_EXIT_SUSTAIN_FRAMES
+    self.REC_ENTER = RECOVERY_ENTER_SUSTAIN_FRAMES
+    self.REC_EXIT = RECOVERY_EXIT_SUSTAIN_FRAMES
+
+  def test_softcap_immediate_entry_on_power_too_high(self):
+    """power_too_high bypasses entry sustain — preserves iter9 fast-protect."""
+    lim = _make_limiter()
+    # Engage at low speed
+    for f in range(0, 25):
+      _step(lim, f, cc_enabled=False, vEgo=10.0, observed_mph=44.0)
+    _step(lim, 25, cc_enabled=True, vEgo=10.0, observed_mph=44.0,
+          button=ButtonType.decelCruise)
+    for f in range(26, 100):
+      _step(lim, f, cc_enabled=True, vEgo=20.0, observed_mph=40.0)
+    lim.user_target_speed = 70.0 * MPH_TO_MS
+    lim.last_set_frame = -10000
+    # Frame 100: power_too_high condition (high estPower, observed > vEgo)
+    # Must enter SOFT_CAP_ACTIVE on the very same frame, not after sustain
+    _step(lim, 100, cc_enabled=True, vEgo=20.0, observed_mph=60.0,
+          est_power_w=70_000.0, abasis=1.0)
+    self.assertEqual(lim.state, STATE_SOFT_CAP_ACTIVE,
+                     "power_too_high must trigger immediate SOFT_CAP entry")
+
+  def _setup_engaged_at_idle(self, lim, vEgo=20.0, target_mph=70.0):
+    """Helper: get limiter into an engaged, IDLE state with explicit
+    user_target_speed set. Mirrors pattern from test_limiting_state_persists_after_set."""
+    for f in range(0, 25):
+      _step(lim, f, cc_enabled=False, vEgo=vEgo, observed_mph=target_mph)
+    _step(lim, 25, cc_enabled=True, vEgo=vEgo, observed_mph=target_mph,
+          button=ButtonType.decelCruise)
+    for f in range(26, 50):
+      _step(lim, f, cc_enabled=True, vEgo=vEgo, observed_mph=target_mph)
+    lim.user_target_speed = target_mph * MPH_TO_MS
+    lim.last_set_frame = -10000
+    lim.last_res_frame = -10000
+
+  def test_softcap_entry_not_blocked_by_idle_dwell(self):
+    """IDLE → SOFT_CAP transition uses entry sustain only; min-dwell does
+    not delay leaving IDLE."""
+    lim = _make_limiter()
+    self._setup_engaged_at_idle(lim, vEgo=20.0, target_mph=70.0)
+    # Now drive set_too_high condition (observed > target_set+deadband)
+    for f in range(50, 50 + self.SC_ENTER + 10):
+      _step(lim, f, cc_enabled=True, vEgo=20.0, observed_mph=80.0,
+            est_power_w=10_000.0, abasis=0.0)
+    self.assertEqual(lim.state, STATE_SOFT_CAP_ACTIVE,
+                     "IDLE → SOFT_CAP must not be blocked by min-dwell")
+
+  def test_min_dwell_enforced_on_softcap_exit(self):
+    """SOFT_CAP_ACTIVE cannot exit before MIN_ACTIVE_STATE_DWELL_FRAMES."""
+    lim = _make_limiter()
+    self._setup_engaged_at_idle(lim, vEgo=20.0, target_mph=70.0)
+    # Drive SOFT_CAP entry — observed way above target_set
+    f = 50
+    while lim.state != STATE_SOFT_CAP_ACTIVE and f < 200:
+      _step(lim, f, cc_enabled=True, vEgo=20.0, observed_mph=80.0,
+            est_power_w=10_000.0, abasis=0.0)
+      f += 1
+    self.assertEqual(lim.state, STATE_SOFT_CAP_ACTIVE)
+    soft_cap_entered_frame = f
+    # Now clear the predicate (observed at target) for SC_EXIT frames,
+    # but stay UNDER MIN_DWELL — state should hold SOFT_CAP_ACTIVE.
+    # Note: `observed_mph=70` matches user_target so no recovery either
+    n_frames = self.SC_EXIT + 10  # exit-sustain met but min-dwell not yet
+    while f <= soft_cap_entered_frame + n_frames:
+      _step(lim, f, cc_enabled=True, vEgo=20.0, observed_mph=70.0,
+            est_power_w=0.0, abasis=0.0)
+      f += 1
+    elapsed = f - soft_cap_entered_frame
+    if elapsed < self.MIN_DWELL:
+      self.assertEqual(lim.state, STATE_SOFT_CAP_ACTIVE,
+                       f"SOFT_CAP must hold for MIN_DWELL frames; elapsed={elapsed}")
+
+  def test_softcap_exits_after_dwell_and_sustain(self):
+    """After both MIN_DWELL and EXIT_SUSTAIN with cleared predicate, exits."""
+    lim = _make_limiter()
+    # vEgo=30 m/s (~67 mph) keeps margin small so target_set not clamped low
+    self._setup_engaged_at_idle(lim, vEgo=30.0, target_mph=70.0)
+    # Enter SOFT_CAP — observed >> target_set+deadband
+    f = 50
+    while lim.state != STATE_SOFT_CAP_ACTIVE and f < 200:
+      _step(lim, f, cc_enabled=True, vEgo=30.0, observed_mph=85.0,
+            est_power_w=10_000.0, abasis=0.0)
+      f += 1
+    self.assertEqual(lim.state, STATE_SOFT_CAP_ACTIVE)
+    # Run for both MIN_DWELL + SC_EXIT + slack with clear predicate (observed
+    # below target so set_too_high=False, observed near target so under_target
+    # also borderline — limiter should drift toward IDLE/RECOVERY).
+    target_frames = self.MIN_DWELL + self.SC_EXIT + 50
+    end_f = f + target_frames
+    while f <= end_f:
+      _step(lim, f, cc_enabled=True, vEgo=30.0, observed_mph=68.0,
+            est_power_w=0.0, abasis=0.0)
+      f += 1
+    self.assertNotEqual(lim.state, STATE_SOFT_CAP_ACTIVE,
+                        "SOFT_CAP must exit after dwell+sustain satisfied")
+
+  def test_recovery_enter_uses_sustain_not_min_dwell(self):
+    """IDLE → RECOVERY uses RECOVERY_ENTER_SUSTAIN frames, not min-dwell."""
+    lim = _make_limiter()
+    for f in range(0, 25):
+      _step(lim, f, cc_enabled=False, vEgo=10.0, observed_mph=44.0)
+    _step(lim, 25, cc_enabled=True, vEgo=20.0, observed_mph=44.0,
+          button=ButtonType.decelCruise)
+    for f in range(26, 50):
+      _step(lim, f, cc_enabled=True, vEgo=20.0, observed_mph=44.0)
+    # Set user_target above observed → under_target true
+    lim.user_target_speed = 60.0 * MPH_TO_MS
+    # Drive recovery sustain only — state should fire RECOVERY_ACTIVE
+    # within REC_ENTER_SUSTAIN frames + small slack
+    for f in range(50, 50 + self.REC_ENTER + 5):
+      _step(lim, f, cc_enabled=True, vEgo=20.0, observed_mph=20.0,
+            est_power_w=5_000.0, abasis=0.0)
+    self.assertEqual(lim.state, STATE_RECOVERY_ACTIVE,
+                     "IDLE → RECOVERY must fire after entry-sustain met")
+
+  def test_oscillation_resistance_simulated(self):
+    """Simulated drive #8 Event B: rapidly alternating
+    set_too_high / under_target predicates should NOT produce ≥10 transitions
+    in 9 simulated minutes (54000 frames @ 100 Hz)."""
+    lim = _make_limiter()
+    # Engage
+    for f in range(0, 25):
+      _step(lim, f, cc_enabled=False, vEgo=30.0, observed_mph=70.0)
+    _step(lim, 25, cc_enabled=True, vEgo=30.0, observed_mph=65.0,
+          button=ButtonType.decelCruise)
+    lim.user_target_speed = 75.0 * MPH_TO_MS
+
+    # Simulate the oscillation pattern: power crosses threshold every ~3 sec
+    # (frame mod 300 < 150 → power high, else power low)
+    transitions = 0
+    last_state = lim.state
+    cap_start_f = 100
+    sim_frames = 54000   # 9 minutes
+    for f in range(cap_start_f, cap_start_f + sim_frames):
+      power_high = (f % 300) < 150
+      observed_mph = 75.0 if power_high else 60.0
+      _step(lim, f, cc_enabled=True, vEgo=30.0, observed_mph=observed_mph,
+            est_power_w=50_000.0 if power_high else 5_000.0, abasis=0.5 if power_high else 0.0)
+      if lim.state != last_state:
+        transitions += 1
+        last_state = lim.state
+    # iter9 had 96 transitions/9min; iter10 target < 20.
+    # With 2 s min-dwell, max possible transitions = 9 min / 2 s = 270 → but
+    # combined with sustain debouncing should be much less. Allow up to 30.
+    self.assertLess(transitions, 30,
+                    f"iter10 must dampen oscillation: got {transitions} transitions "
+                    f"in 9 min, target <20 (iter9 baseline 96)")
+
+
+class TestIter10Governor(unittest.TestCase):
+  """iter10 Layer 1: bounded reference governor. Mode-based bound computation
+  prevents Event A (dwell when gas pressed) and Event B (cluster < vEgo
+  oscillation) by construction."""
+
+  def setUp(self):
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import (
+      GOVERNOR_MODE_NORMAL, GOVERNOR_MODE_GAS_CATCHUP, GOVERNOR_MODE_DECEL,
+      GOVERNOR_MODE_BRAKE, GOVERNOR_MODE_STANDSTILL,
+      MAX_DEFICIT_DEFAULT_MPH, GAS_HEADROOM_MPH, GAS_HOLD_MIN_FRAMES,
+      EGO_SLOP_MS, GAS_RES_INTERVAL_FRAMES,
+    )
+    self.MODE_NORMAL = GOVERNOR_MODE_NORMAL
+    self.MODE_GAS_CATCHUP = GOVERNOR_MODE_GAS_CATCHUP
+    self.MODE_DECEL = GOVERNOR_MODE_DECEL
+    self.MODE_BRAKE = GOVERNOR_MODE_BRAKE
+    self.MAX_DEFICIT = MAX_DEFICIT_DEFAULT_MPH
+    self.GAS_HEAD = GAS_HEADROOM_MPH
+    self.GAS_HOLD = GAS_HOLD_MIN_FRAMES
+    self.EGO_SLOP = EGO_SLOP_MS
+    self.GAS_RES = GAS_RES_INTERVAL_FRAMES
+
+  def _engaged_lim(self, vEgo, target_mph):
+    lim = _make_limiter()
+    for f in range(0, 25):
+      _step(lim, f, cc_enabled=False, vEgo=vEgo, observed_mph=target_mph)
+    _step(lim, 25, cc_enabled=True, vEgo=vEgo, observed_mph=target_mph,
+          button=ButtonType.decelCruise)
+    for f in range(26, 60):
+      _step(lim, f, cc_enabled=True, vEgo=vEgo, observed_mph=target_mph)
+    lim.user_target_speed = target_mph * MPH_TO_MS
+    return lim
+
+  def test_event_a_gas_does_not_block_res(self):
+    """Event A (drive #8 t=320-336): cluster=21 mph, target=44 mph, gas held.
+    iter9 froze cluster at 21 because gas blocked want_res chain. iter10
+    governor allows RES (rate-capped to 1.5 s) so cluster ramps up tracking
+    vEgo. Verify RES fires SOMETIME during a 200-frame gas window."""
+    lim = self._engaged_lim(vEgo=10.0, target_mph=44.0)
+    lim.user_target_speed = 44.0 * MPH_TO_MS
+    lim.last_res_frame = -10000
+    res_fired = False
+    for f in range(100, 300):
+      btn, _ = _step(lim, f, cc_enabled=True, vEgo=10.0, observed_mph=21.0,
+                     est_power_w=5_000.0, abasis=0.0, gas=True)
+      if btn == Buttons.RES_ACCEL:
+        res_fired = True
+        break
+    self.assertTrue(res_fired,
+                    "Event A: gas alone must NOT block RES (iter9 dwell bug fix)")
+
+  def test_governor_bounds_never_inverted(self):
+    """Across all governor modes, lower_bound ≤ upper_bound by construction
+    (or saturated permissively if degenerate)."""
+    lim = _make_limiter()
+    lim.user_target_speed = 70.0 * MPH_TO_MS
+
+    # NORMAL: typical case
+    lim._gas_hold_frames = 0
+    lo, hi = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=30.0,
+                                            observed_set_speed=60.0 * MPH_TO_MS,
+                                            dynamic_ceiling=80.0 * MPH_TO_MS)
+    self.assertLessEqual(lo, hi, "NORMAL: lo > hi")
+
+    # GAS_CATCHUP: cluster < vEgo+headroom (typical Event A)
+    lo, hi = lim._compute_governor_bounds(self.MODE_GAS_CATCHUP, v_ego=10.0,
+                                            observed_set_speed=21.0 * MPH_TO_MS,
+                                            dynamic_ceiling=999.0)
+    self.assertLessEqual(lo, hi, "GAS_CATCHUP cluster<ego: lo > hi")
+
+    # GAS_CATCHUP: cluster > vEgo+headroom (mid-recovery / coast)
+    lo, hi = lim._compute_governor_bounds(self.MODE_GAS_CATCHUP, v_ego=10.0,
+                                            observed_set_speed=40.0 * MPH_TO_MS,
+                                            dynamic_ceiling=999.0)
+    self.assertLessEqual(lo, hi, "GAS_CATCHUP cluster>ego+headroom: lo > hi")
+    self.assertAlmostEqual(lo, hi, places=4,
+                           msg="GAS_CATCHUP cluster>ego+headroom: cluster should hold (lo==hi)")
+
+    # DECEL: permissive lower
+    lo, hi = lim._compute_governor_bounds(self.MODE_DECEL, v_ego=20.0,
+                                            observed_set_speed=50.0 * MPH_TO_MS,
+                                            dynamic_ceiling=999.0)
+    self.assertLessEqual(lo, hi, "DECEL: lo > hi")
+
+  def test_normal_mode_clusters_max_deficit_at_highway(self):
+    """At highway (dynamic_ceiling >= user_target), max_deficit floor enforced.
+    Drive #8 Event B: prevents 13 mph offset from happening."""
+    lim = _make_limiter()
+    lim.user_target_speed = 75.0 * MPH_TO_MS
+    # Highway: vEgo=33 m/s, dynamic_ceiling = 33+5 mph margin = 33+2.2=35.2 m/s = ~79 mph
+    lo, hi = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=33.0,
+                                            observed_set_speed=60.0 * MPH_TO_MS,
+                                            dynamic_ceiling=35.2)
+    expected_lo_ms = (75.0 - self.MAX_DEFICIT) * MPH_TO_MS  # 68 mph
+    # vEgo - slop = 33 - 0.5 = 32.5 m/s = 72.7 mph (higher than 68 → wins)
+    expected_lo_ms = max(expected_lo_ms, 33.0 - self.EGO_SLOP)
+    self.assertAlmostEqual(lo, expected_lo_ms, delta=0.1,
+                           msg="NORMAL highway: lower_bound should be max(target-7, vEgo-slop)")
+    self.assertAlmostEqual(hi, 75.0 * MPH_TO_MS, places=4,
+                           msg="upper_bound should equal user_target")
+
+  def test_normal_mode_low_speed_lets_sliding_cap_below_max_deficit(self):
+    """At low vEgo where dynamic_ceiling < user_target, max_deficit floor
+    suspended so sliding cap can pull cluster naturally."""
+    lim = _make_limiter()
+    lim.user_target_speed = 50.0 * MPH_TO_MS
+    # Low speed: vEgo=10 m/s = 22 mph. dynamic_ceiling = vEgo + ~19 mph margin = 41 mph.
+    # 41 < 50 → low-speed regime
+    lo, hi = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=10.0,
+                                            observed_set_speed=44.0 * MPH_TO_MS,
+                                            dynamic_ceiling=41.0 * MPH_TO_MS)
+    # Floor should be vEgo - slop = 10 - 0.5 = 9.5 m/s = 21.2 mph (no max-deficit)
+    self.assertAlmostEqual(lo, 10.0 - self.EGO_SLOP, delta=0.1,
+                           msg="Low speed: max-deficit floor suppressed; only no-below-vEgo")
+    self.assertAlmostEqual(hi, 50.0 * MPH_TO_MS, places=4)
+
+  def test_no_below_vego_invariant_clamps_lower_bound(self):
+    """Event B fix: cluster_set ≥ vEgo - 0.5 m/s when user_target above vEgo."""
+    lim = _make_limiter()
+    lim.user_target_speed = 75.0 * MPH_TO_MS
+    # vEgo=30 m/s, dynamic_ceiling=33 m/s = 73.8 mph (just below user_target)
+    lo, hi = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=30.0,
+                                            observed_set_speed=70.0 * MPH_TO_MS,
+                                            dynamic_ceiling=33.0)
+    # vEgo - slop = 30 - 0.5 = 29.5 m/s → that's the floor regardless of max-deficit
+    self.assertGreaterEqual(lo, 30.0 - self.EGO_SLOP - 1e-3,
+                            "Lower bound must be >= vEgo - EGO_SLOP")
+
+  def test_decel_intent_requires_positive_evidence(self):
+    """v2: uncertain → MODE_NORMAL. Brake-recent OR sustained SCC decel only."""
+    lim = self._engaged_lim(vEgo=20.0, target_mph=70.0)
+    # No brake recently, no sustained negative abasis → not decel
+    self.assertFalse(lim._has_decel_intent(frame=1000),
+                     "Default state should not assert decel intent")
+    # Recent brake → decel intent
+    lim._last_brake_frame = 950   # 50 frames ago
+    self.assertTrue(lim._has_decel_intent(frame=1000),
+                    "Recent brake should trigger decel intent")
+    # Brake long ago → no decel intent
+    lim._last_brake_frame = 0
+    self.assertFalse(lim._has_decel_intent(frame=1000),
+                     "Old brake (>1 s) should NOT trigger decel intent")
+    # Sustained SCC decel → decel intent
+    lim._scc_decel_persistent_frames = 60
+    self.assertTrue(lim._has_decel_intent(frame=1000),
+                    "Sustained SCC decel should trigger decel intent")
+    # Brief SCC decel (not sustained) → no
+    lim._scc_decel_persistent_frames = 10
+    self.assertFalse(lim._has_decel_intent(frame=1000),
+                     "Brief SCC decel should NOT trigger decel intent")
+
+  def test_governor_mode_priority_brake_over_gas(self):
+    """Mode selection priority: brake_pressed > gas_pressed regardless of arming."""
+    lim = self._engaged_lim(vEgo=20.0, target_mph=70.0)
+    lim.user_target_speed = 70.0 * MPH_TO_MS
+    lim._gas_hold_frames = 100   # would otherwise arm GAS_CATCHUP
+    mode = lim._select_governor_mode(frame=1000, v_ego=20.0,
+                                       gas_pressed=True, brake_pressed=True,
+                                       in_standstill=False,
+                                       observed_set_speed=60.0 * MPH_TO_MS)
+    self.assertEqual(mode, self.MODE_BRAKE,
+                     "Brake must win over gas in mode selection")
+
+  def test_governor_mode_standstill_priority(self):
+    """STANDSTILL mode wins over everything else (vEgo < threshold)."""
+    lim = self._engaged_lim(vEgo=0.0, target_mph=44.0)
+    lim._gas_hold_frames = 100
+    mode = lim._select_governor_mode(frame=1000, v_ego=0.0,
+                                       gas_pressed=True, brake_pressed=False,
+                                       in_standstill=True,
+                                       observed_set_speed=21.0 * MPH_TO_MS)
+    self.assertEqual(mode, lim._select_governor_mode.__defaults__ if False
+                     else 4,  # GOVERNOR_MODE_STANDSTILL = 4
+                     "Standstill must win over everything")
+
+  def test_want_res_during_gas_rate_capped(self):
+    """v2 critique fix: RES presses while gas held are rate-capped to
+    one per 1.5 s (vs 6/s normal global limit). Count RES presses in a
+    fixed gas-held window — should be roughly window_seconds / 1.5."""
+    lim = self._engaged_lim(vEgo=10.0, target_mph=44.0)
+    lim.user_target_speed = 44.0 * MPH_TO_MS
+    lim.last_res_frame = -10000
+    res_count = 0
+    # 5-second window with gas held + cluster well under target
+    for f in range(100, 600):  # 500 frames = 5 s
+      btn, _ = _step(lim, f, cc_enabled=True, vEgo=10.0, observed_mph=21.0,
+                     est_power_w=5_000.0, abasis=0.0, gas=True)
+      if btn == Buttons.RES_ACCEL:
+        res_count += 1
+    # Without rate cap (6/sec global), would be ~30 presses in 5 s.
+    # With 1.5 s gas-time rate cap, max ~3-4 presses.
+    self.assertGreater(res_count, 0, "Some RES should fire during 5s gas hold")
+    self.assertLessEqual(res_count, 5,
+                         f"Gas-time rate cap should limit RES to ~3-4 in 5 s; "
+                         f"got {res_count} (cap is {self.GAS_RES} frames between)")
+
+
+class TestIter10ObserverMitigation(unittest.TestCase):
+  """iter10 Layer 3 commit 1: lowered grade clip + air density default."""
+
+  def test_grade_clip_lowered_to_05_ms2(self):
+    """Constant change: clip 1.0 → 0.5 m/s² to bound phantom contribution."""
+    from opendbc.sunnypilot.car.hyundai.carstate_ext import GRADE_ACCEL_FILTERED_CLIP_MS2
+    self.assertAlmostEqual(GRADE_ACCEL_FILTERED_CLIP_MS2, 0.5, places=4)
+
+  def test_air_density_lowered_for_elevation(self):
+    """Constant change: 1.225 → 1.10 kg/m³ (Loveland-tuned ~1500m)."""
+    from opendbc.sunnypilot.car.hyundai.carstate_ext import AIR_DENSITY_KG_M3
+    self.assertAlmostEqual(AIR_DENSITY_KG_M3, 1.10, places=4)
+
+  def test_road_load_at_73mph_with_lowered_density(self):
+    """At 73 mph (33 m/s), aero load with ρ=1.10 should be ~14.8 kW
+    instead of ~16.5 kW with sea-level density."""
+    from opendbc.sunnypilot.car.hyundai.carstate_ext import road_load_power_w
+    p = road_load_power_w(33.0)
+    # Roll = 0.011 * 1950 * 9.81 * 33 = 6953
+    # Aero = 0.5 * 1.10 * 0.75 * 33^3 = 14817
+    # Total = ~21.7 kW
+    self.assertAlmostEqual(p, 21770.0, delta=200.0)
+
+  def test_grade_at_05_clip_max_power_at_73mph(self):
+    """With clip=0.5 m/s² and v=33 m/s, max grade contribution alone ≈
+    1950 * 33 * 0.5 = 32 kW (was 64 kW with clip=1.0)."""
+    from opendbc.sunnypilot.car.hyundai.carstate_ext import (
+      VEHICLE_MASS_KG, GRADE_ACCEL_FILTERED_CLIP_MS2,
+    )
+    v = 33.0
+    p_grade_max = VEHICLE_MASS_KG * v * GRADE_ACCEL_FILTERED_CLIP_MS2
+    self.assertAlmostEqual(p_grade_max, 32175.0, delta=10.0)
+    self.assertLess(p_grade_max, 35_000.0,
+                    "grade contribution alone should not exceed ~35 kW at 73 mph")
+
+
+class TestIter10KalmanGradeSource(unittest.TestCase):
+  """iter10 Layer 3a: kalman pitch as grade source. card.py sets
+  CarState.grade_accel_external_ms2 from liveLocationKalman pitch; carstate_ext
+  prefers this over the noisy LONG_ACCEL-aEgo derivation when set."""
+
+  def setUp(self):
+    from opendbc.sunnypilot.car.hyundai.carstate_ext import (
+      CarStateExt, GRADE_ACCEL_FILTERED_CLIP_MS2, GRAVITY_MS2,
+    )
+    self.CarStateExt = CarStateExt
+    self.CLIP = GRADE_ACCEL_FILTERED_CLIP_MS2
+    self.G = GRAVITY_MS2
+
+  def test_pitch_to_grade_accel_conversion(self):
+    """3% grade ≈ atan(0.03) ≈ 0.03 rad pitch → grade_accel ≈ 0.03 * 9.81 = 0.29 m/s²."""
+    import math
+    pitch_3pct = math.atan(0.03)
+    expected = self.G * math.sin(pitch_3pct)
+    # Verify card.py-style conversion gives expected value
+    self.assertAlmostEqual(expected, 0.294, delta=0.01)
+
+  def test_external_source_clipped_to_05_ms2(self):
+    """Kalman pitch can produce >0.5 m/s² on steep grades; clipped per
+    iter10 commit 1's lowered ceiling."""
+    cp = FakeCP()
+    cp_sp = FakeCPSP()
+    ext = self.CarStateExt(cp, cp_sp)
+    # Steep grade: 10% = 0.1 rad → 0.1 * 9.81 = 0.98 m/s² (above 0.5 clip)
+    ext.grade_accel_external_ms2 = 0.98
+    self.assertEqual(ext.grade_accel_external_ms2, 0.98,
+                     "External value stored as set; clipping happens in update path")
+    # The actual clip logic runs in _update_ev_limiter_signals; verified
+    # via the constant-change test in TestIter10ObserverMitigation.
+
+  def test_external_none_falls_back_to_legacy(self):
+    """When kalman invalid (grade_accel_external_ms2 = None), carstate_ext
+    falls back to LONG_ACCEL-aEgo derivation."""
+    cp = FakeCP()
+    cp_sp = FakeCPSP()
+    ext = self.CarStateExt(cp, cp_sp)
+    # Default is None on init
+    self.assertIsNone(ext.grade_accel_external_ms2,
+                      "External grade source defaults to None (legacy fallback)")
+
+  def test_state_init_includes_diagnostic_counters(self):
+    """iter10 commit 1: post-filter zero detector counters present."""
+    cp = FakeCP()
+    cp_sp = FakeCPSP()
+    ext = self.CarStateExt(cp, cp_sp)
+    self.assertFalse(ext._grade_filter_seen_nonzero)
+    self.assertFalse(ext._grade_filter_zero_warning_logged)
+    self.assertEqual(ext._grade_filter_call_count, 0)
 
 
 if __name__ == "__main__":

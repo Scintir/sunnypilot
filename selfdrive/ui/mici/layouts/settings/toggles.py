@@ -86,12 +86,23 @@ class TogglesLayoutMici(NavScroller):
           suffix=" mph",
           default=5,
         )
-        self._scroller.add_widgets([log_upload, ev_limiter, ev_power_thr, ev_dte_floor, ev_max_gap])
+        # iter10 Layer 1: max-deficit cap on (user_target - cluster_set).
+        # Bounded reference governor uses this as the floor on cluster set
+        # speed during NORMAL mode at highway. Drive #8 had 13 mph deficit;
+        # 7 default is a balance between EV protection and driver UX.
+        ev_max_deficit = CyclingIntButton(
+          "EV limiter max deficit",
+          "EvLimiterMaxDeficitMph",
+          values=[5, 6, 7, 8, 10],
+          suffix=" mph",
+          default=7,
+        )
+        self._scroller.add_widgets([log_upload, ev_limiter, ev_power_thr, ev_dte_floor, ev_max_gap, ev_max_deficit])
         self._refresh_toggles = self._refresh_toggles + (
           ("LogUploadEnabled", log_upload),
           ("EVLimiterEnabled", ev_limiter),
         )
-        self._cycling_refresh = (ev_power_thr, ev_dte_floor, ev_max_gap)
+        self._cycling_refresh = (ev_power_thr, ev_dte_floor, ev_max_gap, ev_max_deficit)
       except Exception as e:  # widget constructors must not take down the panel
         print(f"[toggles] EV-limiter widget init failed: {type(e).__name__}: {e}")
 
