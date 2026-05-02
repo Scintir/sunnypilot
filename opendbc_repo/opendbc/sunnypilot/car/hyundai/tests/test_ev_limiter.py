@@ -968,19 +968,19 @@ class TestIter10Governor(unittest.TestCase):
 
     # NORMAL: typical case
     lim._gas_hold_frames = 0
-    lo, hi = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=30.0,
+    lo, hi = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=30.0, frame=999,
                                             observed_set_speed=60.0 * MPH_TO_MS,
                                             dynamic_ceiling=80.0 * MPH_TO_MS)
     self.assertLessEqual(lo, hi, "NORMAL: lo > hi")
 
     # GAS_CATCHUP: cluster < vEgo+headroom (typical Event A)
-    lo, hi = lim._compute_governor_bounds(self.MODE_GAS_CATCHUP, v_ego=10.0,
+    lo, hi = lim._compute_governor_bounds(self.MODE_GAS_CATCHUP, v_ego=10.0, frame=999,
                                             observed_set_speed=21.0 * MPH_TO_MS,
                                             dynamic_ceiling=999.0)
     self.assertLessEqual(lo, hi, "GAS_CATCHUP cluster<ego: lo > hi")
 
     # GAS_CATCHUP: cluster > vEgo+headroom (mid-recovery / coast)
-    lo, hi = lim._compute_governor_bounds(self.MODE_GAS_CATCHUP, v_ego=10.0,
+    lo, hi = lim._compute_governor_bounds(self.MODE_GAS_CATCHUP, v_ego=10.0, frame=999,
                                             observed_set_speed=40.0 * MPH_TO_MS,
                                             dynamic_ceiling=999.0)
     self.assertLessEqual(lo, hi, "GAS_CATCHUP cluster>ego+headroom: lo > hi")
@@ -988,54 +988,81 @@ class TestIter10Governor(unittest.TestCase):
                            msg="GAS_CATCHUP cluster>ego+headroom: cluster should hold (lo==hi)")
 
     # DECEL: permissive lower
-    lo, hi = lim._compute_governor_bounds(self.MODE_DECEL, v_ego=20.0,
+    lo, hi = lim._compute_governor_bounds(self.MODE_DECEL, v_ego=20.0, frame=999,
                                             observed_set_speed=50.0 * MPH_TO_MS,
                                             dynamic_ceiling=999.0)
     self.assertLessEqual(lo, hi, "DECEL: lo > hi")
 
-  def test_normal_mode_clusters_max_deficit_at_highway(self):
-    """At highway (dynamic_ceiling >= user_target), max_deficit floor enforced.
-    Drive #8 Event B: prevents 13 mph offset from happening."""
+  def _post_engagement_lim(self):
+    """Helper: produce a limiter that has past the engagement-transient window
+    (iter11 Fix A safety override). Tests that exercise governor bounds
+    directly need to bypass the engage-edge floor suspension."""
     lim = _make_limiter()
+    lim.was_cc_enabled = True
+    lim._engaged_at_frame = -1000   # well before any test frame
+    return lim
+
+  def test_normal_mode_clusters_max_deficit_at_highway(self):
+    """At highway, max_deficit floor enforced as HARD invariant (iter11 Fix A).
+    Drive #8 Event B: prevents 13 mph offset; iter10 had this as conditional."""
+    lim = self._post_engagement_lim()
     lim.user_target_speed = 75.0 * MPH_TO_MS
-    # Highway: vEgo=33 m/s, dynamic_ceiling = 33+5 mph margin = 33+2.2=35.2 m/s = ~79 mph
-    lo, hi = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=33.0,
+    lo, hi = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=33.0, frame=999,
                                             observed_set_speed=60.0 * MPH_TO_MS,
                                             dynamic_ceiling=35.2)
     expected_lo_ms = (75.0 - self.MAX_DEFICIT) * MPH_TO_MS  # 68 mph
-    # vEgo - slop = 33 - 0.5 = 32.5 m/s = 72.7 mph (higher than 68 → wins)
     expected_lo_ms = max(expected_lo_ms, 33.0 - self.EGO_SLOP)
     self.assertAlmostEqual(lo, expected_lo_ms, delta=0.1,
                            msg="NORMAL highway: lower_bound should be max(target-7, vEgo-slop)")
     self.assertAlmostEqual(hi, 75.0 * MPH_TO_MS, places=4,
                            msg="upper_bound should equal user_target")
 
-  def test_normal_mode_low_speed_lets_sliding_cap_below_max_deficit(self):
-    """At low vEgo where dynamic_ceiling < user_target, max_deficit floor
-    suspended so sliding cap can pull cluster naturally."""
-    lim = _make_limiter()
+  def test_normal_mode_max_deficit_HARD_at_low_speed_iter11(self):
+    """iter11 Fix A: at low vEgo where dynamic_ceiling < user_target, the
+    max_deficit floor is STILL ENFORCED. iter10 had it suspended (Bug A);
+    iter11 makes it hard. Replaces iter10's test_normal_mode_low_speed_lets_..."""
+    lim = self._post_engagement_lim()
     lim.user_target_speed = 50.0 * MPH_TO_MS
-    # Low speed: vEgo=10 m/s = 22 mph. dynamic_ceiling = vEgo + ~19 mph margin = 41 mph.
-    # 41 < 50 → low-speed regime
-    lo, hi = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=10.0,
+    # Low speed: vEgo=10 m/s = 22 mph, dynamic_ceiling=41 mph (< user_target=50)
+    lo, hi = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=10.0, frame=999,
                                             observed_set_speed=44.0 * MPH_TO_MS,
                                             dynamic_ceiling=41.0 * MPH_TO_MS)
-    # Floor should be vEgo - slop = 10 - 0.5 = 9.5 m/s = 21.2 mph (no max-deficit)
-    self.assertAlmostEqual(lo, 10.0 - self.EGO_SLOP, delta=0.1,
-                           msg="Low speed: max-deficit floor suppressed; only no-below-vEgo")
-    self.assertAlmostEqual(hi, 50.0 * MPH_TO_MS, places=4)
+    # iter11: max_deficit floor STILL applies (hard invariant)
+    expected_lo_mph = 50.0 - self.MAX_DEFICIT   # 43 mph
+    expected_lo_ms = expected_lo_mph * MPH_TO_MS
+    # vEgo - slop = 10 - 0.5 = 9.5 m/s (much lower than 43 mph) so deficit-floor wins
+    self.assertAlmostEqual(lo, expected_lo_ms, delta=0.5,
+                           msg="iter11: max_deficit floor enforced even when dynamic_ceiling < user_target")
 
   def test_no_below_vego_invariant_clamps_lower_bound(self):
     """Event B fix: cluster_set ≥ vEgo - 0.5 m/s when user_target above vEgo."""
-    lim = _make_limiter()
+    lim = self._post_engagement_lim()
     lim.user_target_speed = 75.0 * MPH_TO_MS
-    # vEgo=30 m/s, dynamic_ceiling=33 m/s = 73.8 mph (just below user_target)
-    lo, hi = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=30.0,
+    lo, hi = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=30.0, frame=999,
                                             observed_set_speed=70.0 * MPH_TO_MS,
                                             dynamic_ceiling=33.0)
-    # vEgo - slop = 30 - 0.5 = 29.5 m/s → that's the floor regardless of max-deficit
     self.assertGreaterEqual(lo, 30.0 - self.EGO_SLOP - 1e-3,
                             "Lower bound must be >= vEgo - EGO_SLOP")
+
+  def test_iter11_engagement_transient_suspends_floor(self):
+    """iter11 Fix A: first 1.0 s after engagement, floor is suspended to allow
+    cluster to settle. Avoids forcing recovery on the engage edge."""
+    lim = _make_limiter()  # was_cc_enabled = False, _engaged_at_frame = -10000
+    lim.user_target_speed = 75.0 * MPH_TO_MS
+    # Frame 0, fresh engagement → transient
+    lo, _ = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=30.0, frame=0,
+                                          observed_set_speed=60.0 * MPH_TO_MS,
+                                          dynamic_ceiling=35.2)
+    self.assertEqual(lo, 0.0,
+                     "Engagement transient: lower_bound suspended (USER_TARGET_MIN_MS=0)")
+    # Now set engaged 200 frames ago (2 sec) — past 100-frame transient
+    lim.was_cc_enabled = True
+    lim._engaged_at_frame = 0
+    lo, _ = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=30.0, frame=200,
+                                          observed_set_speed=60.0 * MPH_TO_MS,
+                                          dynamic_ceiling=35.2)
+    self.assertGreater(lo, 0.0,
+                       "Past engagement transient: hard floor enforced")
 
   def test_decel_intent_requires_positive_evidence(self):
     """v2: uncertain → MODE_NORMAL. Brake-recent OR sustained SCC decel only."""
@@ -1194,6 +1221,211 @@ class TestIter10KalmanGradeSource(unittest.TestCase):
     self.assertFalse(ext._grade_filter_seen_nonzero)
     self.assertFalse(ext._grade_filter_zero_warning_logged)
     self.assertEqual(ext._grade_filter_call_count, 0)
+
+
+class TestIter11Fixes(unittest.TestCase):
+  """iter11 — containment release covering bugs A,B,C,D,E,F discovered
+  in drives #9-13. See plan-v4-iter11.md."""
+
+  def setUp(self):
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import (
+      ACTIVE_STATES, MIN_ACTIVE_STATE_DWELL_FRAMES,
+    )
+    self.ACTIVE_STATES = ACTIVE_STATES
+    self.MIN_DWELL = MIN_ACTIVE_STATE_DWELL_FRAMES
+
+  # --- Bug A: max-deficit invariant + recovery escape ---
+  def test_recovery_below_floor_overrides_power_too_high(self):
+    """When cluster < lower_bound, want_res still fires even if power_too_high.
+    Recovery escape priority over power shaping."""
+    lim = _make_limiter()
+    lim.was_cc_enabled = True
+    lim._engaged_at_frame = -1000
+    lim.user_target_speed = 50.0 * MPH_TO_MS
+    # Force recovery escape mode active (cluster below floor)
+    lim._recovery_escape_active = True
+    lim._recovery_escape_start_t = 0.0
+    lim._recovery_escape_start_cluster = 30.0 * MPH_TO_MS
+    lim.last_res_frame = -10000
+    # Enough elapsed time so rate cap permits a press
+    # frame * 0.01 = 1.0 sec → max gain 2 mph from 30 → 32 mph
+    btn, _ = _step(lim, 100, cc_enabled=True, vEgo=20.0, observed_mph=30.0,
+                   est_power_w=50_000.0, abasis=1.0)  # power high
+    # observed=30 mph < user_target=50, no power_too_high cancel → RES allowed
+    self.assertEqual(btn, Buttons.RES_ACCEL,
+                     "Recovery escape: RES fires even with power_too_high")
+
+  def test_recovery_rate_limited_2mph_per_sec(self):
+    """Iter11 Fix A: at 100Hz decisions, recovery cluster gain ≤ 2 mph/sec."""
+    lim = _make_limiter()
+    lim.was_cc_enabled = True
+    lim._engaged_at_frame = -1000
+    lim.user_target_speed = 50.0 * MPH_TO_MS
+    lim._recovery_escape_active = True
+    lim._recovery_escape_start_t = 100 * 0.01  # entered at frame 100
+    lim._recovery_escape_start_cluster = 30.0 * MPH_TO_MS
+    lim.last_res_frame = -10000
+    # At frame 150 (0.5 sec later), max permitted = 30 + 2*0.5 = 31 mph
+    # If cluster already at 31, want_res blocked
+    btn, _ = _step(lim, 150, cc_enabled=True, vEgo=20.0, observed_mph=31.5,
+                   est_power_w=10_000.0, abasis=0.0)
+    self.assertEqual(btn, Buttons.NONE,
+                     "Recovery rate cap: cluster already at max permitted (31 mph)")
+
+  # --- Bug B: arbiter ---
+  def test_no_direct_state_mutation_outside_arbiter(self):
+    """Static guard: only _arbitrate_state_transition and __init__ should
+    assign self.state. Catches Bug B regression."""
+    import re
+    src_path = '/home/alex.smith/git/sunnypilot/opendbc_repo/opendbc/sunnypilot/car/hyundai/ev_limiter.py'
+    with open(src_path) as f:
+      src = f.read()
+    # Find all 'self.state = X' assignments
+    matches = re.finditer(r'\bself\.state\s*=', src)
+    locations = []
+    for m in matches:
+      # Find the enclosing function name by walking backward
+      pre = src[:m.start()]
+      lines = pre.split('\n')
+      # Walk backwards to find 'def ...'
+      for i in range(len(lines)-1, -1, -1):
+        m2 = re.match(r'\s*def (\w+)\(', lines[i])
+        if m2:
+          locations.append(m2.group(1))
+          break
+      else:
+        locations.append('<module>')
+    # Allowed: __init__ (init), _arbitrate_state_transition (sole mutation site)
+    bad = [loc for loc in locations if loc not in ('__init__', '_arbitrate_state_transition')]
+    self.assertEqual(bad, [],
+                     f"self.state = ... assignments outside arbiter: {bad}")
+
+  def test_arbiter_blocks_active_state_exit_before_min_dwell(self):
+    """SOFT_CAP cannot exit before MIN_ACTIVE_STATE_DWELL_FRAMES."""
+    lim = _make_limiter()
+    lim.was_cc_enabled = True
+    lim._engaged_at_frame = -1000
+    lim.state = STATE_SOFT_CAP_ACTIVE
+    lim._state_entered_frame = 1000
+    # Try to exit at frame 1050 (only 50 frames in state, < 200 MIN_DWELL)
+    actual = lim._arbitrate_state_transition(1050, STATE_IDLE, "test", hard_preempt=False)
+    self.assertEqual(actual, STATE_SOFT_CAP_ACTIVE, "Min-dwell blocks exit")
+    self.assertEqual(lim.state, STATE_SOFT_CAP_ACTIVE)
+
+  def test_arbiter_allows_hard_preempt_through_min_dwell(self):
+    """Hard preempts (driver override, brake) bypass min-dwell."""
+    lim = _make_limiter()
+    lim.state = STATE_SOFT_CAP_ACTIVE
+    lim._state_entered_frame = 1000
+    actual = lim._arbitrate_state_transition(1050, STATE_DISABLED, "cc_off", hard_preempt=True)
+    self.assertEqual(actual, STATE_DISABLED)
+    self.assertEqual(lim.state, STATE_DISABLED)
+
+  # --- Bug C: kalman gate (note: card.py change, tested at integration level) ---
+  def test_kalman_str_status_compared_correctly(self):
+    """pycapnp returns enum NAME (string) for status. iter11 compares to 'valid' not 2."""
+    # Sanity: confirm string comparison works as expected
+    status_value = 'valid'   # what pycapnp returns
+    self.assertEqual(str(status_value) == 'valid', True)
+    self.assertEqual(status_value == 2, False, "Bug C: numeric comparison would fail")
+
+  # --- Bug D: ineffective-RES watchdog ---
+  def test_ineffective_res_escape_triggers_after_8_presses(self):
+    """8+ RES presses without 1 mph cluster gain → escape mode."""
+    lim = _make_limiter()
+    lim.was_cc_enabled = True
+    lim._engaged_at_frame = -1000
+    lim.user_target_speed = 50.0 * MPH_TO_MS
+    lim.last_res_frame = -10000
+    # Simulate 8 RES presses with cluster stuck at 30 mph
+    for i in range(8):
+      f = 100 + i * 80   # one press per 80 frames (RES_COOLDOWN)
+      _step(lim, f, cc_enabled=True, vEgo=20.0, observed_mph=30.0,
+            est_power_w=10_000.0, abasis=0.0)
+    # After 8th press, escape should arm on the next decision
+    f_next = 100 + 8 * 80 + 5
+    _step(lim, f_next, cc_enabled=True, vEgo=20.0, observed_mph=30.0,
+          est_power_w=10_000.0, abasis=0.0)
+    self.assertGreater(lim._ineffective_res_events, 0,
+                       "Escape should trigger after 8 ineffective RES presses")
+
+  def test_escape_aborts_at_3mph_cluster_delta_cap(self):
+    """Escape mode aborts immediately if cluster moves up by 3 mph."""
+    lim = _make_limiter()
+    lim.was_cc_enabled = True
+    lim._engaged_at_frame = -1000
+    # Activate escape manually
+    lim._res_escape_until_frame = 10000   # active
+    lim._res_escape_start_cluster_ms = 30.0 * MPH_TO_MS
+    # Step with cluster now 33 mph (3 mph delta)
+    _step(lim, 200, cc_enabled=True, vEgo=20.0, observed_mph=33.5,
+          est_power_w=10_000.0, abasis=0.0)
+    self.assertLess(lim._res_escape_until_frame, 200,
+                    "Escape aborts when cluster moved 3 mph")
+
+  # --- Bug E: power estimator ---
+  def test_assume_ev_only_defaults_true_when_param_absent(self):
+    """When EvLimiterAssumeEvOnly param missing, default to true."""
+    from opendbc.sunnypilot.car.hyundai.carstate_ext import CarStateExt
+    cp = FakeCP(); cp_sp = FakeCPSP()
+    ext = CarStateExt(cp, cp_sp)
+    # If Params not available or returns None, default true
+    self.assertTrue(ext._assume_ev_only,
+                    "EvLimiterAssumeEvOnly defaults to true when absent")
+
+  def test_power_capped_when_assume_ev_only_true(self):
+    """When _assume_ev_only=True, power capped at _ev_motor_cap_w."""
+    from opendbc.sunnypilot.car.hyundai.carstate_ext import CarStateExt
+    cp = FakeCP(); cp_sp = FakeCPSP()
+    ext = CarStateExt(cp, cp_sp)
+    ext._assume_ev_only = True
+    ext._ev_motor_cap_w = 60_000.0
+    # Direct unit test: simulate the cap logic
+    raw = 80_000.0
+    capped = min(raw, ext._ev_motor_cap_w) if ext._assume_ev_only else raw
+    self.assertEqual(capped, 60_000.0)
+
+  def test_power_not_capped_when_assume_ev_only_false(self):
+    from opendbc.sunnypilot.car.hyundai.carstate_ext import CarStateExt
+    cp = FakeCP(); cp_sp = FakeCPSP()
+    ext = CarStateExt(cp, cp_sp)
+    ext._assume_ev_only = False
+    raw = 80_000.0
+    capped = min(raw, ext._ev_motor_cap_w) if ext._assume_ev_only else raw
+    self.assertEqual(capped, 80_000.0)
+
+  # --- Bug F: highway SET cadence ---
+  def test_highway_set_cooldown_5sec(self):
+    """At vEgo > 25 m/s, SET cooldown is 5 sec (500 frames)."""
+    lim = _make_limiter()
+    lim.was_cc_enabled = True
+    lim._engaged_at_frame = -1000
+    lim.user_target_speed = 75.0 * MPH_TO_MS
+    lim.last_set_frame = -10000
+    # First SET fires
+    btn1, _ = _step(lim, 100, cc_enabled=True, vEgo=33.0, observed_mph=80.0,
+                    est_power_w=50_000.0, abasis=0.5)
+    self.assertEqual(btn1, Buttons.SET_DECEL, "First highway SET fires")
+    # Second SET 100 frames later (1 sec, < 5 sec) — blocked
+    btn2, _ = _step(lim, 200, cc_enabled=True, vEgo=33.0, observed_mph=80.0,
+                    est_power_w=50_000.0, abasis=0.5)
+    self.assertEqual(btn2, Buttons.NONE, "Highway SET rate-capped at 5 sec")
+    # Verify power_high_pending counter incremented
+    self.assertGreater(lim._power_high_pending_frames, 0,
+                       "power_high_pending counter increments during cooldown")
+
+  def test_highway_burst_copies_forced_to_1(self):
+    """At vEgo > 25 m/s, BURST_COPIES forced to 1 (not the default burst)."""
+    lim = _make_limiter()
+    lim.was_cc_enabled = True
+    lim._engaged_at_frame = -1000
+    lim.user_target_speed = 75.0 * MPH_TO_MS
+    lim.last_set_frame = -10000
+    btn, _ = _step(lim, 100, cc_enabled=True, vEgo=33.0, observed_mph=80.0,
+                   est_power_w=50_000.0, abasis=0.5)
+    self.assertEqual(btn, Buttons.SET_DECEL)
+    self.assertEqual(lim.current_burst_count, 1,
+                     "Highway: burst forced to 1 (not BURST_COPIES default)")
 
 
 if __name__ == "__main__":

@@ -266,6 +266,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"EVLimiterDTEFloor", {PERSISTENT, INT, "5"}},
     {"EVLimiterMaxGapMph", {PERSISTENT, INT, "5"}},
     {"EvLimiterMaxDeficitMph", {PERSISTENT, INT, "7"}},   // iter10 Layer 1: bounded governor max-deficit floor
+    {"EvLimiterAssumeEvOnly", {PERSISTENT, BOOL, "1"}},   // iter11 Fix E: assume EV-only operation; cap est power at motor max
+    {"EvLimiterMotorCapKW", {PERSISTENT, INT, "60"}},     // iter11 Fix E: EV motor max power (Santa Fe PHEV ~60kW)
 
     // Calibration box-check bypass + reset signaling (re-applied from older branch).
     // CalibrationBoxCheckDisabled: when true, is_calibration_valid() returns True

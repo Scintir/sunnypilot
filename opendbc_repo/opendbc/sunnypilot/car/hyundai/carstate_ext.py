@@ -125,6 +125,38 @@ class CarStateExt:
     # LONG_ACCEL-aEgo derivation. Set to a finite m/s² value when
     # liveLocationKalman is calibrated and inputsOK.
     self.grade_accel_external_ms2 = None
+    self.kalman_reject_reason = 0   # iter11 Fix C: bitmask, set by card.py
+    self.grade_accel_source = 0     # iter11 Fix C: 0=NONE, 1=LEGACY, 2=KALMAN
+
+    # iter11 Fix E: power estimator EV cap + saturation substitution
+    self._ev_motor_cap_w = self._read_motor_cap_param()
+    self._assume_ev_only = self._read_assume_ev_only_param()
+    self._abasis_filtered = 0.0
+    self._aego_filtered = 0.0
+    self._saturation_entry_frames = 0
+    self._saturation_exit_frames = 0
+    self._saturation_active = False
+
+  # iter11 Fix E: param loaders. Use raw .get() (returns None on absent)
+  # so we can default to True/sensible-default when param missing.
+  def _read_motor_cap_param(self) -> float:
+    try:
+      from openpilot.common.params import Params
+      raw = Params().get("EvLimiterMotorCapKW")
+      if raw is None: return 60_000.0  # default 60 kW
+      kw = max(30, min(int(raw), 100))  # bounds 30-100
+      return kw * 1000.0
+    except Exception:
+      return 60_000.0
+
+  def _read_assume_ev_only_param(self) -> bool:
+    try:
+      from openpilot.common.params import Params
+      raw = Params().get("EvLimiterAssumeEvOnly")
+      if raw is None: return True  # absent → default true (user vehicle)
+      return raw in (b"1", b"true", b"True", "1", "true", "True")
+    except Exception:
+      return True
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -291,13 +323,33 @@ class CarStateExt:
       # +0.025 m/s² bias from LONG_ACCEL-aEgo derivation that produced ~22 kW
       # phantom grade contribution on flat highway in drive #7.
       uphill_grade = max(0.0, grade_f - GRADE_DEADBAND_MS2)
-      abasis_pos = max(0.0, abasis)
+
+      # iter11 Fix E: abasis/aEgo saturation detection. When commanded accel
+      # demand >> actual ego accel for sustained period, motor is power-saturated
+      # and abasis no longer represents delivered power. Substitute LP-filtered
+      # aEgo to avoid over-reading. Hysteresis prevents flapping.
+      a_ego_signal = float(ret.aEgo)
+      self._abasis_filtered += 0.1 * (abasis - self._abasis_filtered)
+      self._aego_filtered += 0.1 * (a_ego_signal - self._aego_filtered)
+      ABASIS_AEGO_DIVERGENCE_MS2 = 0.3
+      if (self._abasis_filtered > ABASIS_AEGO_DIVERGENCE_MS2
+          and self._aego_filtered < self._abasis_filtered - ABASIS_AEGO_DIVERGENCE_MS2):
+        self._saturation_entry_frames += 1
+        self._saturation_exit_frames = 0
+      else:
+        self._saturation_exit_frames += 1
+        self._saturation_entry_frames = 0
+      if not self._saturation_active and self._saturation_entry_frames >= 50:    # 0.5s
+        self._saturation_active = True
+      elif self._saturation_active and self._saturation_exit_frames >= 30:       # 0.3s
+        self._saturation_active = False
+      abasis_for_power = max(0.0, self._aego_filtered) if self._saturation_active else max(0.0, abasis)
 
       # Power = mass × v × (commanded-accel + grade-pull) + steady-state road load.
       # Road load (rolling resistance + aero drag) is the missing baseline iter5/6
       # ignored — at 73 mph it's ~23 kW alone, dominant enough that without it
       # the limiter's threshold is comparing apples to oranges.
-      p_accel_grade_w = VEHICLE_MASS_KG * v_ego * (abasis_pos + uphill_grade)
+      p_accel_grade_w = VEHICLE_MASS_KG * v_ego * (abasis_for_power + uphill_grade)
       p_road_w = road_load_power_w(v_ego)
       raw_power_w = max(0.0, p_accel_grade_w + p_road_w)
 
@@ -324,16 +376,34 @@ class CarStateExt:
         self._power_filtered_w += alpha * (raw_power_w - self._power_filtered_w)
       power_w_published = self._power_filtered_w
 
+      # iter11 Fix E: ALWAYS publish raw (pre-cap) for forensics.
+      raw_power_pre_cap_w = power_w_published
+      ret_sp.estPowerRawW = raw_power_pre_cap_w
+
+      # iter11 Fix E: cap at EV motor max if EvLimiterAssumeEvOnly param set.
+      power_w_capped = power_w_published
+      power_was_capped = False
+      if self._assume_ev_only and power_w_published > self._ev_motor_cap_w:
+        power_w_capped = self._ev_motor_cap_w
+        power_was_capped = True
+      ret_sp.estPowerCapped = bool(power_was_capped)
+      ret_sp.estPowerSaturated = bool(self._saturation_active)
+      ret_sp.evModeAssumed = bool(self._assume_ev_only)
+      ret_sp.abasisFiltered = float(self._abasis_filtered)
+      ret_sp.aEgoFiltered = float(self._aego_filtered)
+
       ret_sp.accelDemand = abasis
-      ret_sp.estPowerW = power_w_published
+      ret_sp.estPowerW = power_w_capped
       # Publish the clipped grade value — useful for HUD/debug.
       # NOTE drive #6 forensic: this field has been observed to publish 0
       # in practice while estPowerW above publishes correctly. The sequential
       # writes look identical, root cause unknown. Not blocking iter7 since
       # consumers (HUD, limiter) read estPowerW; revisit when reproducible.
       ret_sp.evLimiterGradeAccel = float(grade_f)
+      ret_sp.evLimiterGradeAccelSource = int(getattr(self, 'grade_accel_source', 0))
+      ret_sp.evLimiterKalmanRejectReason = int(getattr(self, 'kalman_reject_reason', 0))
       self.accel_demand = abasis
-      self.est_power_w = power_w_published
+      self.est_power_w = power_w_capped
     except KeyError as e:
       global _EV_SIGNALS_MISSING_WARNED
       if not _EV_SIGNALS_MISSING_WARNED:

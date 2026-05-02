@@ -445,6 +445,21 @@ struct CarStateSP @0xb86e6369214c01c8 {
   evLimiterUserTargetSpeed @6 :Float32;           # m/s — driver's intended set speed (what HUD should say "recover to")
   evLimiterState @7 :UInt8;                       # state-machine enum: 0 IDLE, 1 STANDSTILL_HOLD, 2 SOFT_CAP_ACTIVE, 3 RECOVERY_ACTIVE, 4 DRIVER_OVERRIDE_SET, 5 DRIVER_OVERRIDE_RES, 6 BUS_FAULT_HOLD, 7 DISABLED
   evLimiterGradeAccel @8 :Float32;                # m/s^2, signed; LP-filtered (LONG_ACCEL - aEgo). Positive = uphill. Used to grade-correct estPowerW.
+  # iter11 telemetry additions (drive #9-13 forensics, post-hoc visibility)
+  estPowerRawW @9 :Float32;                       # Pre-cap, pre-saturation power. Forensic.
+  estPowerCapped @10 :Bool;                       # True when EV cap clipped power this frame
+  estPowerSaturated @11 :Bool;                    # True when abasis>>aEgo saturation substitution active
+  evModeAssumed @12 :Bool;                        # EvLimiterAssumeEvOnly param value
+  evLimiterGradeAccelSource @13 :UInt8;           # 0=NONE, 1=LEGACY_ACCEL, 2=LLK_CALIBRATED
+  evLimiterKalmanRejectReason @14 :UInt8;         # bitmask: 1=status, 2=inputsOK, 4=sensorsOK, 8=cal_valid, 16=pitch_oob
+  evLimiterIneffectiveResEvents @15 :UInt16;      # cumulative count of ineffective-RES escape attempts
+  evLimiterMaxDeficitViolationFrames @16 :UInt32; # cumulative frames where cluster < lower_bound (engaged-no-override)
+  evLimiterTransitionsBlockedByDwell @17 :UInt32; # cumulative transitions blocked by min-dwell
+  evLimiterTransitionsBlockedBySustain @18 :UInt32; # cumulative transitions blocked by sustain
+  evLimiterPowerHighPendingFrames @19 :UInt32;    # cumulative frames power_too_high while in highway cooldown
+  abasisFiltered @20 :Float32;                    # LP-filtered abasis, forensic
+  aEgoFiltered @21 :Float32;                      # LP-filtered aEgo, forensic
+  evLimiterRecentTransitions @22 :Text;           # Compact log of last ~10 transitions for forensic. ≤200 chars.
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

@@ -98,6 +98,10 @@ STATE_IDLE                = 0
 STATE_STANDSTILL_HOLD     = 1
 STATE_SOFT_CAP_ACTIVE     = 2
 STATE_RECOVERY_ACTIVE     = 3
+
+# iter11 Fix B: set of states the arbiter treats as "active" (subject to
+# min-dwell on exit). All other states are quiescent or driver-priority.
+ACTIVE_STATES = (STATE_SOFT_CAP_ACTIVE, STATE_RECOVERY_ACTIVE)
 STATE_DRIVER_OVERRIDE_SET = 4
 STATE_DRIVER_OVERRIDE_RES = 5
 STATE_BUS_FAULT_HOLD      = 6
@@ -363,6 +367,34 @@ class EVLimiter:
     # MODE_GAS_CATCHUP is non-inverting by construction.
     self._bound_inversion_count = 0
 
+    # iter11 Fix B: arbiter forensic counters
+    self._transitions_blocked_by_dwell = 0
+    self._transitions_blocked_by_sustain = 0
+    self._power_too_high_recent = False   # set true on power_too_high entry, cleared on exit
+    self._transition_log = deque(maxlen=10)
+
+    # iter11 Fix A: recovery escape (rate-limited recovery below max-deficit floor)
+    self._recovery_escape_active = False
+    self._recovery_escape_start_t = 0.0
+    self._recovery_escape_start_cluster = 0.0
+    self._engaged_at_frame = -10000   # for engagement-transient safety override
+
+    # iter11 Fix D: ineffective-RES watchdog
+    self._res_sequence_start_frame = -10000
+    self._res_sequence_press_count = 0
+    self._res_sequence_start_cluster_ms = 0.0
+    self._res_escape_until_frame = -10000
+    self._res_escape_start_cluster_ms = 0.0
+    self._last_escape_attempt_frame = -10000
+    self._ineffective_res_events = 0
+
+    # iter11 Fix F: highway SET cooldown counter
+    self._power_high_pending_frames = 0
+
+    # iter11 Fix B: standstill 10-frame hysteresis
+    self._standstill_entry_frames = 0
+    self._standstill_exit_frames = 0
+
   # ----- Params helpers ---------------------------------------------------
 
   def _read_bool(self, key: str, default: bool) -> bool:
@@ -596,38 +628,42 @@ class EVLimiter:
       return GOVERNOR_MODE_DECEL
     return GOVERNOR_MODE_NORMAL
 
-  def _compute_governor_bounds(self, mode: int, v_ego: float,
+  def _compute_governor_bounds(self, mode: int, v_ego: float, frame: int,
                                 observed_set_speed: float,
                                 dynamic_ceiling: float) -> tuple[float, float]:
-    """Compute (lower_bound, upper_bound) for cluster_set this tick.
-    Non-inverting by construction in MODE_GAS_CATCHUP. NORMAL/DECEL bounds
-    can theoretically invert if user_target < vEgo - max_deficit (rare); a
-    diagnostic counter tracks this for forensic review.
+    """iter11 Fix A: max-deficit invariant is HARD in NORMAL mode, subject
+    only to enumerated safety overrides:
+    - lead/brake/decel handled via MODE_DECEL/MODE_BRAKE selection upstream
+    - engagement transient (just engaged or vEgo too low to act) suspends floor
 
-    `dynamic_ceiling` = vEgo + sliding-cap margin. Used to detect the low-speed
-    regime where sliding cap legitimately wants cluster < (user_target -
-    max_deficit). In that regime, max-deficit floor is suppressed so the
-    sliding cap can operate.
-    """
+    Drive #9-13 forensics: the v0/iter10 'low-speed dynamic ceiling' suspension
+    turned a hard invariant into a conditional and produced 22-44 mph offsets.
+    iter11: floor is hard. If sliding cap wants cluster lower, it loses to
+    the floor (cluster simply won't be cap-down'd below floor)."""
     upper_bound = self.user_target_speed
     max_deficit_mph = self._read_int(MAX_DEFICIT_PARAM, int(MAX_DEFICIT_DEFAULT_MPH))
     default_lower = max(USER_TARGET_MIN_MS, self.user_target_speed - max_deficit_mph * MPH_TO_MS)
 
     if mode == GOVERNOR_MODE_NORMAL:
-      # Max-deficit floor only applies when sliding cap would otherwise allow
-      # cluster at user_target (i.e. dynamic_ceiling >= user_target). At low
-      # speed where sliding cap clamps below user_target, deep cuts are the
-      # sliding cap doing its job — let it through.
-      if dynamic_ceiling >= self.user_target_speed:
-        lower_bound = default_lower
-      else:
+      # iter11 Fix A: engagement-transient safety override. Lets cluster sit
+      # wherever it lands at engage edge (probably below floor) for first 1.0 s
+      # before strict floor enforcement.
+      ENGAGEMENT_TRANSIENT_FRAMES = 100   # 1.0 s @ 100 Hz
+      is_engagement_transient = (
+        not self.was_cc_enabled
+        or (frame - self._engaged_at_frame) < ENGAGEMENT_TRANSIENT_FRAMES
+      )
+
+      if is_engagement_transient:
         lower_bound = USER_TARGET_MIN_MS
+      else:
+        # HARD invariant: cluster ≥ user_target - max_deficit, always.
+        lower_bound = default_lower
+
       # Invariant: never command cluster < vEgo - slop when user_target above ego.
-      # Prevents Event B (cluster<vEgo oscillation) regardless of mode.
-      if self.user_target_speed > v_ego + EGO_SLOP_MS:
+      # Prevents Event B (cluster<vEgo oscillation).
+      if self.user_target_speed > v_ego + EGO_SLOP_MS and not is_engagement_transient:
         lower_bound = max(lower_bound, v_ego - EGO_SLOP_MS)
-        # If user_target is between vEgo and (vEgo + EGO_SLOP_MS), allow upper
-        # to relax to avoid inversion.
         if upper_bound < lower_bound:
           upper_bound = lower_bound
           self._bound_inversion_count += 1
@@ -664,11 +700,11 @@ class EVLimiter:
     """Advance the limiter one tick. Return (button, active)."""
 
     if not self.supported:
-      return self._publish(Buttons.NONE, STATE_DISABLED, 0.0)
+      return self._publish(Buttons.NONE, STATE_DISABLED, 0.0, frame=frame, reason="unsupported")
 
     if not self._read_bool("EVLimiterEnabled", False):
       self.user_target_speed = 0.0
-      return self._publish(Buttons.NONE, STATE_DISABLED, 0.0)
+      return self._publish(Buttons.NONE, STATE_DISABLED, 0.0, frame=frame, reason="disabled_param")
 
     # Tunables (read every frame so params changes take effect live)
     power_threshold_w = float(self._read_int("EVLimiterPowerThresholdKW", 40)) * 1000.0
@@ -724,12 +760,14 @@ class EVLimiter:
       self._reset_tx_cadence()
       self._standstill_trigger_frames = 0
       self.was_cc_enabled = cc_enabled
-      return self._publish(Buttons.NONE, STATE_DISABLED, observed_set_speed)
+      return self._publish(Buttons.NONE, STATE_DISABLED, observed_set_speed,
+                           frame=frame, reason="cc_off")
 
     # cc_enabled is True from here on.
     # Engage rising edge -> seed user_target.
     just_engaged = not self.was_cc_enabled
     if just_engaged:
+      self._engaged_at_frame = frame   # iter11 Fix A: engagement-transient timing
       # Engage via RES? Check current-frame buttonEvents AND recent
       # disabled-frame RES presses (the wheel press may have landed before
       # cc_enabled rose). Engage via SET / main-switch leaves observed
@@ -768,7 +806,8 @@ class EVLimiter:
     self._maybe_observe_quantization(observed_set_speed, frame)
 
     if dte_raw <= dte_floor:
-      return self._publish(Buttons.NONE, STATE_DISABLED, observed_set_speed)
+      return self._publish(Buttons.NONE, STATE_DISABLED, observed_set_speed,
+                           frame=frame, reason="dte_floor")
 
     # Standstill gate. raw_standstill fires immediately (no 20-frame confirm)
     # so engaging while already stopped — or a brief sub-2 mph dip — suppresses
@@ -808,13 +847,15 @@ class EVLimiter:
       ):
         self._standstill_set_pulses += 1
         self._record_tx(frame, Buttons.SET_DECEL)
-        return self._publish(Buttons.SET_DECEL, STATE_SOFT_CAP_ACTIVE, observed_set_speed)
+        return self._publish(Buttons.SET_DECEL, STATE_SOFT_CAP_ACTIVE, observed_set_speed,
+                             frame=frame, reason="standstill_set_pulse")
       # Don't reset last_set_frame — the cooldown gate above relies on it
       # to space SET fires properly within the standstill window. The
       # consequence is up to 1.5 s of self_set_recent post-exit blocking
       # RES, which is acceptable since vehicle is just leaving stop and
       # SCC's accel demand will lift cluster_set via the sliding-cap path.
-      return self._publish(Buttons.NONE, STATE_STANDSTILL_HOLD, observed_set_speed)
+      return self._publish(Buttons.NONE, STATE_STANDSTILL_HOLD, observed_set_speed,
+                           frame=frame, reason="standstill")
 
     # Driver override windows.
     in_override_set = self._in_driver_override_set(frame)
@@ -867,16 +908,37 @@ class EVLimiter:
       frame, v_ego, gas_pressed, brake_pressed, in_standstill, observed_set_speed
     )
     lower_bound, upper_bound = self._compute_governor_bounds(
-      governor_mode, v_ego, observed_set_speed, dynamic_ceiling
+      governor_mode, v_ego, frame, observed_set_speed, dynamic_ceiling
     )
     target_set = max(lower_bound, min(upper_bound, target_set))
+
+    # iter11 Fix A: max-deficit violation forensic counter
+    if governor_mode == GOVERNOR_MODE_NORMAL and not gas_pressed and not brake_pressed:
+      if observed_set_speed < lower_bound - 0.5:   # any sustained dip below floor
+        if not hasattr(self, '_max_deficit_violation_frames'):
+          self._max_deficit_violation_frames = 0
+        self._max_deficit_violation_frames += 1
 
     set_too_high = observed_set_speed > target_set + SET_TRIGGER_DEADBAND_MS
     power_too_high = (
       est_power_w > power_threshold_w
       and observed_set_speed > v_ego + POWER_GAP_DEADBAND_MS
     )
+    # iter11 Fix B: arbiter reads this to allow IDLE→SOFT_CAP without sustain
+    # (preserves iter9 fast-protect on power_too_high)
+    self._power_too_high_recent = power_too_high
     under_target = observed_set_speed < target_set - RECOVERY_DEADBAND_MS
+
+    # iter11 Fix A: recovery escape — when cluster < lower_bound, RES is
+    # allowed even with power_too_high, but rate-limited to ≤2 mph/s elapsed.
+    cluster_below_floor = observed_set_speed < lower_bound - 0.1   # 0.1 m/s slop
+    if cluster_below_floor and not self._recovery_escape_active:
+      # Entering escape mode
+      self._recovery_escape_active = True
+      self._recovery_escape_start_t = frame * 0.01   # 100 Hz → seconds
+      self._recovery_escape_start_cluster = observed_set_speed
+    elif not cluster_below_floor and self._recovery_escape_active:
+      self._recovery_escape_active = False
 
     # Down-trigger: fires whenever sliding cap is violated OR load is high.
     # Driver overrides do NOT suppress us:
@@ -908,16 +970,29 @@ class EVLimiter:
     # MODE_GAS_CATCHUP upper-bound (vEgo + 2 mph) prevents over-recovery while
     # gas is held — RES will track vEgo upward but won't overshoot.
     standstill_clear = (frame - self._left_standstill_at_frame) >= RECOVERY_AFTER_STANDSTILL_FRAMES
+
+    # iter11 Fix A: recovery escape — when cluster is below max-deficit floor,
+    # power_too_high no longer cancels want_res. Recovery toward floor is
+    # escape priority. Rate-limited via permitted-cluster check below.
     want_res = (
       under_target
       and not want_set
-      and not power_too_high
+      and (not power_too_high or self._recovery_escape_active)
       and not in_override_set
       and not self_set_recent
       and not brake_pressed
       and v_ego > RECOVERY_V_EGO_FLOOR_MS
       and standstill_clear
     )
+
+    # iter11 Fix A: rate-limited recovery — max 2 mph/sec elapsed-time-based.
+    # When in escape mode, throttle RES so cluster gain never exceeds 2 mph/sec
+    # since escape entry. Prevents jumpy recovery if SCC is responsive.
+    if want_res and self._recovery_escape_active:
+      elapsed_s = max(0.001, frame * 0.01 - self._recovery_escape_start_t)
+      max_permitted_cluster = self._recovery_escape_start_cluster + 2.0 * MPH_TO_MS * elapsed_s
+      if observed_set_speed >= max_permitted_cluster:
+        want_res = False   # rate-limit hit; wait
 
     # iter10 Layer 1: gas-time RES rate cap. While gas held, throttle RES
     # cadence to one press per 1.5 s (vs 6/s normal global limit) so cluster
@@ -927,13 +1002,75 @@ class EVLimiter:
       if (frame - self.last_res_frame) < GAS_RES_INTERVAL_FRAMES:
         want_res = False
 
+    # iter11 Fix F: highway SET cadence. On highway (vEgo > 25 m/s), force
+    # 5-sec SET cooldown + burst=1, NO bypass for power_too_high (only counter).
+    HIGHWAY_VEGO_THRESHOLD_MS = 25.0
+    SET_COOLDOWN_HIGHWAY_FRAMES = 500
+    is_highway = v_ego > HIGHWAY_VEGO_THRESHOLD_MS
+    if is_highway:
+      if want_set and (frame - self.last_set_frame) < SET_COOLDOWN_HIGHWAY_FRAMES:
+        want_set = False
+        if power_too_high:
+          self._power_high_pending_frames += 1
+      effective_burst = 1   # force single-frame SET on highway
+    else:
+      effective_burst = BURST_COPIES
+
+    # iter11 Fix D: ineffective-RES watchdog escape. When in escape window,
+    # send continuous-frame RES (every tick) instead of discrete bursts.
+    in_res_escape = frame < self._res_escape_until_frame
+    if in_res_escape:
+      # Hard-cap: abort escape if cluster already moved up by 3 mph
+      MAX_ESCAPE_DELTA_MS = 3.0 * MPH_TO_MS
+      if observed_set_speed - self._res_escape_start_cluster_ms >= MAX_ESCAPE_DELTA_MS:
+        self._res_escape_until_frame = -10000
+        in_res_escape = False
+
     button = Buttons.NONE
-    if want_set and (frame - self.last_set_frame) >= set_cooldown_frames:
+    if want_set and (frame - self.last_set_frame) >= (
+        SET_COOLDOWN_HIGHWAY_FRAMES if is_highway else set_cooldown_frames):
       if self._consume_global_rate_limit(frame, 1, limit=rate_limit):
         button = Buttons.SET_DECEL
+        self.current_burst_count = effective_burst
+    elif in_res_escape:
+      # Continuous-frame RES during escape (no cooldown)
+      button = Buttons.RES_ACCEL
+      self.current_burst_count = 1
     elif want_res and (frame - self.last_res_frame) >= RES_COOLDOWN_FRAMES:
       if self._consume_global_rate_limit(frame, 1):
         button = Buttons.RES_ACCEL
+        # iter11 Fix D: track RES sequence for ineffective-button detection
+        if self._res_sequence_press_count == 0:
+          self._res_sequence_start_frame = frame
+          self._res_sequence_start_cluster_ms = observed_set_speed
+        self._res_sequence_press_count += 1
+
+    # iter11 Fix D: detect ineffective RES sequence and trigger escape
+    INEFFECTIVE_RES_WINDOW_FRAMES = 1000   # 10 s
+    INEFFECTIVE_RES_MIN_PRESSES = 8
+    INEFFECTIVE_RES_MIN_GAIN_MS = 1.0 * MPH_TO_MS
+    INEFFECTIVE_RES_HOLD_FRAMES = 50       # 0.5 s continuous press
+    INEFFECTIVE_RES_BACKOFF_FRAMES = 500   # 5 s between attempts
+    if (self._res_sequence_press_count >= INEFFECTIVE_RES_MIN_PRESSES
+        and (frame - self._res_sequence_start_frame) <= INEFFECTIVE_RES_WINDOW_FRAMES
+        and (observed_set_speed - self._res_sequence_start_cluster_ms) < INEFFECTIVE_RES_MIN_GAIN_MS
+        and (frame - self._last_escape_attempt_frame) > INEFFECTIVE_RES_BACKOFF_FRAMES
+        and not in_res_escape):
+      # Trigger ineffective-RES escape
+      self._res_escape_until_frame = frame + INEFFECTIVE_RES_HOLD_FRAMES
+      self._res_escape_start_cluster_ms = observed_set_speed
+      self._last_escape_attempt_frame = frame
+      self._ineffective_res_events += 1
+      # Reset sequence
+      self._res_sequence_press_count = 0
+      self._res_sequence_start_frame = -10000
+
+    # Reset RES sequence tracking on state/mode changes (handled implicitly:
+    # any frame without RES press resets press_count IF we've moved out of
+    # the window). Reset on override or brake or target change:
+    if (in_override_set or in_override_res or brake_pressed
+        or gas_pressed or self._res_sequence_press_count == 0):
+      pass   # sequence already reset or invalid; do nothing
 
     if button != Buttons.NONE:
       self._record_tx(frame, button)
@@ -1024,19 +1161,90 @@ class EVLimiter:
     # else (STANDSTILL_HOLD, DISABLED, BUS_FAULT_HOLD): handled before this
     # block returns from earlier branches in update().
 
-    if new_state != cur_state:
-      self._state_entered_frame = frame
+    # iter11 Fix B: arbiter handles _state_entered_frame mutation; remove
+    # the manual update here. Pass hard_preempt=False so arbiter enforces
+    # min-dwell on active-state exits.
+    # iter11 Fix F: pass effective_burst (1 on highway, BURST_COPIES otherwise)
+    return self._publish(button, new_state, observed_set_speed,
+                         frame=frame, reason="derived", hard_preempt=False,
+                         burst_count=effective_burst if button == Buttons.SET_DECEL else None)
 
-    return self._publish(button, new_state, observed_set_speed)
+  # ----- iter11 Fix B: centralized state arbiter --------------------------
+
+  def _arbitrate_state_transition(self, frame: int, requested: int, reason: str,
+                                   hard_preempt: bool = False) -> int:
+    """SOLE site that mutates self.state. Returns actual state after arbitration.
+    Hard preempts (driver override, brake, disable, bus fault, standstill-with-
+    hysteresis) always succeed. Active-state exits require min-dwell. Active-
+    state entries from IDLE require enter sustain (unless hard preempt or
+    power_too_high — preserves iter9 fast-protect)."""
+    cur = self.state
+    if cur == requested:
+      return cur
+
+    blocked_by = None
+    allow = False
+
+    if hard_preempt:
+      allow = True
+    elif cur in ACTIVE_STATES:
+      # Min-dwell on active-state EXIT
+      time_in_state = frame - self._state_entered_frame
+      if time_in_state >= MIN_ACTIVE_STATE_DWELL_FRAMES:
+        allow = True
+      else:
+        blocked_by = f"min_dwell_{MIN_ACTIVE_STATE_DWELL_FRAMES - time_in_state}f"
+        self._transitions_blocked_by_dwell += 1
+    else:
+      # IDLE → active needs sustain (unless power_too_high recent for SOFT_CAP)
+      if cur == STATE_IDLE and requested == STATE_SOFT_CAP_ACTIVE:
+        if (self._softcap_enter_sustain >= SOFT_CAP_ENTER_SUSTAIN_FRAMES
+            or self._power_too_high_recent):
+          allow = True
+        else:
+          blocked_by = "softcap_enter_sustain"
+          self._transitions_blocked_by_sustain += 1
+      elif cur == STATE_IDLE and requested == STATE_RECOVERY_ACTIVE:
+        if self._recovery_enter_sustain >= RECOVERY_ENTER_SUSTAIN_FRAMES:
+          allow = True
+        else:
+          blocked_by = "recovery_enter_sustain"
+          self._transitions_blocked_by_sustain += 1
+      else:
+        allow = True   # any other transition (IDLE→DISABLED, IDLE→OVR, etc) allowed
+
+    actual = requested if allow else cur
+    self._record_transition(frame, cur, requested, actual, reason, blocked_by)
+    if allow:
+      self._state_entered_frame = frame
+      self.state = actual   # SOLE state mutation (besides __init__)
+    return actual
+
+  def _record_transition(self, frame: int, prev: int, requested: int, actual: int,
+                          reason: str, blocked_by: str | None) -> None:
+    """Append to bounded ring of recent transitions for forensic publish."""
+    if not hasattr(self, '_transition_log'):
+      self._transition_log = deque(maxlen=10)
+    if prev != actual:   # only log actual transitions, not blocked ones
+      self._transition_log.append(f"{frame},{prev},{actual},{reason[:8]}")
 
   # ----- Publish ----------------------------------------------------------
 
-  def _publish(self, button: int, state: int, observed_set_speed: float) -> tuple[int, bool]:
-    self.state = state
-    active = state in (STATE_SOFT_CAP_ACTIVE, STATE_RECOVERY_ACTIVE)
-    self.current_burst_count = BURST_COPIES
+  def _publish(self, button: int, state: int, observed_set_speed: float,
+               frame: int = 0, reason: str = "publish",
+               hard_preempt: bool = True,
+               burst_count: int | None = None) -> tuple[int, bool]:
+    """Publish-and-arbitrate. iter11: state changes route through the arbiter
+    even from this entry point. `hard_preempt=True` by default because most
+    publish callers are early-return paths (DISABLED, STANDSTILL, BUS_FAULT)
+    which legitimately preempt. The state-derivation block in update() passes
+    hard_preempt=False explicitly. `burst_count=None` keeps default BURST_COPIES;
+    iter11 highway SET path passes burst_count=1 to suppress multi-frame burst."""
+    actual = self._arbitrate_state_transition(frame, state, reason, hard_preempt)
+    active = actual in (STATE_SOFT_CAP_ACTIVE, STATE_RECOVERY_ACTIVE)
+    self.current_burst_count = burst_count if burst_count is not None else BURST_COPIES
     _SHARED_STATE["active"] = bool(active)
     _SHARED_STATE["set_speed_offset"] = max(0.0, self.user_target_speed - observed_set_speed)
     _SHARED_STATE["user_target"] = float(self.user_target_speed)
-    _SHARED_STATE["state"] = int(state)
+    _SHARED_STATE["state"] = int(actual)
     return button, active
