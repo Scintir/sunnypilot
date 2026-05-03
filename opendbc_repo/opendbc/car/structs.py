@@ -182,3 +182,20 @@ class CarStateSP:
   estPowerW: float = auto_field()
   evLimiterUserTargetSpeed: float = auto_field()
   evLimiterState: int = auto_field()
+  evLimiterGradeAccel: float = auto_field()  # iter9 — was missing → root cause of drive 6-13 "publish 0" bug
+
+  # iter11 telemetry — must lockstep with cereal/custom.capnp CarStateSP @9-@22
+  estPowerRawW: float = auto_field()
+  estPowerCapped: bool = auto_field()
+  estPowerSaturated: bool = auto_field()
+  evModeAssumed: bool = auto_field()
+  evLimiterGradeAccelSource: int = auto_field()
+  evLimiterKalmanRejectReason: int = auto_field()
+  evLimiterIneffectiveResEvents: int = auto_field()
+  evLimiterMaxDeficitViolationFrames: int = auto_field()
+  evLimiterTransitionsBlockedByDwell: int = auto_field()
+  evLimiterTransitionsBlockedBySustain: int = auto_field()
+  evLimiterPowerHighPendingFrames: int = auto_field()
+  abasisFiltered: float = auto_field()
+  aEgoFiltered: float = auto_field()
+  evLimiterRecentTransitions: str = auto_field()
