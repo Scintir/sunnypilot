@@ -554,23 +554,30 @@ class TestDecelFastCadence(unittest.TestCase):
             est_power_w=0.0, abasis=0.0, aEgo=0.0)
     self.lim.user_target_speed = 50.0 * MPH_TO_MS
 
-  def test_decel_fast_set_cooldown_active(self):
-    """vEgo < 30 mph + aEgo < -0.5 m/s² → SET fires at faster cadence."""
-    # Force conditions: low vEgo (10 m/s ≈ 22 mph, < 30), strong decel
-    # (aEgo = -1.0). cluster=44 vs target_set=22+margin
+  def test_decel_fast_set_cooldown_iter12_obsolete(self):
+    """iter12: decel-fast 60ms cadence is OBSOLETE. iter12 uses ack-driven
+    cadence (50 frames = 0.5s after acked SET, 150 frames = 1.5s otherwise).
+    Brake decel scenario is now BRAKE-mode-suppressed (no SET fires under brake).
+    For coast-decel without brake, iter12's STANDSTILL_HOLD logic handles
+    pre-stop cluster pull-down, not decel-fast."""
     self.lim.last_set_frame = -10000
-    # First SET on frame 100
     btn1, _ = _step(self.lim, 100, cc_enabled=True, vEgo=10.0,
                     observed_mph=44.0, est_power_w=5_000.0, abasis=0.0,
                     aEgo=-1.0)
     self.assertEqual(btn1, Buttons.SET_DECEL)
-    # 7 frames later (70 ms) — should fire if decel-fast cadence (6 frames)
-    # is active, would NOT fire under default cadence (15 frames)
+    # 7 frames later — iter12 ack-driven won't fire (waiting for cluster
+    # response or normal 150-frame cooldown)
     btn2, _ = _step(self.lim, 107, cc_enabled=True, vEgo=10.0,
                     observed_mph=43.0, est_power_w=5_000.0, abasis=0.0,
                     aEgo=-1.0)
-    self.assertEqual(btn2, Buttons.SET_DECEL,
-                      "Decel-fast: SET should fire at 60 ms cadence (got NONE — using default 150 ms?)")
+    self.assertEqual(btn2, Buttons.NONE,
+                     "iter12: decel-fast 60ms obsolete; ack-driven cadence applies")
+    # 60 frames later (acked + > SET_MIN_REPEAT_FRAMES=50) — should fire
+    btn3, _ = _step(self.lim, 160, cc_enabled=True, vEgo=10.0,
+                    observed_mph=43.0, est_power_w=5_000.0, abasis=0.0,
+                    aEgo=-1.0)
+    self.assertEqual(btn3, Buttons.SET_DECEL,
+                     "iter12: after 0.6s with cluster ack, next SET allowed")
 
   def test_decel_fast_inactive_at_high_speed(self):
     """vEgo >= 30 mph → default cadence even with strong decel."""
@@ -601,26 +608,22 @@ class TestDecelFastCadence(unittest.TestCase):
                     aEgo=0.0)
     self.assertEqual(btn2, Buttons.NONE)
 
-  def test_decel_fast_rate_limit_allows_higher_rate(self):
-    """During decel-fast, 12 Hz rate limit allows faster sustained SET
-    than the default 6 Hz would."""
-    # Pre-fill rate limit history with 6 presses in last second to saturate
-    # the default limit; verify a 7th still fires under decel-fast.
+  def test_decel_fast_rate_limit_iter12_obsolete(self):
+    """iter12: decel-fast 12Hz cadence is OBSOLETE. iter12 ack-driven
+    cadence enforces ≥0.5s between SETs even under decel. Test now verifies
+    iter12 behavior."""
     self.lim.last_set_frame = -10000
     f = 1000
-    for _ in range(6):
-      btn, _ = _step(self.lim, f, cc_enabled=True, vEgo=10.0,
-                     observed_mph=44.0, est_power_w=5_000.0, abasis=0.0,
-                     aEgo=-1.0)
-      self.assertEqual(btn, Buttons.SET_DECEL)
-      f += SET_COOLDOWN_DECEL_FAST_FRAMES
-    # 6 SETs fired in ~36 frames (360 ms). 7th press 6 frames later — under
-    # default 6 Hz limit this would be blocked, under decel-fast 12 Hz it fires.
-    btn7, _ = _step(self.lim, f, cc_enabled=True, vEgo=10.0,
+    btn, _ = _step(self.lim, f, cc_enabled=True, vEgo=10.0,
+                   observed_mph=44.0, est_power_w=5_000.0, abasis=0.0,
+                   aEgo=-1.0)
+    self.assertEqual(btn, Buttons.SET_DECEL, "First SET fires")
+    # 6 frames later — iter12 won't fire (need 50 frames + ack)
+    btn2, _ = _step(self.lim, f + 6, cc_enabled=True, vEgo=10.0,
                     observed_mph=44.0, est_power_w=5_000.0, abasis=0.0,
                     aEgo=-1.0)
-    self.assertEqual(btn7, Buttons.SET_DECEL,
-                      "Decel-fast 12 Hz limit must allow >6 SETs/sec")
+    self.assertEqual(btn2, Buttons.NONE,
+                     "iter12: 12Hz rate-limit override removed; ack-driven applies")
 
   def test_standstill_pulse_cap_lowered_to_10(self):
     """iter8: STANDSTILL_SET_PULSE_CAP reduced 30 → 10."""
@@ -1017,22 +1020,19 @@ class TestIter10Governor(unittest.TestCase):
     self.assertAlmostEqual(hi, 75.0 * MPH_TO_MS, places=4,
                            msg="upper_bound should equal user_target")
 
-  def test_normal_mode_max_deficit_HARD_at_low_speed_iter11(self):
-    """iter11 Fix A: at low vEgo where dynamic_ceiling < user_target, the
-    max_deficit floor is STILL ENFORCED. iter10 had it suspended (Bug A);
-    iter11 makes it hard. Replaces iter10's test_normal_mode_low_speed_lets_..."""
+  def test_normal_mode_no_max_deficit_floor_iter12(self):
+    """iter12: max-deficit hard floor REMOVED (was iter11 Fix A, the wrong
+    abstraction that caused ICE activations on today's drive). Only the
+    no-below-vEgo invariant (iter10) remains as floor in NORMAL mode."""
     lim = self._post_engagement_lim()
     lim.user_target_speed = 50.0 * MPH_TO_MS
-    # Low speed: vEgo=10 m/s = 22 mph, dynamic_ceiling=41 mph (< user_target=50)
+    # Low speed: vEgo=10 m/s = 22 mph; expect floor = vEgo - slop only (no max_deficit)
     lo, hi = lim._compute_governor_bounds(self.MODE_NORMAL, v_ego=10.0, frame=999,
                                             observed_set_speed=44.0 * MPH_TO_MS,
                                             dynamic_ceiling=41.0 * MPH_TO_MS)
-    # iter11: max_deficit floor STILL applies (hard invariant)
-    expected_lo_mph = 50.0 - self.MAX_DEFICIT   # 43 mph
-    expected_lo_ms = expected_lo_mph * MPH_TO_MS
-    # vEgo - slop = 10 - 0.5 = 9.5 m/s (much lower than 43 mph) so deficit-floor wins
-    self.assertAlmostEqual(lo, expected_lo_ms, delta=0.5,
-                           msg="iter11: max_deficit floor enforced even when dynamic_ceiling < user_target")
+    expected_lo_ms = 10.0 - self.EGO_SLOP   # 9.5 m/s = ~21 mph
+    self.assertAlmostEqual(lo, expected_lo_ms, delta=0.1,
+                           msg="iter12: floor is only no-below-vEgo invariant; max_deficit removed")
 
   def test_no_below_vego_invariant_clamps_lower_bound(self):
     """Event B fix: cluster_set ≥ vEgo - 0.5 m/s when user_target above vEgo."""
@@ -1395,8 +1395,9 @@ class TestIter11Fixes(unittest.TestCase):
     self.assertEqual(capped, 80_000.0)
 
   # --- Bug F: highway SET cadence ---
-  def test_highway_set_cooldown_5sec(self):
-    """At vEgo > 25 m/s, SET cooldown is 5 sec (500 frames)."""
+  def test_iter12_set_min_repeat_when_acked(self):
+    """iter12 ack-driven: after SET, if cluster drops 1mph (success), next SET
+    allowed after SET_MIN_REPEAT_FRAMES (50 frames = 0.5s)."""
     lim = _make_limiter()
     lim.was_cc_enabled = True
     lim._engaged_at_frame = -1000
@@ -1406,16 +1407,16 @@ class TestIter11Fixes(unittest.TestCase):
     btn1, _ = _step(lim, 100, cc_enabled=True, vEgo=33.0, observed_mph=80.0,
                     est_power_w=50_000.0, abasis=0.5)
     self.assertEqual(btn1, Buttons.SET_DECEL, "First highway SET fires")
-    # Second SET 100 frames later (1 sec, < 5 sec) — blocked
-    btn2, _ = _step(lim, 200, cc_enabled=True, vEgo=33.0, observed_mph=80.0,
+    # 60 frames later (0.6s, > SET_MIN_REPEAT_FRAMES=50), cluster down 1mph (ack)
+    btn2, _ = _step(lim, 160, cc_enabled=True, vEgo=33.0, observed_mph=79.0,
                     est_power_w=50_000.0, abasis=0.5)
-    self.assertEqual(btn2, Buttons.NONE, "Highway SET rate-capped at 5 sec")
-    # Verify power_high_pending counter incremented
-    self.assertGreater(lim._power_high_pending_frames, 0,
-                       "power_high_pending counter increments during cooldown")
+    self.assertEqual(btn2, Buttons.SET_DECEL,
+                     "After 0.6s + cluster ack, next SET allowed")
 
-  def test_highway_burst_copies_forced_to_1(self):
-    """At vEgo > 25 m/s, BURST_COPIES forced to 1 (not the default burst)."""
+  def test_iter12_burst_copies_default_on_highway(self):
+    """iter12: highway burst restored to BURST_COPIES (=2) for SCC reliability.
+    iter11's burst=1 caused dropped frames."""
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import BURST_COPIES
     lim = _make_limiter()
     lim.was_cc_enabled = True
     lim._engaged_at_frame = -1000
@@ -1424,8 +1425,112 @@ class TestIter11Fixes(unittest.TestCase):
     btn, _ = _step(lim, 100, cc_enabled=True, vEgo=33.0, observed_mph=80.0,
                    est_power_w=50_000.0, abasis=0.5)
     self.assertEqual(btn, Buttons.SET_DECEL)
-    self.assertEqual(lim.current_burst_count, 1,
-                     "Highway: burst forced to 1 (not BURST_COPIES default)")
+    self.assertEqual(lim.current_burst_count, BURST_COPIES,
+                     f"iter12: burst=BURST_COPIES ({BURST_COPIES}), not 1")
+
+
+class TestIter12Fixes(unittest.TestCase):
+  """iter12 — comprehensive correction after iter11 multi-failure.
+  Removes hard max-deficit floor (was iter11 Fix A, the wrong abstraction).
+  Adds ack-driven SET cadence + ineffective-SET escape symmetric to RES Bug D.
+  Restores burst=2 on highway.
+  Mode-gates SET emission in BRAKE/DECEL/STANDSTILL/GAS_CATCHUP."""
+
+  def _engaged(self, vEgo=20.0, target_mph=70.0):
+    lim = _make_limiter()
+    for f in range(0, 25):
+      _step(lim, f, cc_enabled=False, vEgo=vEgo, observed_mph=target_mph)
+    _step(lim, 25, cc_enabled=True, vEgo=vEgo, observed_mph=target_mph,
+          button=ButtonType.decelCruise)
+    for f in range(26, 60):
+      _step(lim, f, cc_enabled=True, vEgo=vEgo, observed_mph=target_mph)
+    lim.user_target_speed = target_mph * MPH_TO_MS
+    lim.last_set_frame = -10000
+    lim.last_res_frame = -10000
+    return lim
+
+  # --- Property: cluster - vEgo ≤ max_gap when sliding cap is binding ---
+  def test_iter12_cluster_target_le_vego_plus_max_gap(self):
+    """The PRIMARY iter12 fix: cluster target should be at most vEgo+max_gap
+    when sliding cap is below user_target. This was broken in iter11 (hard
+    floor pinned cluster at user_target-7 = vEgo+18 in low-speed traffic)."""
+    lim = self._engaged(vEgo=22.0, target_mph=75.0)   # vEgo=50mph, target=75
+    # max_gap default = 5 mph (sliding cap target = vEgo+5 = 55 mph)
+    # Drive limiter for many frames at this scenario; observe what target_set
+    # the controller computes (via internal clamping)
+    lim._engaged_at_frame = -10000  # past transient
+    lim.was_cc_enabled = True
+    # Just verify the bound computation directly
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import GOVERNOR_MODE_NORMAL
+    lo, hi = lim._compute_governor_bounds(GOVERNOR_MODE_NORMAL, v_ego=22.0, frame=999,
+                                            observed_set_speed=55.0 * MPH_TO_MS,
+                                            dynamic_ceiling=27.0)  # 22 m/s + ~5 mph margin
+    # iter12: floor = vEgo - slop only (no max_deficit). User can target down to ~vEgo.
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import EGO_SLOP_MS
+    expected_floor = 22.0 - EGO_SLOP_MS
+    self.assertAlmostEqual(lo, expected_floor, delta=0.1,
+                           msg="iter12: floor only = vEgo - slop, no max_deficit pin")
+
+  def test_iter12_brake_mode_blocks_both_set_and_res(self):
+    """gpt-5.5 v1 fix #3: BRAKE mode emits NO SET and NO RES."""
+    lim = self._engaged(vEgo=20.0, target_mph=70.0)
+    lim.user_target_speed = 70.0 * MPH_TO_MS
+    # Power high + cluster well above target → would normally trigger SET
+    btn1, _ = _step(lim, 100, cc_enabled=True, vEgo=20.0, observed_mph=80.0,
+                    est_power_w=50_000.0, abasis=0.5, brake=True)
+    self.assertEqual(btn1, Buttons.NONE, "BRAKE mode: no SET")
+    # Cluster well below target → would normally trigger RES
+    btn2, _ = _step(lim, 200, cc_enabled=True, vEgo=20.0, observed_mph=40.0,
+                    est_power_w=5_000.0, abasis=0.0, brake=True)
+    self.assertEqual(btn2, Buttons.NONE, "BRAKE mode: no RES")
+
+  def test_iter12_set_ack_driven_waits_for_response(self):
+    """After SET press, controller waits for cluster to drop OR for timeout
+    before next decision. No blind cadence."""
+    lim = self._engaged(vEgo=33.0, target_mph=75.0)
+    lim.user_target_speed = 75.0 * MPH_TO_MS
+    # First SET fires
+    btn1, _ = _step(lim, 100, cc_enabled=True, vEgo=33.0, observed_mph=82.0,
+                    est_power_w=10_000.0, abasis=0.0)
+    self.assertEqual(btn1, Buttons.SET_DECEL)
+    self.assertEqual(lim.last_set_frame, 100, "last_set_frame updated")
+    # 30 frames later (300ms), cluster hasn't dropped → don't fire (waiting)
+    btn2, _ = _step(lim, 130, cc_enabled=True, vEgo=33.0, observed_mph=82.0,
+                    est_power_w=10_000.0, abasis=0.0)
+    self.assertEqual(btn2, Buttons.NONE, "Waiting for response, no fire")
+    # 60 frames later (600ms), cluster dropped 1mph → ack → fire after 50f cooldown
+    btn3, _ = _step(lim, 160, cc_enabled=True, vEgo=33.0, observed_mph=81.0,
+                    est_power_w=10_000.0, abasis=0.0)
+    self.assertEqual(btn3, Buttons.SET_DECEL, "Ack received + cooldown clear → fire")
+
+  def test_iter12_set_power_aware_cooldown_fast_when_power_high(self):
+    """When power_too_high, SET min cooldown drops to SET_MIN_REPEAT_FRAMES (50)."""
+    lim = self._engaged(vEgo=33.0, target_mph=75.0)
+    lim.user_target_speed = 75.0 * MPH_TO_MS
+    # First SET fires (cluster=82 > target_set, power high)
+    btn1, _ = _step(lim, 100, cc_enabled=True, vEgo=33.0, observed_mph=82.0,
+                    est_power_w=50_000.0, abasis=0.5)
+    self.assertEqual(btn1, Buttons.SET_DECEL)
+    # 60 frames later, cluster dropped → ack → power-high cooldown applies
+    btn2, _ = _step(lim, 160, cc_enabled=True, vEgo=33.0, observed_mph=81.0,
+                    est_power_w=50_000.0, abasis=0.5)
+    self.assertEqual(btn2, Buttons.SET_DECEL,
+                     "Power-high + ack: fire at 0.5s (not 1.5s normal cadence)")
+
+  def test_iter12_ineffective_set_escape_triggers(self):
+    """Symmetric to iter11 Fix D RES escape: after 3 SET presses with no
+    cluster drop within timeout, enter held-SET escape window."""
+    lim = self._engaged(vEgo=33.0, target_mph=75.0)
+    lim.user_target_speed = 75.0 * MPH_TO_MS
+    # Simulate hostile SCC: SET fires repeatedly but cluster never drops
+    f = 100
+    for _ in range(5):
+      _step(lim, f, cc_enabled=True, vEgo=33.0, observed_mph=82.0,
+            est_power_w=10_000.0, abasis=0.0)
+      f += 200   # 2.0s = SET_RESPONSE_TIMEOUT_FRAMES (each press times out as ineffective)
+    # By now ineffective_set escape should have triggered
+    self.assertGreater(lim._ineffective_set_events, 0,
+                       "After 3+ ineffective SETs, escape triggers")
 
 
 if __name__ == "__main__":

@@ -388,6 +388,14 @@ class EVLimiter:
     self._last_escape_attempt_frame = -10000
     self._ineffective_res_events = 0
 
+    # iter12 Fix F (rev): ack-driven SET cadence + ineffective-SET escape
+    self._cluster_at_last_set = 0.0          # cluster reading at last SET fire
+    self._ineffective_set_press_count = 0    # consecutive ignored SET presses
+    self._set_escape_until_frame = -10000    # held-SET escape window
+    self._set_escape_start_cluster = 0.0     # cluster at escape start (3mph cap)
+    self._last_set_escape_attempt = -10000   # backoff
+    self._ineffective_set_events = 0         # cumulative escape attempts
+
     # iter11 Fix F: highway SET cooldown counter
     self._power_high_pending_frames = 0
 
@@ -654,19 +662,23 @@ class EVLimiter:
         or (frame - self._engaged_at_frame) < ENGAGEMENT_TRANSIENT_FRAMES
       )
 
+      # iter12: REMOVED max-deficit hard floor entirely. iter11 Fix A was the
+      # wrong abstraction — it was solving a SYMPTOM (offset) when the cause
+      # was Hyundai SCC ignoring rapid RES bursts (Bug D). The hard floor blocked
+      # the sliding cap from operating at low/mid vEgo with high user_target,
+      # leading to cluster pinned 15-20 mph above vEgo → ICE activations
+      # (today's drive). The right fix for the original problem is Fix D's
+      # ineffective-RES escape, which iter12 retains.
+      #
+      # iter12 NORMAL bounds: ONLY the no-below-vEgo invariant (iter10 Fix B),
+      # which is correct and orthogonal to max-deficit.
       if is_engagement_transient:
         lower_bound = USER_TARGET_MIN_MS
+      elif self.user_target_speed > v_ego + EGO_SLOP_MS:
+        # I2: never cluster < vEgo - slop when user_target above ego (oscillation prevention)
+        lower_bound = max(USER_TARGET_MIN_MS, v_ego - EGO_SLOP_MS)
       else:
-        # HARD invariant: cluster ≥ user_target - max_deficit, always.
-        lower_bound = default_lower
-
-      # Invariant: never command cluster < vEgo - slop when user_target above ego.
-      # Prevents Event B (cluster<vEgo oscillation).
-      if self.user_target_speed > v_ego + EGO_SLOP_MS and not is_engagement_transient:
-        lower_bound = max(lower_bound, v_ego - EGO_SLOP_MS)
-        if upper_bound < lower_bound:
-          upper_bound = lower_bound
-          self._bound_inversion_count += 1
+        lower_bound = USER_TARGET_MIN_MS
 
     elif mode == GOVERNOR_MODE_GAS_CATCHUP:
       # v2 fix: non-inverting by construction.
@@ -1002,19 +1014,31 @@ class EVLimiter:
       if (frame - self.last_res_frame) < GAS_RES_INTERVAL_FRAMES:
         want_res = False
 
-    # iter11 Fix F: highway SET cadence. On highway (vEgo > 25 m/s), force
-    # 5-sec SET cooldown + burst=1, NO bypass for power_too_high (only counter).
-    HIGHWAY_VEGO_THRESHOLD_MS = 25.0
-    SET_COOLDOWN_HIGHWAY_FRAMES = 500
-    is_highway = v_ego > HIGHWAY_VEGO_THRESHOLD_MS
-    if is_highway:
-      if want_set and (frame - self.last_set_frame) < SET_COOLDOWN_HIGHWAY_FRAMES:
-        want_set = False
-        if power_too_high:
-          self._power_high_pending_frames += 1
-      effective_burst = 1   # force single-frame SET on highway
-    else:
-      effective_burst = BURST_COPIES
+    # iter12 Fix F (revised): ack-driven SET cadence with ineffective-SET escape.
+    # Replaces iter11's burst=1 + blind 5-sec cooldown which was too conservative
+    # AND ignored Hyundai SCC's tendency to drop single-frame buttons.
+    # Behavior: after each SET press, wait for cluster to drop ≥1mph (success)
+    # or 2 sec timeout (ineffective). Power-aware: 0.5s min cooldown when
+    # power_too_high, 1.5s otherwise. Burst stays at BURST_COPIES (=2) for reliability.
+    SET_MIN_REPEAT_FRAMES = 50              # 0.5s — minimum gap after observed ack
+    SET_RESPONSE_TIMEOUT_FRAMES = 200       # 2.0s — wait for cluster drop
+    SET_NORMAL_COOLDOWN_FRAMES = 150        # 1.5s — gentle steady-state cadence
+    INEFFECTIVE_SET_THRESHOLD = 3           # ignored presses → escape
+    SET_ESCAPE_HOLD_FRAMES = 150            # 1.5s continuous-frame held SET
+    SET_ESCAPE_MAX_DELTA_MS = 3.0 * MPH_TO_MS
+    SET_ESCAPE_BACKOFF_FRAMES = 500         # 5s between escape attempts
+
+    # SET-escape window state
+    in_set_escape = frame < self._set_escape_until_frame
+    if in_set_escape:
+      # Hard-cap: abort if cluster moved DOWN by 3mph since escape start
+      if self._set_escape_start_cluster - observed_set_speed >= SET_ESCAPE_MAX_DELTA_MS:
+        self._set_escape_until_frame = -10000
+        in_set_escape = False
+
+    # iter12: keep BURST_COPIES default (=2) for reliability — Hyundai SCC
+    # drops single-frame buttons. iter11's burst=1 was removed.
+    effective_burst = BURST_COPIES
 
     # iter11 Fix D: ineffective-RES watchdog escape. When in escape window,
     # send continuous-frame RES (every tick) instead of discrete bursts.
@@ -1026,17 +1050,76 @@ class EVLimiter:
         self._res_escape_until_frame = -10000
         in_res_escape = False
 
+    # iter12 Fix F (rev): mode-gated emission. Per gpt-5.5 v1 review (I4):
+    # BRAKE/DECEL/STANDSTILL_HOLD modes suppress BOTH SET and RES.
+    # GAS_CATCHUP suppresses SET (driver wants UP, never SLOW), allows RES
+    # (rate-capped, capped at vEgo+headroom — see iter10 GAS_CATCHUP rationale).
+    mode_blocks_set = (governor_mode in (GOVERNOR_MODE_BRAKE, GOVERNOR_MODE_DECEL,
+                                          GOVERNOR_MODE_STANDSTILL, GOVERNOR_MODE_GAS_CATCHUP))
+    mode_blocks_res = (governor_mode in (GOVERNOR_MODE_BRAKE, GOVERNOR_MODE_DECEL,
+                                          GOVERNOR_MODE_STANDSTILL))
+    if mode_blocks_set:
+      want_set = False
+    if mode_blocks_res:
+      want_res = False
+
     button = Buttons.NONE
-    if want_set and (frame - self.last_set_frame) >= (
-        SET_COOLDOWN_HIGHWAY_FRAMES if is_highway else set_cooldown_frames):
-      if self._consume_global_rate_limit(frame, 1, limit=rate_limit):
-        button = Buttons.SET_DECEL
-        self.current_burst_count = effective_burst
-    elif in_res_escape:
+
+    # iter12 Fix F (rev): SET-escape window first (continuous-frame held SET)
+    if want_set and in_set_escape:
+      button = Buttons.SET_DECEL
+      # Don't update last_set_frame inside escape window — escape is "one held press"
+    elif want_set:
+      # iter12 ack-driven SET: check if last SET produced cluster movement
+      elapsed = frame - self.last_set_frame
+      min_cooldown = -1   # default: don't fire (overridden in branches below)
+      if self.last_set_frame > 0 and self._cluster_at_last_set > 0:
+        cluster_drop = self._cluster_at_last_set - observed_set_speed
+        if cluster_drop >= 1.0 * MPH_TO_MS:
+          # SET worked — reset ineffective counter
+          self._ineffective_set_press_count = 0
+          min_cooldown = SET_MIN_REPEAT_FRAMES   # 0.5s — fast progressive
+        elif elapsed >= SET_RESPONSE_TIMEOUT_FRAMES:
+          # Timeout: SET ineffective
+          self._ineffective_set_press_count += 1
+          if (self._ineffective_set_press_count >= INEFFECTIVE_SET_THRESHOLD
+              and (frame - self._last_set_escape_attempt) > SET_ESCAPE_BACKOFF_FRAMES):
+            # Trigger SET-escape
+            self._set_escape_until_frame = frame + SET_ESCAPE_HOLD_FRAMES
+            self._set_escape_start_cluster = observed_set_speed
+            self._last_set_escape_attempt = frame
+            self._ineffective_set_events += 1
+            self._ineffective_set_press_count = 0
+            button = Buttons.SET_DECEL   # fire first frame of escape
+            self.last_set_frame = frame
+            self._cluster_at_last_set = observed_set_speed
+          else:
+            # Still try normal SET, but with normal cooldown
+            min_cooldown = SET_NORMAL_COOLDOWN_FRAMES
+        else:
+          # Still waiting for response — suppress
+          min_cooldown = -1   # signals "don't fire"
+      else:
+        min_cooldown = SET_NORMAL_COOLDOWN_FRAMES   # first SET ever, no ack history
+
+      # Power-aware cooldown
+      if min_cooldown != -1 and power_too_high:
+        min_cooldown = SET_MIN_REPEAT_FRAMES   # fast escape from real ICE risk
+
+      if button == Buttons.NONE and min_cooldown >= 0 and elapsed >= min_cooldown:
+        if self._consume_global_rate_limit(frame, 1, limit=rate_limit):
+          button = Buttons.SET_DECEL
+          # iter12: SOLE site that updates last_set_frame + cluster anchor
+          self.last_set_frame = frame
+          self._cluster_at_last_set = observed_set_speed
+          self.current_burst_count = effective_burst
+
+    # RES-escape window
+    if button == Buttons.NONE and in_res_escape:
       # Continuous-frame RES during escape (no cooldown)
       button = Buttons.RES_ACCEL
       self.current_burst_count = 1
-    elif want_res and (frame - self.last_res_frame) >= RES_COOLDOWN_FRAMES:
+    elif button == Buttons.NONE and want_res and (frame - self.last_res_frame) >= RES_COOLDOWN_FRAMES:
       if self._consume_global_rate_limit(frame, 1):
         button = Buttons.RES_ACCEL
         # iter11 Fix D: track RES sequence for ineffective-button detection
