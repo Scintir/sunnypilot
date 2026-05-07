@@ -199,3 +199,25 @@ class CarStateSP:
   abasisFiltered: float = auto_field()
   aEgoFiltered: float = auto_field()
   evLimiterRecentTransitions: str = auto_field()
+
+  # iter13 v4 telemetry — must lockstep with cereal/custom.capnp CarStateSP @23-@40.
+  # Capnp enums (EvLimiterBlockReason) serialize as integer ordinals on the dataclass
+  # side; CarController sets these via cereal-published message.
+  evLimiterLastBlockReason: int = auto_field()
+  evModeParamReadOk: bool = auto_field()
+  evLimiterSetRequested: int = auto_field()
+  evLimiterSetEmitted: int = auto_field()
+  evLimiterSetDropped: int = auto_field()
+  evLimiterSetClusterDecrementAcked: int = auto_field()
+  evLimiterSetNoAckEvents: int = auto_field()
+  evLimiterStandstillEntered: int = auto_field()
+  evLimiterStandstillExitedByAchieved: int = auto_field()
+  evLimiterStandstillExitedByNoAckBackoff: int = auto_field()
+  evLimiterStandstillSetRequested: int = auto_field()
+  evLimiterStandstillSetEmitted: int = auto_field()
+  evLimiterStandstillSetDropped: int = auto_field()
+  evLimiterSuspectedSccCancelEvents: int = auto_field()
+  evLimiterFaultInhibitActive: bool = auto_field()
+  evLimiterFaultInhibitReason: int = auto_field()
+  evLimiterAllBtnEmitted: int = auto_field()
+  evLimiterCarControllerLimiterTickRate: int = auto_field()

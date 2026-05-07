@@ -625,22 +625,34 @@ class TestDecelFastCadence(unittest.TestCase):
     self.assertEqual(btn2, Buttons.NONE,
                      "iter12: 12Hz rate-limit override removed; ack-driven applies")
 
-  def test_standstill_pulse_cap_lowered_to_10(self):
-    """iter8: STANDSTILL_SET_PULSE_CAP reduced 30 → 10."""
-    self.assertEqual(STANDSTILL_SET_PULSE_CAP, 10)
+  def test_standstill_pulse_cap_iter13_initial_10(self):
+    """iter13 v4 Section E: PRELAUNCH_SET pulse cap starts at 10
+    (STANDSTILL_PULSE_CAP_INITIAL); raises to 30 after first cluster_decrement_acked.
+
+    Without an ACK feedback (constant cluster), only the initial cap of 10
+    fires. The legacy STANDSTILL_SET_PULSE_CAP=10 constant remains for
+    backwards-compat with the old standstill emission path; iter13's new
+    PRELAUNCH_SET path uses STANDSTILL_PULSE_CAP_INITIAL/AFTER_ACK.
+    """
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import (
+      STANDSTILL_PULSE_CAP_INITIAL, STANDSTILL_PULSE_CAP_AFTER_ACK,
+    )
+    self.assertEqual(STANDSTILL_PULSE_CAP_INITIAL, 10)
+    self.assertEqual(STANDSTILL_PULSE_CAP_AFTER_ACK, 30)
     lim = _make_limiter()
     for f in range(0, 25):
       _step(lim, f, cc_enabled=False, vEgo=0.0, observed_mph=80.0)
     _step(lim, 25, cc_enabled=True, vEgo=0.0, observed_mph=80.0,
           button=ButtonType.accelCruise)
     set_count = 0
-    for f in range(26, 26 + 50 * STANDSTILL_SET_PULSE_CAP):
+    # Run for long enough that even the AFTER_ACK cap (30) would be hit if active.
+    for f in range(26, 26 + 60 * STANDSTILL_PULSE_CAP_AFTER_ACK):
       btn, _ = _step(lim, f, cc_enabled=True, vEgo=0.0, observed_mph=80.0)
       if btn == Buttons.SET_DECEL:
         set_count += 1
-    self.assertLessEqual(set_count, STANDSTILL_SET_PULSE_CAP)
-    # Also make sure we hit the cap (not under-firing)
-    self.assertGreaterEqual(set_count, STANDSTILL_SET_PULSE_CAP - 1)
+    # No cluster decrement → no ACK → cap stays at INITIAL=10.
+    self.assertLessEqual(set_count, STANDSTILL_PULSE_CAP_INITIAL,
+                          f"no-ack pulse cap is INITIAL=10; got {set_count}")
 
 
 class TestIter9PowerPriority(unittest.TestCase):
@@ -1364,14 +1376,18 @@ class TestIter11Fixes(unittest.TestCase):
                     "Escape aborts when cluster moved 3 mph")
 
   # --- Bug E: power estimator ---
-  def test_assume_ev_only_defaults_true_when_param_absent(self):
-    """When EvLimiterAssumeEvOnly param missing, default to true."""
+  def test_assume_ev_only_defaults_false_when_param_absent_iter13(self):
+    """iter13 v4 (gpt-5.5 round-2 mandate): default fail-CLOSED to False when
+    Params absent or read fails. Was True in iter11 (fail-open); changed in iter13
+    because silently enabling the EV-only assumption on a plumbing failure was the
+    same class of silent behavior that hurt iter9/iter11/iter12."""
     from opendbc.sunnypilot.car.hyundai.carstate_ext import CarStateExt
     cp = FakeCP(); cp_sp = FakeCPSP()
     ext = CarStateExt(cp, cp_sp)
-    # If Params not available or returns None, default true
-    self.assertTrue(ext._assume_ev_only,
-                    "EvLimiterAssumeEvOnly defaults to true when absent")
+    self.assertFalse(ext._assume_ev_only,
+                     "iter13 v4: EvLimiterAssumeEvOnly defaults to False (fail-closed) when absent")
+    self.assertFalse(ext._assume_ev_only_param_read_ok,
+                     "iter13 v4: param_read_ok=False when card.py hasn't yet written the attribute")
 
   def test_power_capped_when_assume_ev_only_true(self):
     """When _assume_ev_only=True, power capped at _ev_motor_cap_w."""
@@ -1413,10 +1429,15 @@ class TestIter11Fixes(unittest.TestCase):
     self.assertEqual(btn2, Buttons.SET_DECEL,
                      "After 0.6s + cluster ack, next SET allowed")
 
-  def test_iter12_burst_copies_default_on_highway(self):
-    """iter12: highway burst restored to BURST_COPIES (=2) for SCC reliability.
-    iter11's burst=1 caused dropped frames."""
-    from opendbc.sunnypilot.car.hyundai.ev_limiter import BURST_COPIES
+  def test_iter13_burst_copies_set_is_1(self):
+    """iter13 v4 (R4-MF6): BURST_COPIES_SET reduced 2 → 1 for first rollout.
+
+    The CarController-side ClusterButtonRateLimiter is now the authoritative
+    wire-safety guard, with a sliding 100ms all-button window of 1. With
+    BURST_COPIES_SET=2, the second copy would always be dropped at the wire
+    layer with `rateLimitSameFrame` or `rateLimitAll100ms` anyway. Reducing
+    EVLimiter-side burst to 1 keeps the layers consistent and avoids
+    confusing "set_dropped" telemetry on otherwise-accepted SETs."""
     lim = _make_limiter()
     lim.was_cc_enabled = True
     lim._engaged_at_frame = -1000
@@ -1425,8 +1446,8 @@ class TestIter11Fixes(unittest.TestCase):
     btn, _ = _step(lim, 100, cc_enabled=True, vEgo=33.0, observed_mph=80.0,
                    est_power_w=50_000.0, abasis=0.5)
     self.assertEqual(btn, Buttons.SET_DECEL)
-    self.assertEqual(lim.current_burst_count, BURST_COPIES,
-                     f"iter12: burst=BURST_COPIES ({BURST_COPIES}), not 1")
+    self.assertEqual(lim.current_burst_count, 1,
+                     "iter13 v4: BURST_COPIES_SET=1 (R4-MF6)")
 
 
 class TestIter12Fixes(unittest.TestCase):
@@ -1517,20 +1538,269 @@ class TestIter12Fixes(unittest.TestCase):
     self.assertEqual(btn2, Buttons.SET_DECEL,
                      "Power-high + ack: fire at 0.5s (not 1.5s normal cadence)")
 
-  def test_iter12_ineffective_set_escape_triggers(self):
-    """Symmetric to iter11 Fix D RES escape: after 3 SET presses with no
-    cluster drop within timeout, enter held-SET escape window."""
-    lim = self._engaged(vEgo=33.0, target_mph=75.0)
-    lim.user_target_speed = 75.0 * MPH_TO_MS
-    # Simulate hostile SCC: SET fires repeatedly but cluster never drops
-    f = 100
-    for _ in range(5):
-      _step(lim, f, cc_enabled=True, vEgo=33.0, observed_mph=82.0,
-            est_power_w=10_000.0, abasis=0.0)
-      f += 200   # 2.0s = SET_RESPONSE_TIMEOUT_FRAMES (each press times out as ineffective)
-    # By now ineffective_set escape should have triggered
-    self.assertGreater(lim._ineffective_set_events, 0,
-                       "After 3+ ineffective SETs, escape triggers")
+  # iter13 v4: REMOVED test_iter12_ineffective_set_escape_triggers.
+  # Rationale: iter12's continuous-frame SET escape was the cause of 3
+  # SCC auto-cancels on drive 17 (route 00000077--336f3cb0c9). iter13 v4
+  # removes the escape mode entirely; new tests below assert the
+  # replacement ack-paced behavior + adaptive backoff (R4-MF1).
+
+
+# ========================================================================
+# iter13 v4 — new tests
+# ========================================================================
+
+class TestIter13V4States(unittest.TestCase):
+  """iter13 v4 state-enum renumbering: STANDSTILL_PRELAUNCH_SET inserted at @2."""
+
+  def test_state_renumbering(self):
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import (
+        STATE_IDLE, STATE_STANDSTILL_HOLD, STATE_STANDSTILL_PRELAUNCH_SET,
+        STATE_SOFT_CAP_ACTIVE, STATE_RECOVERY_ACTIVE,
+        STATE_DRIVER_OVERRIDE_SET, STATE_DRIVER_OVERRIDE_RES,
+        STATE_BUS_FAULT_HOLD, STATE_DISABLED,
+    )
+    self.assertEqual(STATE_IDLE, 0)
+    self.assertEqual(STATE_STANDSTILL_HOLD, 1)
+    self.assertEqual(STATE_STANDSTILL_PRELAUNCH_SET, 2)
+    self.assertEqual(STATE_SOFT_CAP_ACTIVE, 3)
+    self.assertEqual(STATE_RECOVERY_ACTIVE, 4)
+    self.assertEqual(STATE_DRIVER_OVERRIDE_SET, 5)
+    self.assertEqual(STATE_DRIVER_OVERRIDE_RES, 6)
+    self.assertEqual(STATE_BUS_FAULT_HOLD, 7)
+    self.assertEqual(STATE_DISABLED, 8)
+
+
+class TestIter13V4Allowlist(unittest.TestCase):
+  """R4-MF4: EVLimiter `_desired_button` runtime guard (raise, not assert).
+
+  Production may run `python -O` which strips assertions. Use raise to ensure
+  the guard cannot be optimized out.
+  """
+
+  def _lim(self):
+    return _make_limiter()
+
+  def test_evlimiter_desired_button_assertion_rejects_cancel(self):
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import EVLimiterError
+    lim = self._lim()
+    with self.assertRaises(EVLimiterError):
+      lim._set_desired_button(Buttons.CANCEL)
+
+  def test_evlimiter_desired_button_assertion_rejects_gap(self):
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import EVLimiterError
+    lim = self._lim()
+    with self.assertRaises(EVLimiterError):
+      lim._set_desired_button(Buttons.GAP_DIST)
+
+  def test_evlimiter_desired_button_assertion_accepts_none_set_res(self):
+    lim = self._lim()
+    lim._set_desired_button(None)
+    self.assertIsNone(lim._desired_button)
+    lim._set_desired_button(Buttons.SET_DECEL)
+    self.assertEqual(lim._desired_button, Buttons.SET_DECEL)
+    lim._set_desired_button(Buttons.RES_ACCEL)
+    self.assertEqual(lim._desired_button, Buttons.RES_ACCEL)
+
+
+class TestIter13V4AckMatcher(unittest.TestCase):
+  """R4-MF3 + MF5: ACK matcher post-emission, 1-to-1, 500ms inclusive.
+
+  Critical invariants verified:
+    - Pre-emission decrements never count (test_set_acked_excludes_pre_emission_decrements)
+    - Driver-button-induced decrements excluded (test_set_acked_excludes_decrement_caused_by_driver_button)
+    - Dropped SETs never registered (test_set_acked_excludes_dropped_set_registration)
+    - 1-to-1 oldest-first matching
+  """
+
+  def _lim(self):
+    lim = _make_limiter()
+    lim._cluster_prev_for_ack_ms = 50.0 * MPH_TO_MS
+    return lim
+
+  def test_note_set_emitted_appends_frame(self):
+    lim = self._lim()
+    lim.note_set_emitted(100)
+    self.assertEqual(list(lim._unmatched_emitted_set_frames), [100])
+
+  def test_set_acked_one_to_one_mapping_oldest_first(self):
+    """Two emitted SETs, one cluster decrement → only the OLDEST consumed."""
+    lim = self._lim()
+    lim.note_set_emitted(100)
+    lim.note_set_emitted(120)
+    # decrement at f=140
+    lim._cluster_prev_for_ack_ms = 50.0 * MPH_TO_MS
+    acked = lim.try_ack_set(48.0 * MPH_TO_MS, 140, physical_button_in_window=False)
+    self.assertTrue(acked)
+    self.assertEqual(list(lim._unmatched_emitted_set_frames), [120])
+    self.assertEqual(lim._cluster_decrement_acked, 1)
+
+  def test_set_acked_excludes_pre_emission_decrements(self):
+    """Decrement BEFORE any SET emission does NOT count."""
+    lim = self._lim()
+    # No emissions yet
+    acked = lim.try_ack_set(48.0 * MPH_TO_MS, 50, physical_button_in_window=False)
+    self.assertFalse(acked)
+    self.assertEqual(lim._cluster_decrement_acked, 0)
+
+  def test_set_acked_excludes_decrement_caused_by_driver_button(self):
+    """Cluster decrement when a physical driver button was active does NOT credit."""
+    lim = self._lim()
+    lim.note_set_emitted(100)
+    acked = lim.try_ack_set(48.0 * MPH_TO_MS, 130, physical_button_in_window=True)
+    self.assertFalse(acked)
+    self.assertEqual(lim._cluster_decrement_acked, 0)
+    # Frame still in deque (not consumed)
+    self.assertEqual(list(lim._unmatched_emitted_set_frames), [100])
+
+  def test_set_acked_excludes_dropped_set_registration(self):
+    """R4-MF3: dropped SETs never enter the ACK matcher.
+
+    EVLimiter exposes `note_set_emitted(frame)` only — there is no
+    `note_set_dropped` method. CarController calls note_set_emitted ONLY
+    after maybe_emit() returns SET (i.e., after rate-limit acceptance).
+    This test verifies the API contract by inspection.
+    """
+    lim = self._lim()
+    # If CarController correctly calls only on accepted, the deque only
+    # receives accepted frames. We assert that without explicit register,
+    # nothing accumulates.
+    lim.try_ack_set(48.0 * MPH_TO_MS, 130, physical_button_in_window=False)
+    self.assertEqual(list(lim._unmatched_emitted_set_frames), [])
+
+  def test_set_acked_window_500ms_inclusive(self):
+    """ACK window = 50 frames inclusive. f+50 should still credit; f+51 expires."""
+    lim = self._lim()
+    lim.note_set_emitted(100)
+    # f=150 is exactly 50 frames after — within inclusive window
+    lim._cluster_prev_for_ack_ms = 50.0 * MPH_TO_MS
+    acked = lim.try_ack_set(48.0 * MPH_TO_MS, 150, physical_button_in_window=False)
+    self.assertTrue(acked, "frame f+50 should be inside inclusive 500ms window")
+
+  def test_note_set_emitted_purges_stale(self):
+    """Frames older than ACK_WINDOW_FRAMES are purged on each note_set_emitted."""
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import ACK_WINDOW_FRAMES
+    lim = self._lim()
+    lim.note_set_emitted(100)
+    lim.note_set_emitted(200)   # 200 - 100 = 100 > ACK_WINDOW_FRAMES (50)
+    self.assertEqual(list(lim._unmatched_emitted_set_frames), [200])
+
+
+class TestIter13V4LaunchTarget(unittest.TestCase):
+  """v4 Section C launch target formula: max(21, min(user_target, vEgo+gap))."""
+
+  def _lim(self):
+    return _make_limiter()
+
+  def test_launch_target_at_vego_zero_floors_at_21mph(self):
+    """At vEgo=0 with user_target=42mph: max(21, min(42, 0+5)) = 21."""
+    lim = self._lim()
+    target = lim._compute_launch_target_mph(42.0 * MPH_TO_MS, 0.0)
+    self.assertEqual(target, 21.0)
+
+  def test_launch_target_at_vego_15mph_with_gap_5_returns_20_floored_to_21(self):
+    """At vEgo=15: min(user, 15+5)=20, max(21, 20)=21 (floor wins)."""
+    lim = self._lim()
+    target = lim._compute_launch_target_mph(42.0 * MPH_TO_MS, 15.0 * MPH_TO_MS)
+    self.assertEqual(target, 21.0)
+
+  def test_launch_target_at_high_speed_uses_min(self):
+    """At vEgo=20: min(42, 20+5)=25, max(21, 25)=25."""
+    lim = self._lim()
+    target = lim._compute_launch_target_mph(42.0 * MPH_TO_MS, 20.0 * MPH_TO_MS)
+    self.assertEqual(target, 25.0)
+
+  def test_launch_target_clamped_by_user_target(self):
+    """If user_target=15mph (below floor), max(21, min(15, ...)) = 21."""
+    lim = self._lim()
+    target = lim._compute_launch_target_mph(15.0 * MPH_TO_MS, 0.0)
+    self.assertEqual(target, 21.0)
+
+
+class TestIter13V4PrelaunchPulseCap(unittest.TestCase):
+  """v4 Section E pulse cap 10 → 30 after first cluster_decrement_acked."""
+
+  def test_pulse_cap_initial_10(self):
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import (
+      STANDSTILL_PULSE_CAP_INITIAL, STANDSTILL_PULSE_CAP_AFTER_ACK,
+    )
+    self.assertEqual(STANDSTILL_PULSE_CAP_INITIAL, 10)
+    self.assertEqual(STANDSTILL_PULSE_CAP_AFTER_ACK, 30)
+
+  def test_pulse_cap_raises_after_first_ack(self):
+    """After try_ack_set credits one decrement, _prelaunch_set_pulse_cap → 30."""
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import (
+      STANDSTILL_PULSE_CAP_INITIAL, STANDSTILL_PULSE_CAP_AFTER_ACK,
+    )
+    lim = _make_limiter()
+    lim._was_in_prelaunch = True
+    lim._prelaunch_set_pulse_cap = STANDSTILL_PULSE_CAP_INITIAL
+    lim._cluster_prev_for_ack_ms = 50.0 * MPH_TO_MS
+    lim.note_set_emitted(100)
+    lim.try_ack_set(48.0 * MPH_TO_MS, 130, physical_button_in_window=False)
+    self.assertTrue(lim._prelaunch_first_ack_seen)
+    self.assertEqual(lim._prelaunch_set_pulse_cap, STANDSTILL_PULSE_CAP_AFTER_ACK)
+
+
+class TestIter13V4AdvisoryBlockReason(unittest.TestCase):
+  """Section D priorities 13-19 advisory dispatch (deterministic priority)."""
+
+  def test_advisory_no_action_when_set_or_res_desired(self):
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import GOVERNOR_MODE_NORMAL
+    lim = _make_limiter()
+    r = lim._compute_advisory_block_reason(
+      frame=100, governor_mode=GOVERNOR_MODE_NORMAL,
+      power_too_high=False, want_set=True, want_res=False)
+    self.assertEqual(r, "none")
+
+  def test_advisory_modeForbidden_for_brake_decel_standstill(self):
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import (
+      GOVERNOR_MODE_BRAKE, GOVERNOR_MODE_DECEL, GOVERNOR_MODE_STANDSTILL,
+    )
+    lim = _make_limiter()
+    for mode in (GOVERNOR_MODE_BRAKE, GOVERNOR_MODE_DECEL, GOVERNOR_MODE_STANDSTILL):
+      r = lim._compute_advisory_block_reason(
+        frame=100, governor_mode=mode,
+        power_too_high=False, want_set=False, want_res=False)
+      self.assertEqual(r, "modeForbidden")
+
+
+class TestIter13V4Constants(unittest.TestCase):
+  """v4 Section A constants (sanity)."""
+
+  def test_iter13_constants(self):
+    from opendbc.sunnypilot.car.hyundai.ev_limiter import (
+      ACK_WINDOW_FRAMES, SET_HARD_MIN_INTERVAL_FRAMES,
+      LAUNCH_DEADBAND_MPH, STANDSTILL_TARGET_FLOOR_MPH, ALLOWABLE_GAP_MPH,
+      STANDSTILL_NO_ACK_BACKOFF_AFTER_EMITTED, SET_NO_ACK_BACKOFF_TIER_FRAMES,
+    )
+    self.assertEqual(ACK_WINDOW_FRAMES, 50)              # 500ms @100Hz
+    self.assertEqual(SET_HARD_MIN_INTERVAL_FRAMES, 50)   # 0.5s
+    self.assertEqual(LAUNCH_DEADBAND_MPH, 2.0)
+    self.assertEqual(STANDSTILL_TARGET_FLOOR_MPH, 21.0)
+    self.assertEqual(ALLOWABLE_GAP_MPH, 5.0)
+    self.assertEqual(STANDSTILL_NO_ACK_BACKOFF_AFTER_EMITTED, 5)
+    self.assertEqual(SET_NO_ACK_BACKOFF_TIER_FRAMES, (150, 200, 300))
+
+
+class TestIter13V4Iter12EscapeRemoved(unittest.TestCase):
+  """Verify iter12 continuous-frame SET escape mode is REMOVED (R4-MF1 root cause)."""
+
+  def test_iter12_escape_fields_no_longer_drive_emission(self):
+    """The _set_escape_until_frame field is no longer referenced in the SET
+    emission path. iter13 replaces iter12's continuous-frame escape with
+    ACK-paced single-press SET + adaptive backoff."""
+    from opendbc.sunnypilot.car.hyundai import ev_limiter as ev
+    src = open(ev.__file__).read()
+    # The escape SET fire site (`button = Buttons.SET_DECEL` inside an
+    # `if want_set and in_set_escape:` branch) was removed.
+    self.assertNotIn("if want_set and in_set_escape:", src,
+                     "iter12 continuous-frame SET escape path must be removed")
+    # in_set_escape stays as a sentinel False (kept for code-path symmetry
+    # but never True). Verify the only assignment is `in_set_escape = False`.
+    import re
+    assigns = re.findall(r"in_set_escape\s*=\s*\S+", src)
+    self.assertTrue(all("False" in a or "in_set_escape = False" in a for a in assigns),
+                    f"in_set_escape should only be assigned False; got {assigns}")
 
 
 if __name__ == "__main__":

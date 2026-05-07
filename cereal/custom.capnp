@@ -433,6 +433,41 @@ struct BackupManagerSP @0xf98d843bfd7004a3 {
   }
 }
 
+# iter13 v4: block-reason enum for EV limiter button-injection diagnostics.
+# Ordinals must match BLOCK_REASON_PRIORITY order in
+# opendbc/sunnypilot/car/hyundai/car_controller_button_limiter.py.
+# Stage-1 (unconditional): @1-@19 (D2 reorder: physical state @8-@10 BEFORE latch @11)
+# Stage-2 (sliding-window rate limits): @20-@25 (sameFrame highest, then all-button, then SET-specific)
+enum EvLimiterBlockReason {
+  none @0;
+  invalidButtonRequest @1;
+  busFailsafe @2;
+  clusterInvalid @3;
+  gearNotDrive @4;
+  doorOpen @5;
+  seatbeltUnbuckled @6;
+  systemUnavailable @7;
+  brakePressed @8;
+  gasPressed @9;
+  driverButtonConflict @10;
+  sccCancelInhibit @11;
+  cruiseDisabled @12;
+  modeForbidden @13;
+  evModeAssumedFalse @14;
+  paramReadFailed @15;
+  minIntervalNotMet @16;
+  cooldownActive @17;
+  standstillNoAckBackoff @18;
+  standstillCapReached @19;
+  rateLimitSameFrame @20;
+  rateLimitAll100ms @21;
+  rateLimitAll1s @22;
+  rateLimit100ms @23;
+  rateLimit500ms @24;
+  rateLimit1s @25;
+  other @26;
+}
+
 struct CarStateSP @0xb86e6369214c01c8 {
   speedLimit @0 :Float32;
 
@@ -460,6 +495,26 @@ struct CarStateSP @0xb86e6369214c01c8 {
   abasisFiltered @20 :Float32;                    # LP-filtered abasis, forensic
   aEgoFiltered @21 :Float32;                      # LP-filtered aEgo, forensic
   evLimiterRecentTransitions @22 :Text;           # Compact log of last ~10 transitions for forensic. ≤200 chars.
+
+  # iter13 v4 telemetry additions (drive 17 SCC auto-cancel root cause + reset)
+  evLimiterLastBlockReason @23 :EvLimiterBlockReason;  # last reason a desired button was blocked at CarController limiter
+  evModeParamReadOk @24 :Bool;                          # True iff Params().get_bool("EvLimiterAssumeEvOnly") succeeded
+  evLimiterSetRequested @25 :UInt32;                    # cumulative SETs requested by EVLimiter (decision-side)
+  evLimiterSetEmitted @26 :UInt32;                      # cumulative SETs emitted onto CAN by CarController (wire-side)
+  evLimiterSetDropped @27 :UInt32;                      # cumulative SETs blocked at CarController rate limiter
+  evLimiterSetClusterDecrementAcked @28 :UInt32;        # cumulative 1-to-1 cluster-decrement ACKs after emitted SET
+  evLimiterSetNoAckEvents @29 :UInt32;                  # cumulative ≥3-emitted-without-ack sequences
+  evLimiterStandstillEntered @30 :UInt32;               # cumulative STANDSTILL_PRELAUNCH_SET state entries
+  evLimiterStandstillExitedByAchieved @31 :UInt32;      # exits because cluster reached launch_target
+  evLimiterStandstillExitedByNoAckBackoff @32 :UInt32;  # exits because of no-ack backoff
+  evLimiterStandstillSetRequested @33 :UInt32;          # standstill-slice of evLimiterSetRequested
+  evLimiterStandstillSetEmitted @34 :UInt32;            # standstill-slice of evLimiterSetEmitted
+  evLimiterStandstillSetDropped @35 :UInt32;            # standstill-slice of evLimiterSetDropped
+  evLimiterSuspectedSccCancelEvents @36 :UInt32;        # cumulative suspected limiter-induced SCC cancels
+  evLimiterFaultInhibitActive @37 :Bool;                # circuit-breaker latched (blocks all button injection)
+  evLimiterFaultInhibitReason @38 :EvLimiterBlockReason;  # reason associated with the fault inhibit
+  evLimiterAllBtnEmitted @39 :UInt32;                   # cumulative all-button (SET/RES/CANCEL/GAP) emissions
+  evLimiterCarControllerLimiterTickRate @40 :UInt8;     # diagnostic: CarController frame rate (typ. 100 Hz)
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

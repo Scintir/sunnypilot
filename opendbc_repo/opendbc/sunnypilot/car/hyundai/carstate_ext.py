@@ -129,8 +129,12 @@ class CarStateExt:
     self.grade_accel_source = 0     # iter11 Fix C: 0=NONE, 1=LEGACY, 2=KALMAN
 
     # iter11 Fix E: power estimator EV cap + saturation substitution
+    # iter13 v4: card.py is authoritative for assume_ev_only via attribute write
+    # before each update tick; initialize here to fail-closed False / not-read for
+    # the brief window between construction and the first update().
     self._ev_motor_cap_w = self._read_motor_cap_param()
     self._assume_ev_only = self._read_assume_ev_only_param()
+    self._assume_ev_only_param_read_ok = False
     self._abasis_filtered = 0.0
     self._aego_filtered = 0.0
     self._saturation_entry_frames = 0
@@ -150,13 +154,20 @@ class CarStateExt:
       return 60_000.0
 
   def _read_assume_ev_only_param(self) -> bool:
-    try:
-      from openpilot.common.params import Params
-      raw = Params().get("EvLimiterAssumeEvOnly")
-      if raw is None: return True  # absent → default true (user vehicle)
-      return raw in (b"1", b"true", b"True", "1", "true", "True")
-    except Exception:
-      return True
+    """iter13 v4: param read moved to card.py (selfdrive/car/card.py) so the
+    openpilot-side Params() reaches reliably. Drive 17 forensics: param=1 on
+    device but this returned False because Params() unreachable from opendbc
+    context. card.py now sets self.assume_ev_only as an attribute each tick;
+    this method is retained as a fallback only when card.py has not yet
+    written the attribute (e.g. during early bring-up or unit tests).
+    Default: FAIL-CLOSED False (do not silently re-enable EV cap on plumbing
+    error)."""
+    return bool(getattr(self, 'assume_ev_only', False))
+
+  def _ev_mode_param_read_ok(self) -> bool:
+    """iter13 v4 telemetry: True iff card.py successfully read the param.
+    Published as evModeParamReadOk @24."""
+    return bool(getattr(self, 'assume_ev_only_param_read_ok', False))
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -182,6 +193,12 @@ class CarStateExt:
   def update(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser], speed_conv: float) -> None:
     cp = can_parsers[Bus.pt]
     cp_cam = can_parsers[Bus.cam]
+
+    # iter13 v4 — sync param attributes from card.py (set once per tick before
+    # CI.update()). Default fail-closed False if card.py hasn't written them
+    # (early bring-up, tests, or after a plumbing failure).
+    self._assume_ev_only = bool(getattr(self, 'assume_ev_only', False))
+    self._assume_ev_only_param_read_ok = bool(getattr(self, 'assume_ev_only_param_read_ok', False))
 
     self.aBasis = cp.vl["TCS13"]["aBasis"]
 
@@ -389,6 +406,9 @@ class CarStateExt:
       ret_sp.estPowerCapped = bool(power_was_capped)
       ret_sp.estPowerSaturated = bool(self._saturation_active)
       ret_sp.evModeAssumed = bool(self._assume_ev_only)
+      # iter13 v4 — publish param-read-success flag so device telemetry
+      # distinguishes "param explicitly false" from "param read failed".
+      ret_sp.evModeParamReadOk = bool(self._assume_ev_only_param_read_ok)
       ret_sp.abasisFiltered = float(self._abasis_filtered)
       ret_sp.aEgoFiltered = float(self._aego_filtered)
 
@@ -421,7 +441,43 @@ class CarStateExt:
     ret_sp.evLimiterActive = bool(pub["active"])
     ret_sp.evLimiterSetSpeedOffset = float(pub["set_speed_offset"])
     ret_sp.evLimiterUserTargetSpeed = float(pub.get("user_target", 0.0))
-    ret_sp.evLimiterState = int(pub.get("state", 7))
+    # iter13 v4 state enum default = 8 (DISABLED) — was 7 prior to STANDSTILL_PRELAUNCH_SET
+    # being inserted at @2; see opendbc.sunnypilot.car.hyundai.ev_limiter STATE_DISABLED.
+    ret_sp.evLimiterState = int(pub.get("state", 8))
+
+    # iter13 v4 telemetry: EVLimiter decision-side and standstill counters.
+    # Wire-side counters (evLimiterSetEmitted/Dropped/AllBtnEmitted/LastBlockReason
+    # /SuspectedSccCancelEvents/FaultInhibit*) are published by CarController
+    # from the ClusterButtonRateLimiter — leave unset here (they default to 0
+    # in the dataclass).
+    ret_sp.evLimiterSetRequested = int(pub.get("set_requested", 0))
+    ret_sp.evLimiterSetClusterDecrementAcked = int(pub.get("cluster_decrement_acked", 0))
+    ret_sp.evLimiterSetNoAckEvents = int(pub.get("set_no_ack_events", 0))
+    ret_sp.evLimiterStandstillEntered = int(pub.get("standstill_entered", 0))
+    ret_sp.evLimiterStandstillExitedByAchieved = int(pub.get("standstill_exited_by_achieved", 0))
+    ret_sp.evLimiterStandstillExitedByNoAckBackoff = int(pub.get("standstill_exited_by_no_ack_backoff", 0))
+    ret_sp.evLimiterStandstillSetRequested = int(pub.get("standstill_set_requested", 0))
+
+    # iter13 v4 wire-side fields (sourced from CarController via shared state).
+    ret_sp.evLimiterSetEmitted = int(pub.get("set_emitted", 0))
+    ret_sp.evLimiterSetDropped = int(pub.get("set_dropped", 0))
+    ret_sp.evLimiterAllBtnEmitted = int(pub.get("all_btn_emitted", 0))
+    ret_sp.evLimiterStandstillSetEmitted = int(pub.get("standstill_set_emitted", 0))
+    ret_sp.evLimiterStandstillSetDropped = int(pub.get("standstill_set_dropped", 0))
+    ret_sp.evLimiterSuspectedSccCancelEvents = int(pub.get("suspected_scc_cancel_events", 0))
+    ret_sp.evLimiterFaultInhibitActive = bool(pub.get("fault_inhibit_active", False))
+    ret_sp.evLimiterCarControllerLimiterTickRate = 100  # 100Hz tick
+
+    # Block reason: enum field via ordinal lookup. CarController publishes
+    # the string; we translate to capnp enum ordinal here.
+    try:
+      from opendbc.sunnypilot.car.hyundai.car_controller_button_limiter import BLOCK_REASON_ORDINAL
+      reason_str = pub.get("last_block_reason", "none")
+      ret_sp.evLimiterLastBlockReason = int(BLOCK_REASON_ORDINAL.get(reason_str, 0))
+      fault_reason_str = pub.get("fault_inhibit_reason", "none")
+      ret_sp.evLimiterFaultInhibitReason = int(BLOCK_REASON_ORDINAL.get(fault_reason_str, 0))
+    except Exception:
+      pass
 
   def update_canfd_ext(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser],
                        speed_factor: float) -> None:

@@ -232,6 +232,21 @@ class Car:
     self.CI.CS.kalman_reject_reason = kalman_reject_reason
     self.CI.CS.grade_accel_source = grade_source
 
+    # iter13 v4 — fail-closed param plumbing for EvLimiterAssumeEvOnly.
+    # Drive 17 forensics: param=1 on device but carstate_ext returned False
+    # because the opendbc side cannot reliably reach openpilot.common.params.
+    # Read here (openpilot side, has Params access) and pass via attribute setter,
+    # mirroring grade_accel_external_ms2 plumbing above. Default is FAIL-CLOSED
+    # (False) on any exception — the EV-only assumption powers the motor cap;
+    # silently re-enabling it after a plumbing error would mask a regression.
+    try:
+      self.CI.CS.assume_ev_only = self.params.get_bool("EvLimiterAssumeEvOnly")
+      self.CI.CS.assume_ev_only_param_read_ok = True
+    except Exception as e:
+      self.CI.CS.assume_ev_only = False
+      self.CI.CS.assume_ev_only_param_read_ok = False
+      cloudlog.warning(f"EvLimiterAssumeEvOnly param read failed: {e!r}")
+
     # Update carState from CAN
     CS, CS_SP = self.CI.update(can_list)
     CS_SP = convert_to_capnp(CS_SP)

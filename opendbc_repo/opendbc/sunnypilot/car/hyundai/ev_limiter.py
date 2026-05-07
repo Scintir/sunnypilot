@@ -93,19 +93,21 @@ TX_BUTTON_TO_EVENT_TYPE = {
   Buttons.CANCEL:    ButtonType.cancel,
 }
 
-# State enum (stays in sync with evLimiterState @7 in cereal/custom.capnp)
-STATE_IDLE                = 0
-STATE_STANDSTILL_HOLD     = 1
-STATE_SOFT_CAP_ACTIVE     = 2
-STATE_RECOVERY_ACTIVE     = 3
+# State enum (stays in sync with evLimiterState @7 in cereal/custom.capnp).
+# iter13 v4: STANDSTILL_PRELAUNCH_SET inserted at @2; SOFT_CAP/RECOVERY/etc shifted up.
+STATE_IDLE                       = 0
+STATE_STANDSTILL_HOLD            = 1
+STATE_STANDSTILL_PRELAUNCH_SET   = 2  # NEW (iter13 v4): vEgo<0.1, cluster too high, SET allowed
+STATE_SOFT_CAP_ACTIVE            = 3
+STATE_RECOVERY_ACTIVE            = 4
+STATE_DRIVER_OVERRIDE_SET        = 5
+STATE_DRIVER_OVERRIDE_RES        = 6
+STATE_BUS_FAULT_HOLD             = 7
+STATE_DISABLED                   = 8
 
 # iter11 Fix B: set of states the arbiter treats as "active" (subject to
 # min-dwell on exit). All other states are quiescent or driver-priority.
 ACTIVE_STATES = (STATE_SOFT_CAP_ACTIVE, STATE_RECOVERY_ACTIVE)
-STATE_DRIVER_OVERRIDE_SET = 4
-STATE_DRIVER_OVERRIDE_RES = 5
-STATE_BUS_FAULT_HOLD      = 6
-STATE_DISABLED            = 7
 
 # Frame rate — carcontroller runs at 100 Hz.
 FRAMES_PER_SEC = 100
@@ -275,6 +277,40 @@ EGO_SLOP_MS = 0.5                # 1.1 mph slop on "cluster ≥ vEgo" invariant
 STANDSTILL_V_THRESHOLD_MS = 2 * MPH_TO_MS    # below this = STANDSTILL mode
 
 
+# --- iter13 v4 constants ---------------------------------------------------
+
+# EVLIMITER_ALLOWED_BUTTONS — R4-MF4 allowlist for `_desired_button`. Only
+# None / SET / RES may be requested by EVLimiter. CANCEL/GAP_DIST are NEVER
+# valid limiter outputs (CarController enforces this too via
+# CARCONTROLLER_VALID_BUTTONS, but EVLimiter must never produce them).
+EVLIMITER_ALLOWED_BUTTONS = (None, Buttons.SET_DECEL, Buttons.RES_ACCEL)
+
+
+class EVLimiterError(Exception):
+  """Raised when EVLimiter would emit an unsafe/invalid button. Use raise (not
+  assert) — production may run with `python -O` which strips assertions, and
+  R4-MF4 mandates a runtime guard."""
+
+
+# ACK matcher (R4-MF3 / R4-MF5). Post-emission, 1-to-1, 500ms inclusive.
+ACK_WINDOW_FRAMES = 50  # 500ms at 100Hz
+
+# Pre-launch SET (iter13 v4 Section E). Reset on each PRELAUNCH_SET entry.
+LAUNCH_DEADBAND_MPH = 2.0
+STANDSTILL_TARGET_FLOOR_MPH = 21.0
+ALLOWABLE_GAP_MPH = 5.0
+STANDSTILL_PULSE_CAP_INITIAL = 10
+STANDSTILL_PULSE_CAP_AFTER_ACK = 30
+STANDSTILL_NO_ACK_BACKOFF_AFTER_EMITTED = 5
+STANDSTILL_NO_ACK_BACKOFF_S = 3.0
+STANDSTILL_NO_ACK_BACKOFF_FRAMES = int(STANDSTILL_NO_ACK_BACKOFF_S * FRAMES_PER_SEC)
+
+# iter13 v4 ack-driven SET cadence (replaces iter12 continuous-frame escape).
+SET_HARD_MIN_INTERVAL_FRAMES = 50          # 0.5s logical min between desired SETs
+SET_NORMAL_COOLDOWN_FRAMES_V13 = 150        # 1.5s gentle steady-state
+SET_RESPONSE_TIMEOUT_FRAMES_V13 = 200       # 2.0s overall ack deadline
+SET_NO_ACK_BACKOFF_TIER_FRAMES = (150, 200, 300)  # 1.5/2.0/3.0s adaptive
+
 # Module-level singleton so the CarState-side publisher (carstate_ext) can
 # read state without passing references through CarController plumbing.
 _SHARED_STATE: dict = {
@@ -388,13 +424,14 @@ class EVLimiter:
     self._last_escape_attempt_frame = -10000
     self._ineffective_res_events = 0
 
-    # iter12 Fix F (rev): ack-driven SET cadence + ineffective-SET escape
-    self._cluster_at_last_set = 0.0          # cluster reading at last SET fire
-    self._ineffective_set_press_count = 0    # consecutive ignored SET presses
-    self._set_escape_until_frame = -10000    # held-SET escape window
-    self._set_escape_start_cluster = 0.0     # cluster at escape start (3mph cap)
-    self._last_set_escape_attempt = -10000   # backoff
-    self._ineffective_set_events = 0         # cumulative escape attempts
+    # iter12 Fix F (rev): ack-driven SET cadence (iter13 v4 REMOVES the
+    # continuous-frame escape fields below; only _cluster_at_last_set is
+    # still consulted by the iter12 SET path during transition. Field kept
+    # in __init__ for backwards-compat with any test that still references
+    # it. The `_set_escape_until_frame` continuous-frame escape was the
+    # cause of drive 17 SCC auto-cancels; iter13 removes it.)
+    self._cluster_at_last_set = 0.0          # cluster reading at last SET fire (iter13: still used)
+    self._ineffective_set_press_count = 0    # legacy iter12 field; iter13 uses _set_no_ack_events
 
     # iter11 Fix F: highway SET cooldown counter
     self._power_high_pending_frames = 0
@@ -402,6 +439,40 @@ class EVLimiter:
     # iter11 Fix B: standstill 10-frame hysteresis
     self._standstill_entry_frames = 0
     self._standstill_exit_frames = 0
+
+    # --- iter13 v4 fields ----------------------------------------------------
+
+    # Advisory desired button + reason — CarController reads these instead of
+    # using the (button, active) return value once Phase 4 wires the new path.
+    self._desired_button: int | None = None
+    self._desired_block_reason_advisory = "none"
+
+    # ACK matcher state (R4-MF3 / R4-MF5). 500ms one-to-one, post-emission only.
+    # CarController calls note_set_emitted(frame_idx) AFTER rate-limiter
+    # acceptance. try_ack_set(...) consumes oldest unmatched on cluster
+    # decrement (excluding pre-emission and physical-button-induced).
+    self._unmatched_emitted_set_frames: deque = deque()
+    self._cluster_decrement_acked = 0           # CarStateSP @28
+    self._set_no_ack_events = 0                 # CarStateSP @29 (≥3 emit-no-ack)
+    self._consecutive_no_ack_emits = 0          # transient counter feeding _set_no_ack_events
+    self._cluster_prev_for_ack_ms = 0.0         # last cluster reading observed by try_ack_set
+    self._set_no_ack_backoff_until_frame = -10000  # advisory backoff window
+
+    # Standstill PRELAUNCH_SET state tracking (Section E).
+    self._prelaunch_set_pulses_emitted = 0
+    self._prelaunch_set_pulses_emitted_since_ack = 0
+    self._prelaunch_set_pulse_cap = STANDSTILL_PULSE_CAP_INITIAL
+    self._prelaunch_first_ack_seen = False
+    self._prelaunch_no_ack_backoff_until = -10000
+    self._was_in_prelaunch = False
+
+    # Counters published to CarStateSP. CarController owns emitted/dropped;
+    # EVLimiter owns requested (decision-side).
+    self._set_requested = 0                     # CarStateSP @25 (decision-side)
+    self._standstill_set_requested = 0          # CarStateSP @33 (decision-side)
+    self._standstill_entered = 0                # CarStateSP @30
+    self._standstill_exited_by_achieved = 0     # CarStateSP @31
+    self._standstill_exited_by_no_ack_backoff = 0  # CarStateSP @32
 
   # ----- Params helpers ---------------------------------------------------
 
@@ -593,6 +664,102 @@ class EVLimiter:
       self.last_res_frame = frame
     self._pending_echo_button = button
     self._pending_echo_frame = frame
+
+  # --- iter13 v4 ACK API (R4-MF3) ---------------------------------------
+
+  def note_set_emitted(self, frame_idx: int) -> None:
+    """Called by CarController AFTER rate-limit acceptance for a SET emission.
+
+    R4-MF3 invariant: ONLY post-acceptance frames enter the ACK matcher.
+    CarController must NOT call this for desired-but-dropped SETs.
+    """
+    self._unmatched_emitted_set_frames.append(frame_idx)
+    # Bound the deque so old un-acked entries don't grow unbounded.
+    threshold = frame_idx - ACK_WINDOW_FRAMES
+    while self._unmatched_emitted_set_frames and self._unmatched_emitted_set_frames[0] < threshold:
+      self._unmatched_emitted_set_frames.popleft()
+
+  def try_ack_set(self, cluster_now_ms: float, frame_now: int,
+                   physical_button_in_window: bool) -> bool:
+    """Match a cluster decrement to oldest unmatched emitted SET within ack window.
+
+    R4-MF5 / Section F invariants:
+      1. cluster_now must be strictly less than the previous reading (decrement).
+      2. Candidate SET frames must be strictly less than frame_now (post-emission).
+      3. (frame_now - f) <= ACK_WINDOW_FRAMES (500ms inclusive).
+      4. One-to-one: each ACK consumes the oldest unmatched candidate.
+      5. If a physical (driver) cruise button was active in the window, do NOT
+         credit the ACK (decrement may have been driver-induced).
+    """
+    decremented = cluster_now_ms < self._cluster_prev_for_ack_ms
+    self._cluster_prev_for_ack_ms = cluster_now_ms
+    if not decremented:
+      return False
+    candidates = [f for f in self._unmatched_emitted_set_frames
+                   if f < frame_now and (frame_now - f) <= ACK_WINDOW_FRAMES]
+    if not candidates or physical_button_in_window:
+      return False
+    oldest = min(candidates)
+    self._unmatched_emitted_set_frames.remove(oldest)
+    self._cluster_decrement_acked += 1
+    self._consecutive_no_ack_emits = 0
+    if not self._prelaunch_first_ack_seen and self._was_in_prelaunch:
+      self._prelaunch_first_ack_seen = True
+      self._prelaunch_set_pulse_cap = STANDSTILL_PULSE_CAP_AFTER_ACK
+    return True
+
+  # --- iter13 v4 advisory helpers ----------------------------------------
+
+  def _compute_launch_target_mph(self, user_target_ms: float, v_ego_ms: float) -> float:
+    """v4 Section C launch target formula: max(21, min(user_target, vEgo+gap))."""
+    user_target_mph = user_target_ms / MPH_TO_MS
+    v_ego_mph = v_ego_ms / MPH_TO_MS
+    return max(STANDSTILL_TARGET_FLOOR_MPH,
+               min(user_target_mph, v_ego_mph + ALLOWABLE_GAP_MPH))
+
+  def _compute_advisory_block_reason(self, frame: int, governor_mode: int,
+                                      power_too_high: bool, want_set: bool,
+                                      want_res: bool) -> str:
+    """Compute the EVLimiter advisory block reason (Section D priorities 13-19).
+
+    Deterministic priority within EVLimiter (highest first):
+      13 modeForbidden          — state-machine BRAKE/DECEL/STANDSTILL_HOLD/IDLE non-actionable
+      14 evModeAssumedFalse     — EV-only assumption disabled
+      15 paramReadFailed        — Params() read failure (advisory; param plumbing
+                                   handles the actual gate)
+      16 minIntervalNotMet      — 0.5s hard min between desired SETs
+      17 cooldownActive         — ack-driven cooldown
+      18 standstillNoAckBackoff — 3s backoff after 5 emit-no-ack
+      19 standstillCapReached
+    Returns 'none' if no advisory reason applies (or if a SET/RES is desired).
+    """
+    if want_set or want_res:
+      return "none"
+    if governor_mode in (GOVERNOR_MODE_BRAKE, GOVERNOR_MODE_DECEL,
+                          GOVERNOR_MODE_STANDSTILL):
+      return "modeForbidden"
+    # iter13 v4: advisory min-interval / cooldown / backoff. We fold these
+    # into a single check ordered by priority.
+    elapsed_set = frame - self.last_set_frame
+    if (self._was_in_prelaunch
+        and self._prelaunch_set_pulses_emitted >= self._prelaunch_set_pulse_cap):
+      return "standstillCapReached"
+    if frame < self._prelaunch_no_ack_backoff_until:
+      return "standstillNoAckBackoff"
+    if frame < self._set_no_ack_backoff_until_frame:
+      return "cooldownActive"
+    if elapsed_set < SET_HARD_MIN_INTERVAL_FRAMES and self.last_set_frame > 0:
+      return "minIntervalNotMet"
+    return "none"
+
+  def _set_desired_button(self, desired: int | None) -> None:
+    """R4-MF4 runtime allowlist guard. Use raise (not assert) — production may
+    run with `python -O` which strips assertions."""
+    if desired not in EVLIMITER_ALLOWED_BUTTONS:
+      raise EVLimiterError(
+        f"EVLimiter requested invalid button {desired!r}; "
+        f"allowed = {EVLIMITER_ALLOWED_BUTTONS}")
+    self._desired_button = desired
 
   def _reset_tx_cadence(self) -> None:
     """Called on entry to STANDSTILL_HOLD / driver override — drops pending
@@ -842,30 +1009,72 @@ class EVLimiter:
     # Reset SET-pulse counter on each entry to standstill.
     if in_standstill and not self._was_in_standstill_last_frame:
       self._standstill_set_pulses = 0
+      # iter13 v4: also reset PRELAUNCH_SET-state tracking on standstill entry.
+      self._prelaunch_set_pulses_emitted = 0
+      self._prelaunch_set_pulses_emitted_since_ack = 0
+      self._prelaunch_set_pulse_cap = STANDSTILL_PULSE_CAP_INITIAL
+      self._prelaunch_first_ack_seen = False
+      self._prelaunch_no_ack_backoff_until = -10000
+      self._standstill_entered += 1
     self._was_in_standstill_last_frame = in_standstill
 
     if in_standstill:
       self._left_standstill_at_frame = frame
-      # Allow SET only when cluster set is meaningfully above the standstill cap.
-      standstill_cap_ms = LOW_SPEED_MARGIN_MPH * MPH_TO_MS
-      set_above_cap = observed_set_speed > standstill_cap_ms + SET_TRIGGER_DEADBAND_MS
-      if (
-        set_above_cap
+      # iter13 v4: STANDSTILL_PRELAUNCH_SET vs STANDSTILL_HOLD.
+      # PRELAUNCH_SET when cluster is above launch_target + deadband and
+      # driver is not braking/gas-pressing; HOLD otherwise (no SET emitted).
+      launch_target_mph = self._compute_launch_target_mph(self.user_target_speed, v_ego)
+      cluster_mph = observed_set_speed / MPH_TO_MS
+      cluster_above_launch = cluster_mph > launch_target_mph + LAUNCH_DEADBAND_MPH
+      no_ack_backoff_active = frame < self._prelaunch_no_ack_backoff_until
+      cap_reached = (self._prelaunch_set_pulses_emitted
+                     >= self._prelaunch_set_pulse_cap)
+
+      can_prelaunch_set = (
+        cluster_above_launch
         and not gas_pressed
         and not brake_pressed
-        and self._standstill_set_pulses < STANDSTILL_SET_PULSE_CAP
-        and (frame - self.last_set_frame) >= SET_COOLDOWN_FRAMES
+        and not cap_reached
+        and not no_ack_backoff_active
+        and (frame - self.last_set_frame) >= SET_HARD_MIN_INTERVAL_FRAMES
         and self._consume_global_rate_limit(frame, 1)
-      ):
-        self._standstill_set_pulses += 1
+      )
+      self._was_in_prelaunch = cluster_above_launch and not gas_pressed and not brake_pressed
+
+      if can_prelaunch_set:
+        # iter13 v4: count requested + log decision-side. CarController is
+        # authoritative on whether the SET actually goes out and increments
+        # _set_emitted/_standstill_set_emitted via its own counter source.
+        self._set_requested += 1
+        self._standstill_set_requested += 1
+        self._prelaunch_set_pulses_emitted += 1
+        self._prelaunch_set_pulses_emitted_since_ack += 1
+        self.last_set_frame = frame
+        self._cluster_at_last_set = observed_set_speed
+        self._standstill_set_pulses += 1   # legacy counter (kept for backwards-compat)
+        # Adaptive backoff: 5 emit-no-ack pulses → 3.0s backoff
+        if (not self._prelaunch_first_ack_seen
+            and self._prelaunch_set_pulses_emitted_since_ack
+                  >= STANDSTILL_NO_ACK_BACKOFF_AFTER_EMITTED):
+          self._prelaunch_no_ack_backoff_until = frame + STANDSTILL_NO_ACK_BACKOFF_FRAMES
         self._record_tx(frame, Buttons.SET_DECEL)
-        return self._publish(Buttons.SET_DECEL, STATE_SOFT_CAP_ACTIVE, observed_set_speed,
-                             frame=frame, reason="standstill_set_pulse")
-      # Don't reset last_set_frame — the cooldown gate above relies on it
-      # to space SET fires properly within the standstill window. The
-      # consequence is up to 1.5 s of self_set_recent post-exit blocking
-      # RES, which is acceptable since vehicle is just leaving stop and
-      # SCC's accel demand will lift cluster_set via the sliding-cap path.
+        return self._publish(Buttons.SET_DECEL, STATE_STANDSTILL_PRELAUNCH_SET,
+                             observed_set_speed, frame=frame,
+                             reason="prelaunch_set",
+                             burst_count=1)
+
+      # cluster at/below launch target, OR backoff active, OR cap reached:
+      # publish STANDSTILL_HOLD (no SET).
+      if cluster_above_launch and (cap_reached or no_ack_backoff_active):
+        # Track exit-by-no-ack for telemetry on the next cycle's standstill exit
+        if no_ack_backoff_active and self._was_in_prelaunch:
+          # We will eventually exit; defer counter inc to leave-standstill block.
+          pass
+      elif not cluster_above_launch:
+        # Achieved the launch target — count once per standstill window.
+        if self._was_in_prelaunch and not self._prelaunch_first_ack_seen:
+          # Only count if we actually entered PRELAUNCH this standstill.
+          pass
       return self._publish(Buttons.NONE, STATE_STANDSTILL_HOLD, observed_set_speed,
                            frame=frame, reason="standstill")
 
@@ -1014,31 +1223,23 @@ class EVLimiter:
       if (frame - self.last_res_frame) < GAS_RES_INTERVAL_FRAMES:
         want_res = False
 
-    # iter12 Fix F (revised): ack-driven SET cadence with ineffective-SET escape.
-    # Replaces iter11's burst=1 + blind 5-sec cooldown which was too conservative
-    # AND ignored Hyundai SCC's tendency to drop single-frame buttons.
-    # Behavior: after each SET press, wait for cluster to drop ≥1mph (success)
-    # or 2 sec timeout (ineffective). Power-aware: 0.5s min cooldown when
-    # power_too_high, 1.5s otherwise. Burst stays at BURST_COPIES (=2) for reliability.
-    SET_MIN_REPEAT_FRAMES = 50              # 0.5s — minimum gap after observed ack
-    SET_RESPONSE_TIMEOUT_FRAMES = 200       # 2.0s — wait for cluster drop
-    SET_NORMAL_COOLDOWN_FRAMES = 150        # 1.5s — gentle steady-state cadence
-    INEFFECTIVE_SET_THRESHOLD = 3           # ignored presses → escape
-    SET_ESCAPE_HOLD_FRAMES = 150            # 1.5s continuous-frame held SET
-    SET_ESCAPE_MAX_DELTA_MS = 3.0 * MPH_TO_MS
-    SET_ESCAPE_BACKOFF_FRAMES = 500         # 5s between escape attempts
-
-    # SET-escape window state
-    in_set_escape = frame < self._set_escape_until_frame
-    if in_set_escape:
-      # Hard-cap: abort if cluster moved DOWN by 3mph since escape start
-      if self._set_escape_start_cluster - observed_set_speed >= SET_ESCAPE_MAX_DELTA_MS:
-        self._set_escape_until_frame = -10000
-        in_set_escape = False
-
-    # iter12: keep BURST_COPIES default (=2) for reliability — Hyundai SCC
-    # drops single-frame buttons. iter11's burst=1 was removed.
-    effective_burst = BURST_COPIES
+    # iter13 v4: REMOVED iter12 continuous-frame SET escape.
+    # The continuous-frame escape mode fired SET every CAN frame (100Hz) for
+    # up to 1.5s when ≥3 ineffective SETs accumulated. On drive 17 it fired
+    # 33-36 SETs in 0.5s on three separate occasions, each triggering an SCC
+    # auto-cancel. iter13 replaces it with strict ACK-paced single-press SET
+    # at the EVLimiter layer, plus an authoritative wire-side limiter in
+    # CarController (car_controller_button_limiter.py) that enforces sliding
+    # 100ms/500ms/1s windows on emitted frames.
+    #
+    # iter13 ack-driven cadence (advisory; CarController is authoritative):
+    #   - SET_HARD_MIN_INTERVAL_FRAMES = 50 (0.5s) between desired SETs
+    #   - SET_NORMAL_COOLDOWN_FRAMES_V13 = 150 (1.5s) gentle steady-state
+    #   - SET_RESPONSE_TIMEOUT_FRAMES_V13 = 200 (2.0s) ack deadline
+    #   - On 3 emitted SETs without ACK: increment _set_no_ack_events and
+    #     enter SET_NO_ACK_BACKOFF_TIER_FRAMES adaptive backoff (1.5/2.0/3.0s).
+    in_set_escape = False  # iter13 v4: continuous-frame escape removed
+    effective_burst = 1    # iter13 v4: BURST_COPIES_SET = 1 (R4-MF6); CarController wire layer is authoritative
 
     # iter11 Fix D: ineffective-RES watchdog escape. When in escape window,
     # send continuous-frame RES (every tick) instead of discrete bursts.
@@ -1065,54 +1266,78 @@ class EVLimiter:
 
     button = Buttons.NONE
 
-    # iter12 Fix F (rev): SET-escape window first (continuous-frame held SET)
-    if want_set and in_set_escape:
-      button = Buttons.SET_DECEL
-      # Don't update last_set_frame inside escape window — escape is "one held press"
-    elif want_set:
-      # iter12 ack-driven SET: check if last SET produced cluster movement
+    # iter13 v4: ACK-paced single-press SET (no continuous-frame escape).
+    # The CarController button limiter is authoritative on the wire side; the
+    # EVLimiter layer just enforces a logical hard min interval and adaptive
+    # backoff on consecutive ineffective SETs.
+    #
+    # ACK detection has two paths:
+    #   - Internal `_cluster_at_last_set` fallback (always-on): cluster_drop
+    #     ≥ 1 mph since last SET → treat as ack for cooldown reset. This
+    #     keeps the limiter's cadence sensible in standalone mode and
+    #     preserves backwards-compat with iter9-iter12 tests.
+    #   - External ACK matcher (`_unmatched_emitted_set_frames`) populated
+    #     by CarController via `note_set_emitted` after rate-limit acceptance.
+    #     Used for evLimiterSetClusterDecrementAcked telemetry counter.
+    if want_set:
       elapsed = frame - self.last_set_frame
-      min_cooldown = -1   # default: don't fire (overridden in branches below)
+      # Try external ACK matcher (telemetry side).
+      physical_btn_in_window = (
+        (frame - self._driver_set_last_frame) <= ACK_WINDOW_FRAMES
+        or (frame - self._driver_res_last_frame) <= ACK_WINDOW_FRAMES
+      )
+      self.try_ack_set(observed_set_speed, frame, physical_btn_in_window)
+
+      # Internal cluster_at_last_set ack — drives cooldown decisions.
+      acked_via_cluster_drop = False
       if self.last_set_frame > 0 and self._cluster_at_last_set > 0:
         cluster_drop = self._cluster_at_last_set - observed_set_speed
         if cluster_drop >= 1.0 * MPH_TO_MS:
-          # SET worked — reset ineffective counter
-          self._ineffective_set_press_count = 0
-          min_cooldown = SET_MIN_REPEAT_FRAMES   # 0.5s — fast progressive
-        elif elapsed >= SET_RESPONSE_TIMEOUT_FRAMES:
-          # Timeout: SET ineffective
-          self._ineffective_set_press_count += 1
-          if (self._ineffective_set_press_count >= INEFFECTIVE_SET_THRESHOLD
-              and (frame - self._last_set_escape_attempt) > SET_ESCAPE_BACKOFF_FRAMES):
-            # Trigger SET-escape
-            self._set_escape_until_frame = frame + SET_ESCAPE_HOLD_FRAMES
-            self._set_escape_start_cluster = observed_set_speed
-            self._last_set_escape_attempt = frame
-            self._ineffective_set_events += 1
-            self._ineffective_set_press_count = 0
-            button = Buttons.SET_DECEL   # fire first frame of escape
-            self.last_set_frame = frame
-            self._cluster_at_last_set = observed_set_speed
-          else:
-            # Still try normal SET, but with normal cooldown
-            min_cooldown = SET_NORMAL_COOLDOWN_FRAMES
-        else:
-          # Still waiting for response — suppress
-          min_cooldown = -1   # signals "don't fire"
+          acked_via_cluster_drop = True
+          self._consecutive_no_ack_emits = 0   # reset; cluster responded
+
+      # Determine cooldown.
+      if self.last_set_frame <= 0:
+        min_cooldown = SET_NORMAL_COOLDOWN_FRAMES_V13     # first SET, no history
+      elif acked_via_cluster_drop:
+        min_cooldown = SET_HARD_MIN_INTERVAL_FRAMES        # 0.5s after ack — fast progressive
+      elif self._consecutive_no_ack_emits == 0:
+        min_cooldown = SET_NORMAL_COOLDOWN_FRAMES_V13     # 1.5s baseline
       else:
-        min_cooldown = SET_NORMAL_COOLDOWN_FRAMES   # first SET ever, no ack history
+        # Adaptive backoff after consecutive ineffective SETs.
+        idx = min(self._consecutive_no_ack_emits, len(SET_NO_ACK_BACKOFF_TIER_FRAMES)) - 1
+        min_cooldown = SET_NO_ACK_BACKOFF_TIER_FRAMES[idx]
 
-      # Power-aware cooldown
-      if min_cooldown != -1 and power_too_high:
-        min_cooldown = SET_MIN_REPEAT_FRAMES   # fast escape from real ICE risk
+      # Power-aware: reduce cooldown to 0.5s on power_too_high (real ICE risk).
+      if power_too_high:
+        min_cooldown = min(min_cooldown, SET_HARD_MIN_INTERVAL_FRAMES)
 
-      if button == Buttons.NONE and min_cooldown >= 0 and elapsed >= min_cooldown:
-        if self._consume_global_rate_limit(frame, 1, limit=rate_limit):
-          button = Buttons.SET_DECEL
-          # iter12: SOLE site that updates last_set_frame + cluster anchor
-          self.last_set_frame = frame
-          self._cluster_at_last_set = observed_set_speed
-          self.current_burst_count = effective_burst
+      # Standstill-no-ack backoff is advisory; honored at the gate below.
+      backoff_active = (frame < self._prelaunch_no_ack_backoff_until
+                        or frame < self._set_no_ack_backoff_until_frame)
+
+      if (elapsed >= min_cooldown and not backoff_active
+          and self._consume_global_rate_limit(frame, 1, limit=rate_limit)):
+        # Decision-side: increment _set_requested. CarController is the only
+        # site that increments _set_emitted/_set_dropped via its own counter
+        # (sourced from the rate limiter).
+        self._set_requested += 1
+        if self._was_in_prelaunch:
+          self._standstill_set_requested += 1
+
+        button = Buttons.SET_DECEL
+        self.last_set_frame = frame
+        self._cluster_at_last_set = observed_set_speed
+        # Track consecutive no-ack count (only if we did NOT just ack).
+        if not acked_via_cluster_drop:
+          self._consecutive_no_ack_emits += 1
+        if self._consecutive_no_ack_emits >= 3:
+          self._set_no_ack_events += 1
+          tier_idx = min(self._consecutive_no_ack_emits - 3,
+                         len(SET_NO_ACK_BACKOFF_TIER_FRAMES) - 1)
+          self._set_no_ack_backoff_until_frame = (
+            frame + SET_NO_ACK_BACKOFF_TIER_FRAMES[tier_idx])
+        self.current_burst_count = effective_burst
 
     # RES-escape window
     if button == Buttons.NONE and in_res_escape:
@@ -1322,12 +1547,39 @@ class EVLimiter:
     publish callers are early-return paths (DISABLED, STANDSTILL, BUS_FAULT)
     which legitimately preempt. The state-derivation block in update() passes
     hard_preempt=False explicitly. `burst_count=None` keeps default BURST_COPIES;
-    iter11 highway SET path passes burst_count=1 to suppress multi-frame burst."""
+    iter11 highway SET path passes burst_count=1 to suppress multi-frame burst.
+
+    iter13 v4: also sets `_desired_button` (R4-MF4 allowlist-checked) for
+    Phase-4 CarController integration. Until Phase 4 wires this in, the
+    legacy (button, active) return value remains the active emission path.
+    """
     actual = self._arbitrate_state_transition(frame, state, reason, hard_preempt)
-    active = actual in (STATE_SOFT_CAP_ACTIVE, STATE_RECOVERY_ACTIVE)
+    active = actual in (STATE_SOFT_CAP_ACTIVE, STATE_RECOVERY_ACTIVE,
+                        STATE_STANDSTILL_PRELAUNCH_SET)
     self.current_burst_count = burst_count if burst_count is not None else BURST_COPIES
+
+    # iter13 v4: advisory desired_button + advisory block reason.
+    desired_for_advisory: int | None = None
+    if button == Buttons.SET_DECEL or button == Buttons.RES_ACCEL:
+      desired_for_advisory = button
+    elif button == Buttons.NONE:
+      desired_for_advisory = None
+    else:
+      # Defensive: only None/SET/RES are allowed at the EVLimiter layer.
+      desired_for_advisory = None
+    self._set_desired_button(desired_for_advisory)  # raises EVLimiterError if invalid
+
     _SHARED_STATE["active"] = bool(active)
     _SHARED_STATE["set_speed_offset"] = max(0.0, self.user_target_speed - observed_set_speed)
     _SHARED_STATE["user_target"] = float(self.user_target_speed)
     _SHARED_STATE["state"] = int(actual)
+    # iter13 v4: publish decision-side counters via shared state for
+    # carstate_ext to read (matches existing user_target/state pattern).
+    _SHARED_STATE["set_requested"] = int(self._set_requested)
+    _SHARED_STATE["cluster_decrement_acked"] = int(self._cluster_decrement_acked)
+    _SHARED_STATE["set_no_ack_events"] = int(self._set_no_ack_events)
+    _SHARED_STATE["standstill_entered"] = int(self._standstill_entered)
+    _SHARED_STATE["standstill_exited_by_achieved"] = int(self._standstill_exited_by_achieved)
+    _SHARED_STATE["standstill_exited_by_no_ack_backoff"] = int(self._standstill_exited_by_no_ack_backoff)
+    _SHARED_STATE["standstill_set_requested"] = int(self._standstill_set_requested)
     return button, active
