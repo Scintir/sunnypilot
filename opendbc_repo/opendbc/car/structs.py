@@ -221,3 +221,22 @@ class CarStateSP:
   evLimiterFaultInhibitReason: int = auto_field()
   evLimiterAllBtnEmitted: int = auto_field()
   evLimiterCarControllerLimiterTickRate: int = auto_field()
+
+  # iter14 v2 telemetry — must lockstep with cereal/custom.capnp CarStateSP @41-@56.
+  # Triple-output power estimator (R1-MF3): control path uses estPowerControlW, NOT
+  # the HUD-smoothed estPowerW. estPowerInstantW is forensic-only.
+  estPowerInstantW: float = auto_field()
+  estPowerControlW: float = auto_field()
+  evLimiterPowerCappedSustainFrames: int = auto_field()
+  evLimiterPowerNearBudgetSustainFrames: int = auto_field()
+  evLimiterEstPowerRawIsFiltered: bool = auto_field()
+
+  # Transition-decision instrumentation (R1-MF1): every-frame candidate vs final state
+  # so we can diagnose why iter13's existing line-1450 transition didn't fire on episode #1.
+  evLimiterStatePriorTransition: int = auto_field()
+  evLimiterStateCandidateBeforeGuard: int = auto_field()
+  evLimiterStateAfterPowerGuard: int = auto_field()
+  evLimiterPowerGuardYieldReason: str = auto_field()
+  evLimiterPowerGuardLockoutActive: bool = auto_field()
+  evLimiterRecoveryYieldEvents: int = auto_field()
+  evLimiterRecoveryLockoutsEntered: int = auto_field()

@@ -121,6 +121,10 @@ class BlockReason:
   rateLimit500ms = "rateLimit500ms"
   rateLimit1s = "rateLimit1s"
   other = "other"
+  # iter14 v2 — power-gated RECOVERY (drive 18 t=1331-1352)
+  recoveryYieldedToSoftCap = "recoveryYieldedToSoftCap"
+  powerOverBudget = "powerOverBudget"
+  recoveryReentryLocked = "recoveryReentryLocked"
 
 
 # Maps reason string → capnp ordinal (must match cereal/custom.capnp).
@@ -152,6 +156,10 @@ BLOCK_REASON_ORDINAL = {
   BlockReason.rateLimit500ms: 24,
   BlockReason.rateLimit1s: 25,
   BlockReason.other: 26,
+  # iter14 v2
+  BlockReason.recoveryYieldedToSoftCap: 27,
+  BlockReason.powerOverBudget: 28,
+  BlockReason.recoveryReentryLocked: 29,
 }
 
 # Section D priority list. Lower index = higher priority.
@@ -182,6 +190,10 @@ BLOCK_REASON_PRIORITY = [
   BlockReason.rateLimit500ms,           # 24 (R4-MF1)
   BlockReason.rateLimit1s,              # 25
   BlockReason.other,                    # 26
+  # iter14 v2 — power-gated RECOVERY (drive 18 t=1331-1352)
+  BlockReason.recoveryYieldedToSoftCap,  # 27
+  BlockReason.powerOverBudget,           # 28
+  BlockReason.recoveryReentryLocked,     # 29
 ]
 
 

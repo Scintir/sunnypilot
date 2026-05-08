@@ -466,6 +466,10 @@ enum EvLimiterBlockReason {
   rateLimit500ms @24;
   rateLimit1s @25;
   other @26;
+  # iter14 v2 — power-gated RECOVERY block reasons (drive 18 RECOVERY-while-capped)
+  recoveryYieldedToSoftCap @27;       # state machine forced down by power guard
+  powerOverBudget @28;                # est_power_control_w >= cap (not specifically the yield itself)
+  recoveryReentryLocked @29;          # lockout active, RECOVERY re-entry blocked
 }
 
 struct CarStateSP @0xb86e6369214c01c8 {
@@ -515,6 +519,23 @@ struct CarStateSP @0xb86e6369214c01c8 {
   evLimiterFaultInhibitReason @38 :EvLimiterBlockReason;  # reason associated with the fault inhibit
   evLimiterAllBtnEmitted @39 :UInt32;                   # cumulative all-button (SET/RES/CANCEL/GAP) emissions
   evLimiterCarControllerLimiterTickRate @40 :UInt8;     # diagnostic: CarController frame rate (typ. 100 Hz)
+
+  # iter14 v2 telemetry additions (drive 18 RECOVERY-while-capped + estimator decoupling)
+  estPowerInstantW @41 :Float32;                        # truly raw, no LP, no cap — forensic / diagnosis only
+  estPowerControlW @42 :Float32;                        # short-tau LP (rise=50ms, fall=300ms), uncapped — state arbiter input
+  evLimiterPowerCappedSustainFrames @43 :UInt32;        # diagnostic counter: frames at est_power_control_w >= cap (sustained-capped trigger removed)
+  evLimiterPowerNearBudgetSustainFrames @44 :UInt32;    # debounce counter: frames at est_power_control_w >= 0.95*cap
+  evLimiterEstPowerRawIsFiltered @45 :Bool;             # = true; clarifies that estPowerRawW @9 is filtered, not raw
+
+  # iter14 v2 transition-decision instrumentation (every-frame for replay forensics).
+  # Renumbered from plan's @50-@56 to @46-@52 for capnp sequential-ordinal requirement.
+  evLimiterStatePriorTransition @46 :UInt8;             # state at start of update()
+  evLimiterStateCandidateBeforeGuard @47 :UInt8;        # what state arbiter wanted before power guard
+  evLimiterStateAfterPowerGuard @48 :UInt8;             # what the guard forced (= published evLimiterState)
+  evLimiterPowerGuardYieldReason @49 :Text;             # "none" | "immediate" | "debounced"
+  evLimiterPowerGuardLockoutActive @50 :Bool;           # softcap_from_recovery_lockout active (lockout time + headroom not satisfied)
+  evLimiterRecoveryYieldEvents @51 :UInt32;             # cumulative RECOVERY → SOFT_CAP yields by power guard
+  evLimiterRecoveryLockoutsEntered @52 :UInt32;         # cumulative frames where RECOVERY blocked by lockout
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

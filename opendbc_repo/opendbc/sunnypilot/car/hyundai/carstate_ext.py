@@ -70,6 +70,14 @@ POWER_TAU_FALL_S = 2.0                    # 2 s tau — slow decay, stable HUD
 DT_CLAMP_MIN_S = 0.001                    # safety: never let dt blow up alpha
 DT_CLAMP_MAX_S = 0.1                      # 100 ms (10x nominal)
 
+# iter14 v2 — short-tau LP for control-side power estimator (decoupled from HUD).
+# Drive 18 t=1331-1352: HUD-smoothed estPowerW (2 s fall) lagged demand drops by
+# many seconds, masking re-entry conditions for the state arbiter. Triple-output
+# pattern: estPowerInstantW (raw, no LP) for forensic; estPowerControlW (50 ms rise
+# / 300 ms fall, uncapped) for state arbiter; estPowerW (kept as iter13) for HUD.
+POWER_CONTROL_TAU_RISE_S = 0.05           # 50 ms — basically tracks instant
+POWER_CONTROL_TAU_FALL_S = 0.30           # 300 ms — fast enough to reflect demand drops
+
 # Grade dead-band (iter9). Drive #7 forensics: `(LONG_ACCEL - aEgo)` has
 # a +0.025 m/s² mean bias and p90 of +0.38, which the asymmetric LP +
 # max(raw, filtered) pipeline locked in as ~22 kW phantom grade contribution
@@ -112,6 +120,10 @@ class CarStateExt:
     # Asymmetric LP filter for published estPowerW (iter7).
     self._power_filtered_w = 0.0
     self._power_filter_initialized = False
+    # iter14 v2 — separate short-tau LP for control-side state arbiter input.
+    # NOT capped, NOT shared with HUD path. EVLimiter reads est_power_control_w.
+    self._power_control_filtered_w = 0.0
+    self._power_control_filter_initialized = False
     # iter10 (drive #8): post-filter zero detector. Drive #8 had 203k
     # frames of evLimiterGradeAccel=0.0 published while estPowerW varied
     # normally — meaning either grade_f truly stuck at 0 (ESP12 silently
@@ -370,6 +382,31 @@ class CarStateExt:
       p_road_w = road_load_power_w(v_ego)
       raw_power_w = max(0.0, p_accel_grade_w + p_road_w)
 
+      # iter14 v2 — triple-output power estimator.
+      # 1) estPowerInstantW: truly raw, no LP, no cap. Forensic / diagnosis only.
+      power_instant_w = raw_power_w
+
+      # 2) estPowerControlW: short-tau LP, uncapped. Used by EVLimiter state arbiter.
+      #    Drive 18 t=1331-1352 root cause: HUD-smoothed estPowerW (2 s fall) lagged
+      #    real demand drops by many seconds, so the existing line-1450 RECOVERY→
+      #    SOFT_CAP transition saw stale "below threshold" readings and stayed in
+      #    RECOVERY for 21.5 s while at cap. Decoupling this LP fixes that.
+      if not self._power_control_filter_initialized:
+        self._power_control_filtered_w = raw_power_w
+        self._power_control_filter_initialized = True
+      else:
+        dt = GRADE_FILTER_DT_S
+        if dt < DT_CLAMP_MIN_S:
+          dt = DT_CLAMP_MIN_S
+        elif dt > DT_CLAMP_MAX_S:
+          dt = DT_CLAMP_MAX_S
+        if raw_power_w > self._power_control_filtered_w:
+          alpha_ctl = dt / (POWER_CONTROL_TAU_RISE_S + dt)
+        else:
+          alpha_ctl = dt / (POWER_CONTROL_TAU_FALL_S + dt)
+        self._power_control_filtered_w += alpha_ctl * (raw_power_w - self._power_control_filtered_w)
+      power_control_w = self._power_control_filtered_w
+
       # Asymmetric LP for HUD smoothness + control responsiveness.
       # iter9: publish filtered only (was max(raw, filtered)) — drive #7
       # showed the max() pipeline locked in positive grade-noise transients,
@@ -414,6 +451,10 @@ class CarStateExt:
 
       ret_sp.accelDemand = abasis
       ret_sp.estPowerW = power_w_capped
+      # iter14 v2 — publish triple-output power signals (NEW @41/@42/@45).
+      ret_sp.estPowerInstantW = float(power_instant_w)
+      ret_sp.estPowerControlW = float(power_control_w)
+      ret_sp.evLimiterEstPowerRawIsFiltered = True   # clarifies @9 misleading name
       # Publish the clipped grade value — useful for HUD/debug.
       # NOTE drive #6 forensic: this field has been observed to publish 0
       # in practice while estPowerW above publishes correctly. The sequential
@@ -424,6 +465,9 @@ class CarStateExt:
       ret_sp.evLimiterKalmanRejectReason = int(getattr(self, 'kalman_reject_reason', 0))
       self.accel_demand = abasis
       self.est_power_w = power_w_capped
+      # iter14 v2 — expose control-side power signal for EVLimiter state arbiter.
+      self.est_power_control_w = power_control_w
+      self.est_power_instant_w = power_instant_w
     except KeyError as e:
       global _EV_SIGNALS_MISSING_WARNED
       if not _EV_SIGNALS_MISSING_WARNED:
@@ -467,6 +511,18 @@ class CarStateExt:
     ret_sp.evLimiterSuspectedSccCancelEvents = int(pub.get("suspected_scc_cancel_events", 0))
     ret_sp.evLimiterFaultInhibitActive = bool(pub.get("fault_inhibit_active", False))
     ret_sp.evLimiterCarControllerLimiterTickRate = 100  # 100Hz tick
+
+    # iter14 v2 — RECOVERY power-gate diagnostic counters + transition instrumentation.
+    # All fields published every frame for replay forensics (gpt-5.5 R2 answer).
+    ret_sp.evLimiterPowerCappedSustainFrames = int(pub.get("power_capped_control_sustain", 0))
+    ret_sp.evLimiterPowerNearBudgetSustainFrames = int(pub.get("power_near_budget_sustain", 0))
+    ret_sp.evLimiterStatePriorTransition = int(pub.get("state_prior_transition", 8))
+    ret_sp.evLimiterStateCandidateBeforeGuard = int(pub.get("state_candidate_before_guard", 8))
+    ret_sp.evLimiterStateAfterPowerGuard = int(pub.get("state", 8))   # = published state
+    ret_sp.evLimiterPowerGuardYieldReason = str(pub.get("power_guard_yield_reason", "none"))
+    ret_sp.evLimiterPowerGuardLockoutActive = bool(pub.get("power_guard_lockout_active", False))
+    ret_sp.evLimiterRecoveryYieldEvents = int(pub.get("recovery_yield_events", 0))
+    ret_sp.evLimiterRecoveryLockoutsEntered = int(pub.get("recovery_lockouts_entered", 0))
 
     # Block reason: enum field via ordinal lookup. CarController publishes
     # the string; we translate to capnp enum ordinal here.

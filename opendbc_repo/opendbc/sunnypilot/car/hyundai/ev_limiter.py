@@ -232,6 +232,17 @@ SOFT_CAP_EXIT_SUSTAIN_FRAMES = 200       # 2.0 s of clear before allowing exit
 RECOVERY_ENTER_SUSTAIN_FRAMES = 20       # 0.2 s of under_target
 RECOVERY_EXIT_SUSTAIN_FRAMES = 100       # 1.0 s of at-target before allowing exit
 
+# iter14 v2 (drive 18 t=1331-1352): RECOVERY-while-capped state-arbiter guard.
+# Independent of cur_state, runs after _derive_state() and before _publish() so
+# it gates actuation, not just telemetry (R1-MF1). Reads est_power_control_w
+# (short-tau LP, uncapped) — NEVER the HUD-smoothed est_power_w (R1-MF3).
+RECOVERY_POWER_NEAR_BUDGET_FRAC = 0.95         # tier-2 trigger (LOWER frac = more aggressive)
+POWER_NEAR_BUDGET_DEBOUNCE_FRAMES = 3          # 30 ms — filter single-frame IMU/aBasis spikes
+RECOVERY_AFTER_SOFTCAP_LOCKOUT_FRAMES = 200    # 2 s minimum no-RECOVERY after guard fires
+RECOVERY_REENTRY_HEADROOM_FRAC = 0.85          # power must drop to 0.85*cap for re-entry sustain
+RECOVERY_REENTRY_SUSTAIN_FRAMES = 100          # 1 s sustained at headroom
+# RECOVERY re-entry requires BOTH lockout_time_done AND headroom_done (R2-MF-B).
+
 # iter10 (drive #8) Layer 1: bounded reference governor.
 # Replaces iter9's blanket `gas_pressed` block on want_res with mode-based
 # bound computation. Prevents Event A (dwell at 21 mph) and Event B
@@ -408,6 +419,20 @@ class EVLimiter:
     self._transitions_blocked_by_sustain = 0
     self._power_too_high_recent = False   # set true on power_too_high entry, cleared on exit
     self._transition_log = deque(maxlen=10)
+
+    # iter14 v2 — RECOVERY power-gate state (drive 18 t=1331-1352 fix).
+    self._power_near_budget_sustain = 0          # debounce counter for tier-2 (>= 0.95*cap)
+    self._power_capped_control_sustain = 0       # diagnostic counter (sustained-capped trigger removed per R2-MF-A)
+    self._softcap_from_recovery_lockout_until = -1000000  # frame after which lockout time has elapsed
+    self._recovery_reentry_sustain = 0           # frames at <= 0.85*cap (headroom)
+    self._recovery_lockout_engaged = False        # True after a yield until lockout cleared (cold-start: False)
+    self._evLimiter_recovery_yield_events = 0    # cumulative yields by power guard
+    self._evLimiter_recovery_lockouts_held = 0   # cumulative frames RECOVERY blocked by lockout
+    self._softcap_entry_reason = "none"          # "recovery_power_immediate" | "recovery_power_near_budget_debounced" | "none"
+    self._power_guard_yield_reason_last = "none" # for instrumentation publish: "none" | "immediate" | "debounced"
+    self._power_guard_lockout_active_last = False
+    self._state_prior_transition_last = STATE_DISABLED   # state at start of update() (instrumentation)
+    self._state_candidate_before_guard_last = STATE_DISABLED  # what state arbiter wanted
 
     # iter11 Fix A: recovery escape (rate-limited recovery below max-deficit floor)
     self._recovery_escape_active = False
@@ -877,6 +902,8 @@ class EVLimiter:
 
   def update(self, CC, CS, frame: int) -> tuple[int, bool]:
     """Advance the limiter one tick. Return (button, active)."""
+    # iter14 v2 instrumentation: capture state at start of update() for replay forensics.
+    self._state_prior_transition_last = int(self.state)
 
     if not self.supported:
       return self._publish(Buttons.NONE, STATE_DISABLED, 0.0, frame=frame, reason="unsupported")
@@ -898,6 +925,11 @@ class EVLimiter:
     gas_pressed = bool(CS.out.gasPressed)
     standstill_flag = bool(getattr(CS.out.cruiseState, "standstill", False))
     est_power_w = float(getattr(CS, "est_power_w", 0.0))
+    # iter14 v2 (R1-MF3): control-side power signal for state arbiter — short-tau LP,
+    # uncapped. Decoupled from HUD estPowerW (2 s fall) to avoid drive 18 t=1331-1352
+    # bug where stale HUD-smoothed value masked re-entry conditions. Falls back to
+    # est_power_w if carstate_ext hasn't populated it yet (transition / unit tests).
+    est_power_control_w = float(getattr(CS, "est_power_control_w", est_power_w))
     abasis = float(getattr(CS, "accel_demand", 0.0))
     dte_raw = float(getattr(CS, "dte_raw", 0.0))
 
@@ -1017,6 +1049,14 @@ class EVLimiter:
       self._prelaunch_no_ack_backoff_until = -10000
       self._standstill_entered += 1
     self._was_in_standstill_last_frame = in_standstill
+
+    # iter14 v2 carryover (drives 18+19 forensic finding): _was_in_prelaunch flag
+    # was sticky across the standstill→moving transition, causing SOFT_CAP / IDLE /
+    # RECOVERY SET emissions while moving to be wrongly attributed to the standstill
+    # slice counter. Reset BEFORE standstill block so the in_standstill branch can
+    # set it True again if conditions hold; outside standstill it stays False.
+    if not in_standstill:
+      self._was_in_prelaunch = False
 
     if in_standstill:
       self._left_standstill_at_frame = frame
@@ -1469,6 +1509,14 @@ class EVLimiter:
     # else (STANDSTILL_HOLD, DISABLED, BUS_FAULT_HOLD): handled before this
     # block returns from earlier branches in update().
 
+    # ───────────────────────────────────────────────────────────────────
+    # iter14 v2 — RECOVERY power-gate guard (drive 18 t=1331-1352 root cause).
+    # Runs BEFORE _publish() / _arbitrate_state_transition() so guard gates
+    # actuation, not just telemetry (R1-MF1).
+    new_state = self._apply_recovery_power_guard(
+      new_state, est_power_control_w, power_threshold_w, frame
+    )
+
     # iter11 Fix B: arbiter handles _state_entered_frame mutation; remove
     # the manual update here. Pass hard_preempt=False so arbiter enforces
     # min-dwell on active-state exits.
@@ -1478,6 +1526,82 @@ class EVLimiter:
                          burst_count=effective_burst if button == Buttons.SET_DECEL else None)
 
   # ----- iter11 Fix B: centralized state arbiter --------------------------
+
+  def _apply_recovery_power_guard(self, new_state: int, est_power_control_w: float,
+                                   power_threshold_w: float, frame: int) -> int:
+    """iter14 v2 — RECOVERY power-gate guard. Runs BEFORE _publish() so it
+    gates actuation, not just telemetry (R1-MF1).
+
+    Reads est_power_control_w (short-tau LP, uncapped) — NEVER est_power_w
+    (HUD-smoothed, capped) per R1-MF3. Avoids drive 18 stale-reading bug.
+
+    Two-tier yield (R1-MF4):
+      Tier 1: power_control >= cap → immediate
+      Tier 2: power_control >= 0.95*cap for 3 frames (30 ms) → debounced
+    (Sustained-capped at 0.5 s removed in R2-MF-A; counter kept diagnostic.)
+
+    Lockout (R2-MF-B): RECOVERY blocked until BOTH 2 s minimum elapsed AND
+    power below 0.85*cap for sustained 1 s. Single conjunction governs.
+    """
+    self._state_candidate_before_guard_last = int(new_state)
+
+    power_for_arbiter = est_power_control_w
+    power_immediate_yield = power_for_arbiter >= power_threshold_w
+
+    if power_for_arbiter >= power_threshold_w * RECOVERY_POWER_NEAR_BUDGET_FRAC:
+      self._power_near_budget_sustain += 1
+    else:
+      self._power_near_budget_sustain = 0
+    power_debounced_yield = self._power_near_budget_sustain >= POWER_NEAR_BUDGET_DEBOUNCE_FRAMES
+
+    # R2-MF-A: diagnostic-only counter (sustained-capped trigger REMOVED).
+    if power_for_arbiter >= power_threshold_w:
+      self._power_capped_control_sustain += 1
+    else:
+      self._power_capped_control_sustain = 0
+
+    power_should_yield = power_immediate_yield or power_debounced_yield
+
+    # R2-MF-B: single conjunction lockout — both must be satisfied to allow RECOVERY.
+    lockout_time_done = frame >= self._softcap_from_recovery_lockout_until
+
+    if power_for_arbiter <= power_threshold_w * RECOVERY_REENTRY_HEADROOM_FRAC:
+      self._recovery_reentry_sustain += 1
+    else:
+      self._recovery_reentry_sustain = 0
+    headroom_done = self._recovery_reentry_sustain >= RECOVERY_REENTRY_SUSTAIN_FRAMES
+
+    recovery_unlocked = lockout_time_done and headroom_done
+    # Lockout flag clears once unlocked (one-shot release). On cold start, flag is
+    # False so the elif below cannot block IDLE→RECOVERY when no yield ever fired.
+    if self._recovery_lockout_engaged and recovery_unlocked:
+      self._recovery_lockout_engaged = False
+    self._power_guard_lockout_active_last = self._recovery_lockout_engaged
+    self._power_guard_yield_reason_last = "none"
+
+    if new_state == STATE_RECOVERY_ACTIVE:
+      if power_should_yield:
+        new_state = STATE_SOFT_CAP_ACTIVE
+        self._softcap_from_recovery_lockout_until = frame + RECOVERY_AFTER_SOFTCAP_LOCKOUT_FRAMES
+        self._recovery_lockout_engaged = True
+        self._softcap_entry_reason = (
+          "recovery_power_immediate" if power_immediate_yield
+          else "recovery_power_near_budget_debounced"
+        )
+        self._power_guard_yield_reason_last = (
+          "immediate" if power_immediate_yield else "debounced"
+        )
+        self._evLimiter_recovery_yield_events += 1
+        self._recovery_reentry_sustain = 0  # reset headroom clock
+      elif self._recovery_lockout_engaged and not recovery_unlocked:
+        # Lockout was engaged by a prior yield AND not yet released — block RECOVERY.
+        # Force SOFT_CAP if headroom still missing, else IDLE (lockout time only).
+        new_state = STATE_SOFT_CAP_ACTIVE if not headroom_done else STATE_IDLE
+        if not headroom_done:
+          self._evLimiter_recovery_lockouts_held += 1
+      # else: lockout cleared (or never engaged) — original RECOVERY stands
+
+    return new_state
 
   def _arbitrate_state_transition(self, frame: int, requested: int, reason: str,
                                    hard_preempt: bool = False) -> int:
@@ -1582,4 +1706,13 @@ class EVLimiter:
     _SHARED_STATE["standstill_exited_by_achieved"] = int(self._standstill_exited_by_achieved)
     _SHARED_STATE["standstill_exited_by_no_ack_backoff"] = int(self._standstill_exited_by_no_ack_backoff)
     _SHARED_STATE["standstill_set_requested"] = int(self._standstill_set_requested)
+    # iter14 v2 — RECOVERY power-gate counters + transition instrumentation.
+    _SHARED_STATE["power_near_budget_sustain"] = int(self._power_near_budget_sustain)
+    _SHARED_STATE["power_capped_control_sustain"] = int(self._power_capped_control_sustain)
+    _SHARED_STATE["power_guard_yield_reason"] = str(self._power_guard_yield_reason_last)
+    _SHARED_STATE["power_guard_lockout_active"] = bool(self._power_guard_lockout_active_last)
+    _SHARED_STATE["recovery_yield_events"] = int(self._evLimiter_recovery_yield_events)
+    _SHARED_STATE["recovery_lockouts_entered"] = int(self._evLimiter_recovery_lockouts_held)
+    _SHARED_STATE["state_prior_transition"] = int(self._state_prior_transition_last)
+    _SHARED_STATE["state_candidate_before_guard"] = int(self._state_candidate_before_guard_last)
     return button, active
