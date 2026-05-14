@@ -243,6 +243,22 @@ RECOVERY_REENTRY_HEADROOM_FRAC = 0.85          # power must drop to 0.85*cap for
 RECOVERY_REENTRY_SUSTAIN_FRAMES = 100          # 1 s sustained at headroom
 # RECOVERY re-entry requires BOTH lockout_time_done AND headroom_done (R2-MF-B).
 
+# iter15 v2 (Section C) — narrow standstill reset + state-vector telemetry.
+# Drive-A/B forensics: takeoff after long red lights felt slow. Hypothesis is
+# stale PRELAUNCH no-ack backoff and stale `_softcap_entry_reason` from a
+# prior softcap episode that the long standstill made irrelevant. R1-MF-C
+# narrowed the reset dramatically: PRESERVE sustain counters + lockout frame
+# counter; CLEAR only PRELAUNCH backoff and stale softcap reason (conditional).
+LONG_STANDSTILL_RESET_FRAMES = 500             # 5 s at 100 Hz — threshold for "long" stop
+STALE_SOFTCAP_REASON_POWER_FRAC = 0.85         # softcap reason cleared only if power<0.85*cap
+
+# iter15 v2 (Section D) — post-RES quiet period for SOFT_CAP decrement.
+# Drive A/B: after RES emit, accel command spikes briefly → est_power read
+# inflates → softcap-driven SET fires → net cruise speed loss. Suppress for 2 s
+# UNLESS power genuinely far over cap. Edge-detect events (R1-MF-D).
+POST_RES_QUIET_PERIOD_FRAMES = 200             # 2 s at 100 Hz
+POST_RES_HARD_OVERRIDE_FRAC = 1.05             # override quiet if est_power_control_w > 1.05*cap
+
 # iter10 (drive #8) Layer 1: bounded reference governor.
 # Replaces iter9's blanket `gas_pressed` block on want_res with mode-based
 # bound computation. Prevents Event A (dwell at 21 mph) and Event B
@@ -498,6 +514,39 @@ class EVLimiter:
     self._standstill_entered = 0                # CarStateSP @30
     self._standstill_exited_by_achieved = 0     # CarStateSP @31
     self._standstill_exited_by_no_ack_backoff = 0  # CarStateSP @32
+
+    # iter15 v2 (Section A) — hard-preempt guard transition flag + counters.
+    # `_guard_forced_transition_last_frame` is the per-frame published bool.
+    # `_evLimiter_guard_forced_transition_events` counts frames where guard
+    # forced transition (cumulative). `_evLimiter_recovery_yield_episodes` is
+    # edge-detected RECOVERY→SOFT_CAP episodes (R2-MF-1 strict).
+    self._guard_forced_transition_last_frame = False
+    self._evLimiter_guard_forced_transition_events = 0
+    self._evLimiter_recovery_yield_episodes = 0
+
+    # iter15 v2 (Section C) — narrow standstill reset state + state-vector
+    # telemetry. `_time_in_standstill_frames` accumulates while in_standstill,
+    # resets on exit. The exit snapshot fields are LATCHED on the transition
+    # from standstill→non-standstill so the next drive can review post-mortem.
+    self._time_in_standstill_frames = 0
+    self._evLimiter_long_standstill_resets = 0
+    self._evLimiter_long_standstill_prelaunch_backoff_cleared = 0
+    self._evLimiter_long_standstill_softcap_reason_cleared = 0
+    self._standstill_exit_state_snapshot_last = ""
+    self._standstill_exit_time_s_last = 0.0
+    self._standstill_exit_to_first_res_latency_frames = 0
+    self._standstill_exit_post_exit_active = False
+    self._standstill_exit_first_res_seen = False
+
+    # iter15 v2 (Section D) — post-RES quiet period for SOFT_CAP decrement.
+    # `_last_res_emit_frame` updated when RES_ACCEL emitted. Edge-detect via
+    # `_softcap_decrement_suppressed_last_frame` per R1-MF-D.
+    self._last_res_emit_frame = -1_000_000
+    self._softcap_decrement_suppressed_last_frame = False
+    self._evLimiter_softcap_decrement_suppressed_frames = 0
+    self._evLimiter_softcap_decrement_suppressed_events = 0
+    self._evLimiter_post_res_hard_override_events = 0
+    self._post_res_quiet_active_last = False
 
   # ----- Params helpers ---------------------------------------------------
 
@@ -1048,7 +1097,32 @@ class EVLimiter:
       self._prelaunch_first_ack_seen = False
       self._prelaunch_no_ack_backoff_until = -10000
       self._standstill_entered += 1
+      # iter15 v2 (Section C): reset time-in-standstill counter on entry.
+      self._time_in_standstill_frames = 0
+
+    # iter15 v2 (Section C): standstill-EXIT detection. When `_was_in_standstill_last_frame`
+    # was True and now `in_standstill` is False, this is the exit frame. Run narrow
+    # reset (R1-MF-C) + latch state-vector snapshot for next-drive forensics.
+    standstill_just_exited = (self._was_in_standstill_last_frame and not in_standstill)
+    if standstill_just_exited:
+      self._on_leaving_standstill(
+        frame=frame,
+        time_in_standstill_frames=self._time_in_standstill_frames,
+        est_power_control_w=est_power_control_w,
+        power_threshold_w=power_threshold_w,
+      )
+
+    # Increment time-in-standstill while still in standstill.
+    if in_standstill:
+      self._time_in_standstill_frames += 1
+
     self._was_in_standstill_last_frame = in_standstill
+
+    # iter15 v2 (Section C) post-exit RES-latency tracker. After standstill exit
+    # (set above), increment each frame until a RES_ACCEL is emitted; latch the
+    # frame count on first RES. Resets on next exit.
+    if self._standstill_exit_post_exit_active and not self._standstill_exit_first_res_seen:
+      self._standstill_exit_to_first_res_latency_frames += 1
 
     # iter14 v2 carryover (drives 18+19 forensic finding): _was_in_prelaunch flag
     # was sticky across the standstill→moving transition, causing SOFT_CAP / IDLE /
@@ -1220,6 +1294,36 @@ class EVLimiter:
       and not gas_pressed
       and not brake_pressed
     )
+
+    # iter15 v2 (Section D R1-MF-D) — post-RES quiet period for SOFT_CAP decrement.
+    # After a RES emission, accel command spikes briefly → est_power read inflates →
+    # softcap-driven SET fires → net cruise speed loss. Suppress softcap-driven
+    # SET for POST_RES_QUIET_PERIOD_FRAMES UNLESS power genuinely far over cap
+    # (est_power_control_w > POST_RES_HARD_OVERRIDE_FRAC * cap, the 1.05 frac).
+    #
+    # ONLY gates the softcap-driven SET path. Driver SET button echo, IDLE→SOFT_CAP
+    # state-entry, manual driver-override paths, etc. unaffected.
+    # Counter is edge-detected per R1-MF-D (transition from non-suppressed-last-frame
+    # to suppressed-this-frame). Frame counter is separate (forensics).
+    in_post_res_quiet = (frame - self._last_res_emit_frame) < POST_RES_QUIET_PERIOD_FRAMES
+    power_far_over_cap = est_power_control_w > power_threshold_w * POST_RES_HARD_OVERRIDE_FRAC
+    softcap_pred_now = set_too_high or power_too_high   # mirrors line ~1428 softcap_pred
+    softcap_driven_set = want_set and softcap_pred_now
+    decrement_suppressed_this_frame = (
+      softcap_driven_set and in_post_res_quiet and not power_far_over_cap
+    )
+    if decrement_suppressed_this_frame:
+      want_set = False
+      self._evLimiter_softcap_decrement_suppressed_frames += 1
+    # Edge-detect (R1-MF-D): increment only on transition non-suppressed → suppressed.
+    if decrement_suppressed_this_frame and not self._softcap_decrement_suppressed_last_frame:
+      self._evLimiter_softcap_decrement_suppressed_events += 1
+    self._softcap_decrement_suppressed_last_frame = decrement_suppressed_this_frame
+    # Informational counter: power "far over cap" overrode the quiet (would
+    # have suppressed otherwise, but power is genuinely high).
+    if softcap_driven_set and in_post_res_quiet and power_far_over_cap:
+      self._evLimiter_post_res_hard_override_events += 1
+    self._post_res_quiet_active_last = in_post_res_quiet
 
     # Up-trigger: gentle recovery toward target_set when below. Mutually
     # exclusive with want_set — never both same frame. Also explicitly
@@ -1393,6 +1497,17 @@ class EVLimiter:
           self._res_sequence_start_cluster_ms = observed_set_speed
         self._res_sequence_press_count += 1
 
+    # iter15 v2 (Section D): mark the post-RES quiet window AND latch first-RES
+    # for the standstill-exit latency metric (Section C state-vector telemetry).
+    # Do this once after both RES emit branches resolve.
+    if button == Buttons.RES_ACCEL:
+      self._last_res_emit_frame = frame
+      if self._standstill_exit_post_exit_active and not self._standstill_exit_first_res_seen:
+        self._standstill_exit_first_res_seen = True
+        # Stop the post-exit-RES-latency counter from advancing past this frame
+        # (the value at this point is the recorded latency). Field stays latched
+        # until next standstill exit resets it.
+
     # iter11 Fix D: detect ineffective RES sequence and trigger escape
     INEFFECTIVE_RES_WINDOW_FRAMES = 1000   # 10 s
     INEFFECTIVE_RES_MIN_PRESSES = 8
@@ -1513,22 +1628,131 @@ class EVLimiter:
     # iter14 v2 — RECOVERY power-gate guard (drive 18 t=1331-1352 root cause).
     # Runs BEFORE _publish() / _arbitrate_state_transition() so guard gates
     # actuation, not just telemetry (R1-MF1).
-    new_state = self._apply_recovery_power_guard(
+    #
+    # iter15 v2 (Section A R1-MF-A) — hard-preempt fix for BUG #1 from drives
+    # A+B forensics: the guard returned the right new_state, but `_publish()`
+    # internally calls `_arbitrate_state_transition()` which enforces
+    # `MIN_ACTIVE_STATE_DWELL_FRAMES=200` on active-state EXIT — silently
+    # demoting the guard's decision to a no-op for up to 2 s. iter15 fix:
+    # the guard now returns `(new_state, guard_forced_transition)` and the
+    # caller passes `hard_preempt=guard_forced_transition` so ONLY the guard's
+    # forced transition bypasses min-dwell; all other state transitions still
+    # respect dwell+sustain.
+    #
+    # `prior_published_state` (= self.state at this point) is the state at the
+    # moment of the guard call; the edge-detected RECOVERY→SOFT_CAP episode
+    # counter (R2-MF-1 strict) uses this with new_state.
+    prior_published_state = int(self.state)
+    new_state, guard_forced_transition = self._apply_recovery_power_guard(
       new_state, est_power_control_w, power_threshold_w, frame
     )
 
+    # iter15 v2 R2-MF-1 STRICT: episode counter increments ONLY when guard
+    # converted a RECOVERY-active candidate to SOFT_CAP_ACTIVE. Not on
+    # RECOVERY→IDLE (lockout-block fallback). Not on non-RECOVERY priors.
+    if (prior_published_state == STATE_RECOVERY_ACTIVE
+        and new_state == STATE_SOFT_CAP_ACTIVE
+        and guard_forced_transition):
+      self._evLimiter_recovery_yield_episodes += 1
+    # Per-frame guard_forced_transition published bool + cumulative counter.
+    self._guard_forced_transition_last_frame = bool(guard_forced_transition)
+    if guard_forced_transition:
+      self._evLimiter_guard_forced_transition_events += 1
+
     # iter11 Fix B: arbiter handles _state_entered_frame mutation; remove
-    # the manual update here. Pass hard_preempt=False so arbiter enforces
-    # min-dwell on active-state exits.
+    # the manual update here.
+    # iter15 v2 (Section A): pass hard_preempt=guard_forced_transition so the
+    # arbiter bypasses min-dwell ONLY when the guard actually changed state
+    # away from RECOVERY. Other transitions remain min-dwell-respecting.
     # iter11 Fix F: pass effective_burst (1 on highway, BURST_COPIES otherwise)
     return self._publish(button, new_state, observed_set_speed,
-                         frame=frame, reason="derived", hard_preempt=False,
+                         frame=frame, reason="derived",
+                         hard_preempt=guard_forced_transition,
                          burst_count=effective_burst if button == Buttons.SET_DECEL else None)
+
+  # ----- iter15 v2 Section C — narrow standstill reset + state-vector telemetry
+
+  def _on_leaving_standstill(self, frame: int, time_in_standstill_frames: int,
+                              est_power_control_w: float,
+                              power_threshold_w: float) -> None:
+    """iter15 v2 (Section C R1-MF-C) — narrow standstill-exit reset.
+
+    Apply only when time-in-standstill > LONG_STANDSTILL_RESET_FRAMES (5 s).
+    The reset is INTENTIONALLY NARROW per gpt-5.5 R1-MF-C / R2-MF-3:
+
+      WHAT WE CLEAR (conditional, harmful-if-stale):
+        1. `_prelaunch_no_ack_backoff_until` — if still in the future (a stale
+           backoff window from a prior PRELAUNCH episode).
+        2. `_softcap_entry_reason` — if est_power_control_w is now comfortably
+           below cap (the reason no longer reflects current conditions).
+
+      WHAT WE PRESERVE (R2-MF-3 PRESERVATION TESTS in test_iter15_standstill_windup):
+        - `_softcap_from_recovery_lockout_until` (frame counter; expires naturally)
+        - `_softcap_enter_sustain`, `_softcap_exit_sustain`
+        - `_recovery_enter_sustain`, `_recovery_exit_sustain`
+        - `_recovery_lockout_engaged`, `_recovery_reentry_sustain`
+        - `_power_near_budget_sustain`, `_power_capped_control_sustain`
+        - `_power_too_high_recent`
+
+    Always (regardless of long/short) latch the state-vector snapshot for the
+    next 1-2 drives' forensics. Short stops still publish snapshot but skip
+    the reset path.
+    """
+    # State-vector snapshot — bounded to <=200 chars per capnp Text type.
+    # Compact "/"-delimited key=value summary; readable from CarStateSP replay.
+    cur_state = int(self.state)
+    nb_remaining = max(0, self._prelaunch_no_ack_backoff_until - frame)
+    snapshot_parts = [
+      f"st={cur_state}",
+      f"sec={self._softcap_enter_sustain},{self._softcap_exit_sustain}",
+      f"rec={self._recovery_enter_sustain},{self._recovery_exit_sustain}",
+      f"nb={nb_remaining}",
+      f"lk={int(self._recovery_lockout_engaged)}",
+      f"reentry={self._recovery_reentry_sustain}",
+      f"pwr={est_power_control_w / 1000.0:.1f}kw",
+      f"cap={power_threshold_w / 1000.0:.0f}kw",
+      f"reason={self._softcap_entry_reason[:18]}",
+    ]
+    snapshot = "/".join(snapshot_parts)[:200]
+    self._standstill_exit_state_snapshot_last = snapshot
+    self._standstill_exit_time_s_last = float(time_in_standstill_frames) / float(FRAMES_PER_SEC)
+
+    # Reset the exit-to-RES latency tracker on every exit (regardless of long/short).
+    self._standstill_exit_to_first_res_latency_frames = 0
+    self._standstill_exit_post_exit_active = True
+    self._standstill_exit_first_res_seen = False
+
+    # SHORT-STOP path: telemetry only; no reset of internal state.
+    if time_in_standstill_frames <= LONG_STANDSTILL_RESET_FRAMES:
+      return
+
+    # LONG-STOP path: NARROW reset only (R1-MF-C). Increment the resets event
+    # counter only if at least one of the two conditional clears fires.
+    any_reset_fired = False
+
+    if frame < self._prelaunch_no_ack_backoff_until:
+      # Clear stale PRELAUNCH no-ack backoff window. The standstill just ended;
+      # if the backoff window extended past the standstill exit, it's stale.
+      self._prelaunch_no_ack_backoff_until = frame
+      self._evLimiter_long_standstill_prelaunch_backoff_cleared += 1
+      any_reset_fired = True
+
+    if (est_power_control_w < power_threshold_w * STALE_SOFTCAP_REASON_POWER_FRAC
+        and self._softcap_entry_reason
+        and self._softcap_entry_reason != "none"):
+      # Power is now comfortably below cap; clear the stale entry reason so
+      # future SOFT_CAP entries report current cause.
+      self._softcap_entry_reason = ""
+      self._evLimiter_long_standstill_softcap_reason_cleared += 1
+      any_reset_fired = True
+
+    if any_reset_fired:
+      self._evLimiter_long_standstill_resets += 1
 
   # ----- iter11 Fix B: centralized state arbiter --------------------------
 
   def _apply_recovery_power_guard(self, new_state: int, est_power_control_w: float,
-                                   power_threshold_w: float, frame: int) -> int:
+                                   power_threshold_w: float, frame: int) -> tuple[int, bool]:
     """iter14 v2 — RECOVERY power-gate guard. Runs BEFORE _publish() so it
     gates actuation, not just telemetry (R1-MF1).
 
@@ -1542,7 +1766,30 @@ class EVLimiter:
 
     Lockout (R2-MF-B): RECOVERY blocked until BOTH 2 s minimum elapsed AND
     power below 0.85*cap for sustained 1 s. Single conjunction governs.
+
+    iter15 v2 (Section A R1-MF-A) — RETURNS TUPLE `(new_state, guard_forced_transition)`.
+    `guard_forced_transition` is True ONLY when the guard concluded the
+    current published RECOVERY state must yield AND the resulting `new_state`
+    is non-RECOVERY (i.e., the transition genuinely leaves RECOVERY). Two
+    sources of "yield" can both set this flag:
+      (a) Guard's own RECOVERY→SOFT_CAP forcing on `power_should_yield`.
+      (b) Caller's earlier state-derivation already chose SOFT_CAP/IDLE while
+          published state was RECOVERY AND `power_should_yield` is True — in
+          which case the arbiter's min-dwell would otherwise silently block
+          the transition (iter14 BUG #1).
+    Caller passes the flag to `_publish(..., hard_preempt=guard_forced_transition)`
+    to bypass min-dwell on these guard-relevant transitions only.
     """
+    # iter15 v2 R1-MF-A — capture prior state for change-detection.
+    # `prior_candidate_state` is the state the state-derivation block chose
+    # (the function's `new_state` parameter).
+    # `prior_published_state` is the actually-published state (self.state) at
+    # this instant — needed to detect iter14 BUG #1 where state-derivation
+    # quietly chose SOFT_CAP but min-dwell silently blocked the transition.
+    prior_candidate_state = new_state
+    prior_published_state = int(self.state)
+    guard_forced_transition = False
+
     self._state_candidate_before_guard_last = int(new_state)
 
     power_for_arbiter = est_power_control_w
@@ -1601,7 +1848,21 @@ class EVLimiter:
           self._evLimiter_recovery_lockouts_held += 1
       # else: lockout cleared (or never engaged) — original RECOVERY stands
 
-    return new_state
+    # iter15 v2 R1-MF-A: guard_forced_transition = True when ANY of:
+    #   (a) guard's own RECOVERY→SOFT_CAP forcing changed `new_state` away from
+    #       `prior_candidate_state` (above branches).
+    #   (b) iter14 BUG #1 path — caller's state-derivation already chose
+    #       non-RECOVERY while published state was RECOVERY AND power_should_yield
+    #       is True. Without this, the arbiter's min-dwell silently blocks the
+    #       transition (1.31 s observed on drive A).
+    guard_changed_state = (new_state != prior_candidate_state)
+    bug1_path = (
+      prior_published_state == STATE_RECOVERY_ACTIVE
+      and new_state != STATE_RECOVERY_ACTIVE
+      and power_should_yield
+    )
+    guard_forced_transition = guard_changed_state or bug1_path
+    return new_state, guard_forced_transition
 
   def _arbitrate_state_transition(self, frame: int, requested: int, reason: str,
                                    hard_preempt: bool = False) -> int:
@@ -1715,4 +1976,19 @@ class EVLimiter:
     _SHARED_STATE["recovery_lockouts_entered"] = int(self._evLimiter_recovery_lockouts_held)
     _SHARED_STATE["state_prior_transition"] = int(self._state_prior_transition_last)
     _SHARED_STATE["state_candidate_before_guard"] = int(self._state_candidate_before_guard_last)
+    # iter15 v2 — hard-preempt fix (Section A), narrow standstill reset +
+    # state-vector telemetry (Section C), post-RES quiet period (Section D).
+    _SHARED_STATE["guard_forced_transition"] = bool(self._guard_forced_transition_last_frame)
+    _SHARED_STATE["guard_forced_transition_events"] = int(self._evLimiter_guard_forced_transition_events)
+    _SHARED_STATE["recovery_yield_episodes"] = int(self._evLimiter_recovery_yield_episodes)
+    _SHARED_STATE["long_standstill_resets"] = int(self._evLimiter_long_standstill_resets)
+    _SHARED_STATE["long_standstill_prelaunch_backoff_cleared"] = int(self._evLimiter_long_standstill_prelaunch_backoff_cleared)
+    _SHARED_STATE["long_standstill_softcap_reason_cleared"] = int(self._evLimiter_long_standstill_softcap_reason_cleared)
+    _SHARED_STATE["standstill_exit_state_snapshot"] = str(self._standstill_exit_state_snapshot_last)
+    _SHARED_STATE["standstill_exit_time_s"] = float(self._standstill_exit_time_s_last)
+    _SHARED_STATE["standstill_exit_to_first_res_latency_frames"] = int(self._standstill_exit_to_first_res_latency_frames)
+    _SHARED_STATE["post_res_quiet_active"] = bool(self._post_res_quiet_active_last)
+    _SHARED_STATE["softcap_decrement_suppressed_frames"] = int(self._evLimiter_softcap_decrement_suppressed_frames)
+    _SHARED_STATE["softcap_decrement_suppressed_events"] = int(self._evLimiter_softcap_decrement_suppressed_events)
+    _SHARED_STATE["post_res_hard_override_events"] = int(self._evLimiter_post_res_hard_override_events)
     return button, active

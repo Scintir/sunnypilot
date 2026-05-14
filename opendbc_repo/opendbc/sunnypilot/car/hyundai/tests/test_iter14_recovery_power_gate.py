@@ -59,8 +59,18 @@ def make_limiter():
 
 
 def step(lim, candidate_state, power_w, frame, cap=CAP_W):
-  """Invoke the power guard with a candidate state, control power, frame index."""
-  return lim._apply_recovery_power_guard(candidate_state, power_w, cap, frame)
+  """Invoke the power guard with a candidate state, control power, frame index.
+
+  iter15 v2: `_apply_recovery_power_guard()` now returns the tuple
+  `(new_state, guard_forced_transition)`. These iter14 tests only assert on
+  the resulting state, so we drop the second element for backwards-compat
+  with the previous int-only assertions. iter15-specific tests assert on
+  `guard_forced_transition` separately in `test_iter15_recovery_hardpreempt.py`.
+  """
+  new_state, _guard_forced = lim._apply_recovery_power_guard(
+    candidate_state, power_w, cap, frame
+  )
+  return new_state
 
 
 # ─────────────────────────────────────────────────────────────────────────

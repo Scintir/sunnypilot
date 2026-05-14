@@ -240,3 +240,37 @@ class CarStateSP:
   evLimiterPowerGuardLockoutActive: bool = auto_field()
   evLimiterRecoveryYieldEvents: int = auto_field()
   evLimiterRecoveryLockoutsEntered: int = auto_field()
+
+  # iter15 v2 telemetry — must lockstep with cereal/custom.capnp CarStateSP @53-@69.
+  # Hard-preempt fix (Section A)
+  evLimiterGuardForcedTransition: bool = auto_field()
+  evLimiterGuardForcedTransitionEvents: int = auto_field()
+
+  # Grade clamp (Section B); raw may exceed cap (R2-MF-2)
+  evLimiterGradePowerRawW: float = auto_field()
+  evLimiterGradePowerCappedFrames: int = auto_field()
+
+  # Long-standstill narrow reset (Section C)
+  evLimiterLongStandstillResets: int = auto_field()
+
+  # Post-RES quiet (Section D)
+  evLimiterPostResQuietActive: bool = auto_field()
+  evLimiterSoftcapDecrementSuppressedFrames: int = auto_field()
+  evLimiterSoftcapDecrementSuppressedEvents: int = auto_field()
+
+  # @61-@62 RESERVED for iter16 HEV CAN passive — DO NOT IMPLEMENT in iter15
+  evLimiterReservedIter16A: int = auto_field()
+  evLimiterReservedIter16B: int = auto_field()
+
+  # Edge-detected recovery yield episodes (Section A)
+  evLimiterRecoveryYieldEpisodes: int = auto_field()
+
+  # Long-standstill state vector telemetry (Section C R1-MF-C)
+  evLimiterStandstillExitStateSnapshot: str = auto_field()
+  evLimiterStandstillExitTimeS: float = auto_field()
+  evLimiterStandstillExitToFirstResLatencyFrames: int = auto_field()
+  evLimiterLongStandstillPrelaunchBackoffCleared: int = auto_field()
+  evLimiterLongStandstillSoftcapReasonCleared: int = auto_field()
+
+  # Post-RES informational override (Section D)
+  evLimiterPostResHardOverrideEvents: int = auto_field()

@@ -470,6 +470,9 @@ enum EvLimiterBlockReason {
   recoveryYieldedToSoftCap @27;       # state machine forced down by power guard
   powerOverBudget @28;                # est_power_control_w >= cap (not specifically the yield itself)
   recoveryReentryLocked @29;          # lockout active, RECOVERY re-entry blocked
+  # iter15 v2 — post-RES quiet period (Section D) + grade clamp (Section B) informational
+  softcapDecrementSuppressedPostRes @30;  # SOFT_CAP decrement blocked during RES quiet
+  gradeContributionCapped @31;            # grade power above cap (informational)
 }
 
 struct CarStateSP @0xb86e6369214c01c8 {
@@ -536,6 +539,40 @@ struct CarStateSP @0xb86e6369214c01c8 {
   evLimiterPowerGuardLockoutActive @50 :Bool;           # softcap_from_recovery_lockout active (lockout time + headroom not satisfied)
   evLimiterRecoveryYieldEvents @51 :UInt32;             # cumulative RECOVERY → SOFT_CAP yields by power guard
   evLimiterRecoveryLockoutsEntered @52 :UInt32;         # cumulative frames where RECOVERY blocked by lockout
+
+  # iter15 v2 telemetry — must lockstep with structs.py CarStateSP @53-@69.
+  # Hard-preempt fix (Section A): the guard ACTUALLY changed state away from RECOVERY this frame.
+  evLimiterGuardForcedTransition @53 :Bool;             # True iff guard forced new_state != prior_state THIS frame
+  evLimiterGuardForcedTransitionEvents @54 :UInt32;     # cumulative frames where guard forced transition
+
+  # Grade clamp (Section B): anti-overread CLAMP; raw may exceed cap (R2-MF-2)
+  evLimiterGradePowerRawW @55 :Float32;                 # pre-clamp grade contribution (raw — may exceed cap)
+  evLimiterGradePowerCappedFrames @56 :UInt32;          # frames where grade_power_raw > cap (clamp fired)
+
+  # Long-standstill narrow reset event counter (Section C)
+  evLimiterLongStandstillResets @57 :UInt32;            # narrow reset events (anything cleared)
+
+  # Post-RES quiet (Section D)
+  evLimiterPostResQuietActive @58 :Bool;                # this frame is within POST_RES_QUIET_PERIOD_FRAMES
+  evLimiterSoftcapDecrementSuppressedFrames @59 :UInt32;  # frames where softcap-driven SET decrement was suppressed
+  evLimiterSoftcapDecrementSuppressedEvents @60 :UInt32;  # edge-detected episodes (R1-MF-D)
+
+  # @61-@62 RESERVED for iter16 HEV CAN passive (do NOT use in iter15 — R2-MF-4)
+  evLimiterReservedIter16A @61 :UInt32;                 # RESERVED iter16: evLimiterRealMotorPowerW
+  evLimiterReservedIter16B @62 :UInt32;                 # RESERVED iter16: evLimiterRealMotorPowerSignalSource
+
+  # Edge-detected recovery yield episodes (Section A — supplements frame counter @51)
+  evLimiterRecoveryYieldEpisodes @63 :UInt32;           # EDGE-DETECTED RECOVERY→SOFT_CAP episodes (strict R2-MF-1)
+
+  # Long-standstill state vector telemetry (Section C R1-MF-C)
+  evLimiterStandstillExitStateSnapshot @64 :Text;       # JSON-or-delimited state vector at exit (<=200 chars)
+  evLimiterStandstillExitTimeS @65 :Float32;            # last standstill duration in seconds
+  evLimiterStandstillExitToFirstResLatencyFrames @66 :UInt32;  # post-exit count until first RES emit
+  evLimiterLongStandstillPrelaunchBackoffCleared @67 :UInt32;  # cumulative narrow-reset PRELAUNCH backoff clears
+  evLimiterLongStandstillSoftcapReasonCleared @68 :UInt32;     # cumulative narrow-reset stale softcap reason clears
+
+  # Post-RES informational override counter (Section D)
+  evLimiterPostResHardOverrideEvents @69 :UInt32;       # frames where power_far_over_cap overrode quiet
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

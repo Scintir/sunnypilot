@@ -125,6 +125,9 @@ class BlockReason:
   recoveryYieldedToSoftCap = "recoveryYieldedToSoftCap"
   powerOverBudget = "powerOverBudget"
   recoveryReentryLocked = "recoveryReentryLocked"
+  # iter15 v2 — post-RES quiet period + grade clamp informational
+  softcapDecrementSuppressedPostRes = "softcapDecrementSuppressedPostRes"
+  gradeContributionCapped = "gradeContributionCapped"
 
 
 # Maps reason string → capnp ordinal (must match cereal/custom.capnp).
@@ -160,6 +163,9 @@ BLOCK_REASON_ORDINAL = {
   BlockReason.recoveryYieldedToSoftCap: 27,
   BlockReason.powerOverBudget: 28,
   BlockReason.recoveryReentryLocked: 29,
+  # iter15 v2
+  BlockReason.softcapDecrementSuppressedPostRes: 30,
+  BlockReason.gradeContributionCapped: 31,
 }
 
 # Section D priority list. Lower index = higher priority.
@@ -194,6 +200,9 @@ BLOCK_REASON_PRIORITY = [
   BlockReason.recoveryYieldedToSoftCap,  # 27
   BlockReason.powerOverBudget,           # 28
   BlockReason.recoveryReentryLocked,     # 29
+  # iter15 v2 — post-RES quiet period + grade clamp informational
+  BlockReason.softcapDecrementSuppressedPostRes,  # 30
+  BlockReason.gradeContributionCapped,            # 31
 ]
 
 

@@ -720,23 +720,30 @@ class TestIter9GradeDeadband(unittest.TestCase):
   def setUp(self):
     from opendbc.sunnypilot.car.hyundai.carstate_ext import (
       road_load_power_w, VEHICLE_MASS_KG, GRADE_DEADBAND_MS2,
+      GRADE_CONTRIB_CAP_DEFAULT_KW,
     )
     self.road_load = road_load_power_w
     self.MASS = VEHICLE_MASS_KG
     self.DEADBAND = GRADE_DEADBAND_MS2
+    # iter15 v2: grade contribution clamp (default 10 kW).
+    self.CAP_W = GRADE_CONTRIB_CAP_DEFAULT_KW * 1000.0
 
   def _formula(self, abasis, grade_f, v_mph):
-    """Iter9 formula: subtract dead-band from grade before adding to power."""
+    """iter15 v2 formula: subtract deadband from grade, then CLAMP the grade
+    contribution at GRADE_CONTRIB_CAP_DEFAULT_KW (anti-overread). The abasis
+    term is uncapped."""
     v = v_mph * MPH_TO_MS
     abasis_pos = max(0.0, abasis)
-    grade_pos = max(0.0, grade_f - self.DEADBAND)  # iter9 dead-band
-    p_accel_grade = self.MASS * v * (abasis_pos + grade_pos)
+    grade_pos = max(0.0, grade_f - self.DEADBAND)
+    grade_power_raw = self.MASS * v * grade_pos
+    grade_power_clamped = min(grade_power_raw, self.CAP_W)
+    p_accel_grade = self.MASS * v * abasis_pos + grade_power_clamped
     p_road = self.road_load(v)
     return max(0.0, p_accel_grade + p_road)
 
   def test_deadband_value(self):
-    """Sanity check the dead-band constant."""
-    self.assertAlmostEqual(self.DEADBAND, 0.10, places=4)
+    """iter15 v2 R1-MF-B: dead-band raised 0.10 → 0.20 (filters 12 kW phantom)."""
+    self.assertAlmostEqual(self.DEADBAND, 0.20, places=4)
 
   def test_grade_below_deadband_contributes_zero(self):
     """A grade reading at the +0.025 m/s² noise mean must NOT add power."""
@@ -752,12 +759,21 @@ class TestIter9GradeDeadband(unittest.TestCase):
     self.assertAlmostEqual(pwr, pwr_no_grade, places=2)
 
   def test_grade_above_deadband_contributes_proportionally(self):
-    """A real +0.4 m/s² grade contributes (0.4 - 0.10) = 0.30 m/s² worth."""
-    pwr = self._formula(abasis=0.0, grade_f=0.4, v_mph=60.0)
-    expected_grade_extra = self.MASS * (60.0 * MPH_TO_MS) * 0.30
-    pwr_no_grade = self._formula(abasis=0.0, grade_f=0.0, v_mph=60.0)
+    """iter15 v2: a small grade well above deadband but below clamp contributes
+    proportionally. A +0.4 m/s² grade with deadband 0.20 → 0.20 effective grade
+    at low v contributes < 10 kW, so the cap doesn't fire and the formula is
+    linear. We use a low speed (15 mph) to ensure grade_power_raw < cap_w."""
+    v_mph = 15.0
+    pwr = self._formula(abasis=0.0, grade_f=0.4, v_mph=v_mph)
+    expected_grade_extra = self.MASS * (v_mph * MPH_TO_MS) * (0.4 - self.DEADBAND)
+    # Sanity: this grade contribution must be below the cap (else we're
+    # testing the clamp, not the linear region).
+    self.assertLess(expected_grade_extra, self.CAP_W,
+                    msg="Test inputs hit the clamp; lower v_mph to stay linear")
+    pwr_no_grade = self._formula(abasis=0.0, grade_f=0.0, v_mph=v_mph)
     self.assertAlmostEqual(pwr - pwr_no_grade, expected_grade_extra, places=0,
-                            msg="Grade above dead-band should contribute (grade - dead-band)")
+                            msg="Grade above dead-band (below clamp) should contribute "
+                                "(grade - dead-band) linearly")
 
 
 class TestIter10StateDwell(unittest.TestCase):

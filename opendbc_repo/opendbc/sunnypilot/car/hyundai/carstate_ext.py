@@ -78,13 +78,29 @@ DT_CLAMP_MAX_S = 0.1                      # 100 ms (10x nominal)
 POWER_CONTROL_TAU_RISE_S = 0.05           # 50 ms — basically tracks instant
 POWER_CONTROL_TAU_FALL_S = 0.30           # 300 ms — fast enough to reflect demand drops
 
-# Grade dead-band (iter9). Drive #7 forensics: `(LONG_ACCEL - aEgo)` has
-# a +0.025 m/s² mean bias and p90 of +0.38, which the asymmetric LP +
-# max(raw, filtered) pipeline locked in as ~22 kW phantom grade contribution
-# on flat highway. Subtract a 0.10 m/s² floor (≈0.6° grade) before adding
-# grade to power; sub-0.6° grades shouldn't be triggering the limiter
-# (gentle highway slopes don't push motor power into ICE territory anyway).
-GRADE_DEADBAND_MS2 = 0.10
+# Grade dead-band (iter9 → iter15).
+# iter9 history: `(LONG_ACCEL - aEgo)` had a +0.025 m/s² mean bias and p90 of
+# +0.38, which the asymmetric LP + max(raw, filtered) pipeline locked in as
+# ~22 kW phantom grade contribution on flat highway. Subtract a deadband
+# floor before adding grade to power; sub-deadband-grades shouldn't be
+# triggering the limiter (gentle highway slopes don't push motor power into
+# ICE territory anyway).
+# iter15 v2 R1-MF-B: raised 0.10 → 0.20. At 70 mph this filters out 12 kW
+# worth of phantom grade power (drives A/B forensics showed grade contribution
+# was a dominant over-read term, peaks 12-27 kW above true on flatish road).
+GRADE_DEADBAND_MS2 = 0.20
+
+# iter15 v2 — ANTI-OVERREAD CLAMP on grade contribution. This is NOT physically
+# accurate modeling of grade power — on real 5% grades, true grade power is
+# ~30 kW (m·g·grade·v: 1950·9.81·0.05·31.7 ≈ 30.3 kW). The clamp INTENTIONALLY
+# UNDERCOUNTS sustained real hills to avoid false-positive over-cap on noisy
+# grade readings (IMU pitch noise + LP transients). Trade-off: under-active
+# limiter on real long hills. Drive review on known uphill of >0.30 m/s²
+# must check that this doesn't cause ICE engagement on actual highway grades.
+# Parameterized as EvLimiterGradeContribCapKW (default 10, bounds 5-30).
+GRADE_CONTRIB_CAP_DEFAULT_KW = 10
+GRADE_CONTRIB_CAP_MIN_KW = 5
+GRADE_CONTRIB_CAP_MAX_KW = 30
 
 
 def road_load_power_w(v_ego_ms: float) -> float:
@@ -153,6 +169,15 @@ class CarStateExt:
     self._saturation_exit_frames = 0
     self._saturation_active = False
 
+    # iter15 v2 (Section B) — grade contribution anti-overread CLAMP.
+    # Fail-closed read; bounds-clamped to [5, 30] kW. Read once at construction;
+    # changes require restart (matches EvLimiterMotorCapKW behavior).
+    self._grade_contrib_cap_w = self._read_grade_contrib_cap_param()
+    # Diagnostic: cumulative frames where grade_power_raw exceeded the cap.
+    self._grade_power_capped_frames = 0
+    # Last frame's raw (pre-clamp) grade power, published every frame for forensics.
+    self._grade_power_raw_w_last = 0.0
+
   # iter11 Fix E: param loaders. Use raw .get() (returns None on absent)
   # so we can default to True/sensible-default when param missing.
   def _read_motor_cap_param(self) -> float:
@@ -164,6 +189,20 @@ class CarStateExt:
       return kw * 1000.0
     except Exception:
       return 60_000.0
+
+  def _read_grade_contrib_cap_param(self) -> float:
+    """iter15 v2 (Section B): EvLimiterGradeContribCapKW — anti-overread cap on
+    the grade contribution to estPower*. Default 10 kW, bounded to [5, 30] kW.
+    Fail-closed to default. Mirrors `_read_motor_cap_param` shape exactly."""
+    try:
+      from openpilot.common.params import Params
+      raw = Params().get("EvLimiterGradeContribCapKW")
+      if raw is None: return GRADE_CONTRIB_CAP_DEFAULT_KW * 1000.0
+      kw = max(GRADE_CONTRIB_CAP_MIN_KW,
+               min(int(raw), GRADE_CONTRIB_CAP_MAX_KW))
+      return kw * 1000.0
+    except Exception:
+      return GRADE_CONTRIB_CAP_DEFAULT_KW * 1000.0
 
   def _read_assume_ev_only_param(self) -> bool:
     """iter13 v4: param read moved to card.py (selfdrive/car/card.py) so the
@@ -374,11 +413,25 @@ class CarStateExt:
         self._saturation_active = False
       abasis_for_power = max(0.0, self._aego_filtered) if self._saturation_active else max(0.0, abasis)
 
-      # Power = mass × v × (commanded-accel + grade-pull) + steady-state road load.
+      # iter15 v2 (Section B) — grade contribution CLAMP (anti-overread).
+      # Decompose: the abasis term is unchanged; grade term is the slice clamped
+      # at `_grade_contrib_cap_w` (default 10 kW). Raw published unclamped for
+      # forensics (R2-MF-2: raw MAY exceed cap; only the clamped value enters
+      # p_accel_grade_w).
+      grade_power_raw_w = VEHICLE_MASS_KG * v_ego * uphill_grade
+      cap_w = self._grade_contrib_cap_w
+      grade_power_clamped_w = min(grade_power_raw_w, cap_w)
+      if grade_power_raw_w > cap_w:
+        self._grade_power_capped_frames += 1
+      self._grade_power_raw_w_last = grade_power_raw_w
+
+      # Power = mass × v × commanded-accel  +  grade-power-CLAMPED  +  steady-state road load.
       # Road load (rolling resistance + aero drag) is the missing baseline iter5/6
       # ignored — at 73 mph it's ~23 kW alone, dominant enough that without it
       # the limiter's threshold is comparing apples to oranges.
-      p_accel_grade_w = VEHICLE_MASS_KG * v_ego * (abasis_for_power + uphill_grade)
+      # NOTE: road_load_power_w() formula is UNCHANGED (only the grade term is
+      # clamped — Section B is independent of road_load per plan instructions).
+      p_accel_grade_w = VEHICLE_MASS_KG * v_ego * abasis_for_power + grade_power_clamped_w
       p_road_w = road_load_power_w(v_ego)
       raw_power_w = max(0.0, p_accel_grade_w + p_road_w)
 
@@ -523,6 +576,33 @@ class CarStateExt:
     ret_sp.evLimiterPowerGuardLockoutActive = bool(pub.get("power_guard_lockout_active", False))
     ret_sp.evLimiterRecoveryYieldEvents = int(pub.get("recovery_yield_events", 0))
     ret_sp.evLimiterRecoveryLockoutsEntered = int(pub.get("recovery_lockouts_entered", 0))
+
+    # iter15 v2 — hard-preempt fix (Section A) + post-RES quiet (Section D) +
+    # narrow standstill reset (Section C) telemetry. All sourced from shared
+    # state populated by EVLimiter._publish().
+    ret_sp.evLimiterGuardForcedTransition = bool(pub.get("guard_forced_transition", False))
+    ret_sp.evLimiterGuardForcedTransitionEvents = int(pub.get("guard_forced_transition_events", 0))
+    ret_sp.evLimiterLongStandstillResets = int(pub.get("long_standstill_resets", 0))
+    ret_sp.evLimiterPostResQuietActive = bool(pub.get("post_res_quiet_active", False))
+    ret_sp.evLimiterSoftcapDecrementSuppressedFrames = int(pub.get("softcap_decrement_suppressed_frames", 0))
+    ret_sp.evLimiterSoftcapDecrementSuppressedEvents = int(pub.get("softcap_decrement_suppressed_events", 0))
+    # @61-@62 RESERVED for iter16 HEV CAN — emit 0 placeholder so capnp serializer
+    # populates the field. Do NOT add control logic here in iter15 (R2-MF-4).
+    ret_sp.evLimiterReservedIter16A = 0
+    ret_sp.evLimiterReservedIter16B = 0
+    ret_sp.evLimiterRecoveryYieldEpisodes = int(pub.get("recovery_yield_episodes", 0))
+    ret_sp.evLimiterStandstillExitStateSnapshot = str(pub.get("standstill_exit_state_snapshot", ""))[:200]
+    ret_sp.evLimiterStandstillExitTimeS = float(pub.get("standstill_exit_time_s", 0.0))
+    ret_sp.evLimiterStandstillExitToFirstResLatencyFrames = int(pub.get("standstill_exit_to_first_res_latency_frames", 0))
+    ret_sp.evLimiterLongStandstillPrelaunchBackoffCleared = int(pub.get("long_standstill_prelaunch_backoff_cleared", 0))
+    ret_sp.evLimiterLongStandstillSoftcapReasonCleared = int(pub.get("long_standstill_softcap_reason_cleared", 0))
+    ret_sp.evLimiterPostResHardOverrideEvents = int(pub.get("post_res_hard_override_events", 0))
+
+    # iter15 v2 (Section B) — grade clamp telemetry. carstate_ext owns these;
+    # they are not in _SHARED_STATE because they're computed in the power path
+    # (above) before EVLimiter runs.
+    ret_sp.evLimiterGradePowerRawW = float(self._grade_power_raw_w_last)
+    ret_sp.evLimiterGradePowerCappedFrames = int(self._grade_power_capped_frames)
 
     # Block reason: enum field via ordinal lookup. CarController publishes
     # the string; we translate to capnp enum ordinal here.
