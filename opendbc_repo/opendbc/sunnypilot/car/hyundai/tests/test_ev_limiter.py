@@ -636,6 +636,7 @@ class TestDecelFastCadence(unittest.TestCase):
     """
     from opendbc.sunnypilot.car.hyundai.ev_limiter import (
       STANDSTILL_PULSE_CAP_INITIAL, STANDSTILL_PULSE_CAP_AFTER_ACK,
+      MAX_PRELAUNCH_BACKOFF_RETRIES, STANDSTILL_NO_ACK_BACKOFF_AFTER_EMITTED,
     )
     self.assertEqual(STANDSTILL_PULSE_CAP_INITIAL, 10)
     self.assertEqual(STANDSTILL_PULSE_CAP_AFTER_ACK, 30)
@@ -650,9 +651,17 @@ class TestDecelFastCadence(unittest.TestCase):
       btn, _ = _step(lim, f, cc_enabled=True, vEgo=0.0, observed_mph=80.0)
       if btn == Buttons.SET_DECEL:
         set_count += 1
-    # No cluster decrement → no ACK → cap stays at INITIAL=10.
-    self.assertLessEqual(set_count, STANDSTILL_PULSE_CAP_INITIAL,
-                          f"no-ack pulse cap is INITIAL=10; got {set_count}")
+    # iter16a (B1): the per-stop budget now REFRESHES each time the no-ack backoff
+    # expires, so a long red light keeps making BOUNDED set-down attempts instead of
+    # permanently giving up at the initial cap of 10 (the driver-observed red-light
+    # windup). Still bounded — total no-ack pulses cannot exceed the initial budget
+    # plus MAX_PRELAUNCH_BACKOFF_RETRIES refresh cycles. The "no runaway" intent holds.
+    no_ack_bound = (STANDSTILL_PULSE_CAP_INITIAL
+                    + MAX_PRELAUNCH_BACKOFF_RETRIES * STANDSTILL_NO_ACK_BACKOFF_AFTER_EMITTED)
+    self.assertLessEqual(set_count, no_ack_bound,
+                          f"no-ack pulses must stay bounded (<= {no_ack_bound}); got {set_count}")
+    self.assertGreater(set_count, STANDSTILL_PULSE_CAP_INITIAL,
+                       "iter16a B1: a long unacked stop should retry past the initial cap")
 
 
 class TestIter9PowerPriority(unittest.TestCase):

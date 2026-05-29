@@ -232,6 +232,13 @@ SOFT_CAP_EXIT_SUSTAIN_FRAMES = 200       # 2.0 s of clear before allowing exit
 RECOVERY_ENTER_SUSTAIN_FRAMES = 20       # 0.2 s of under_target
 RECOVERY_EXIT_SUSTAIN_FRAMES = 100       # 1.0 s of at-target before allowing exit
 
+# iter16a (B2, gpt-5.5 review): suppress counterproductive RES while the set-vs-actual
+# delta is already large. Drives a8..b3 showed RECOVERY pushing set UP for 1078 frames
+# mid-windup (set 18-40 mph above actual) — direct lead-clear-surge fuel. Hysteretic to
+# avoid RES chatter at the boundary. Blocks UP only; never blocks SET-down protection.
+RECOVERY_MAX_DELTA_ENTER_MPH = 12.0      # block RES when (cluster_set - vEgo) exceeds this
+RECOVERY_MAX_DELTA_EXIT_MPH = 8.0        # re-allow RES once delta falls back below this
+
 # iter14 v2 (drive 18 t=1331-1352): RECOVERY-while-capped state-arbiter guard.
 # Independent of cur_state, runs after _derive_state() and before _publish() so
 # it gates actuation, not just telemetry (R1-MF1). Reads est_power_control_w
@@ -242,6 +249,19 @@ RECOVERY_AFTER_SOFTCAP_LOCKOUT_FRAMES = 200    # 2 s minimum no-RECOVERY after g
 RECOVERY_REENTRY_HEADROOM_FRAC = 0.85          # power must drop to 0.85*cap for re-entry sustain
 RECOVERY_REENTRY_SUSTAIN_FRAMES = 100          # 1 s sustained at headroom
 # RECOVERY re-entry requires BOTH lockout_time_done AND headroom_done (R2-MF-B).
+
+# iter16a (C1) — below-vEgo power-droop. LOG-ONLY / default-OFF this iteration
+# (gpt-5.5: new authority on an unvalidated estimate must not ship active until a
+# real-power-instrumented drive validates it). When the est power stays over the
+# enter threshold for the sustain window, we SIMULATE a droop target (vEgo - droop),
+# ramping the droop up to a cap, and publish what we WOULD do. Control only changes
+# if the EvLimiterPowerDroopEnable param is explicitly on (default off).
+POWER_DROOP_ENTER_KW = 45.0              # enter sim when est power exceeds this (hysteresis)
+POWER_DROOP_EXIT_KW = 38.0              # exit sim when est power falls below this
+POWER_DROOP_SUSTAIN_FRAMES = 200        # 2 s sustained over-cap before droop engages
+POWER_DROOP_MAX_MPH = 4.0              # cap on how far below vEgo the droop will request
+POWER_DROOP_RAMP_MPH_PER_FRAME = 1.0 / 100.0   # +1 mph per second at 100 Hz
+POWER_DROOP_ENABLE_PARAM = "EvLimiterPowerDroopEnable"  # default off (fail-safe)
 
 # iter15 v2 (Section C) — narrow standstill reset + state-vector telemetry.
 # Drive-A/B forensics: takeoff after long red lights felt slow. Hypothesis is
@@ -328,6 +348,13 @@ STANDSTILL_TARGET_FLOOR_MPH = 21.0
 ALLOWABLE_GAP_MPH = 5.0
 STANDSTILL_PULSE_CAP_INITIAL = 10
 STANDSTILL_PULSE_CAP_AFTER_ACK = 30
+# iter16a (B1): a long red light used to permanently exhaust the per-stop pulse
+# cap (~10 pulses) and then sit in STANDSTILL_HOLD for the rest of the stop with
+# set speed pinned ≫ launch_target (driver-observed red-light windup). Allow the
+# per-stop budget to refresh each time the no-ack backoff expires, so the limiter
+# keeps making BOUNDED low-duty-cycle set-down attempts (≈5 pulses / 3 s) across a
+# long stop. Still bounded: launch floor, driver defers, and a per-stop retry cap.
+MAX_PRELAUNCH_BACKOFF_RETRIES = 8        # ≈ up to ~50 bounded pulses across a multi-min stop
 STANDSTILL_NO_ACK_BACKOFF_AFTER_EMITTED = 5
 STANDSTILL_NO_ACK_BACKOFF_S = 3.0
 STANDSTILL_NO_ACK_BACKOFF_FRAMES = int(STANDSTILL_NO_ACK_BACKOFF_S * FRAMES_PER_SEC)
@@ -481,6 +508,16 @@ class EVLimiter:
     self._standstill_entry_frames = 0
     self._standstill_exit_frames = 0
 
+    # iter16a (B2): hysteretic RES-block-while-delta-large latch.
+    self._recovery_delta_block = False
+    # iter16a (Phase A): live request-indicator signals (per-frame).
+    self._request_dir = 0       # 0 NONE, 1 UP(want_res), 2 DOWN(want_set)
+    self._button_dir = 0        # 0 NONE, 1 UP(RES), 2 DOWN(SET) — actual emitted
+    self._request_honored = 0   # 0 unknown, 1 honored, 2 ignored
+    self._last_emit_dir = 0     # dir of last emitted button (for honored matching)
+    self._last_emit_frame_for_honored = -10000
+    self._cluster_at_emit_ms = 0.0
+
     # --- iter13 v4 fields ----------------------------------------------------
 
     # Advisory desired button + reason — CarController reads these instead of
@@ -506,6 +543,14 @@ class EVLimiter:
     self._prelaunch_first_ack_seen = False
     self._prelaunch_no_ack_backoff_until = -10000
     self._was_in_prelaunch = False
+    # iter16a (B1): per-stop bounded backoff-retry tracking.
+    self._prelaunch_backoff_retries = 0
+    self._prelaunch_backoff_was_active = False
+    # iter16a (C1): below-vEgo power-droop sim (log-only / default-off).
+    self._power_droop_sustain = 0
+    self._power_droop_would_enter = False
+    self._power_droop_request_mph = 0.0
+    self._power_droop_active = False
 
     # Counters published to CarStateSP. CarController owns emitted/dropped;
     # EVLimiter owns requested (decision-side).
@@ -1096,6 +1141,9 @@ class EVLimiter:
       self._prelaunch_set_pulse_cap = STANDSTILL_PULSE_CAP_INITIAL
       self._prelaunch_first_ack_seen = False
       self._prelaunch_no_ack_backoff_until = -10000
+      # iter16a (B1): reset per-stop backoff-retry tracking on each new stop.
+      self._prelaunch_backoff_retries = 0
+      self._prelaunch_backoff_was_active = False
       self._standstill_entered += 1
       # iter15 v2 (Section C): reset time-in-standstill counter on entry.
       self._time_in_standstill_frames = 0
@@ -1141,6 +1189,18 @@ class EVLimiter:
       cluster_mph = observed_set_speed / MPH_TO_MS
       cluster_above_launch = cluster_mph > launch_target_mph + LAUNCH_DEADBAND_MPH
       no_ack_backoff_active = frame < self._prelaunch_no_ack_backoff_until
+      # iter16a (B1): when the no-ack backoff expires (falling edge), refresh the
+      # per-stop pulse budget so a long red light keeps making BOUNDED set-down
+      # attempts instead of permanently giving up at the initial cap. Capped at
+      # MAX_PRELAUNCH_BACKOFF_RETRIES per stop. Only matters before first ack; once
+      # the SCC acks, the larger AFTER_ACK cap already gives ample budget.
+      if (self._prelaunch_backoff_was_active and not no_ack_backoff_active
+          and not self._prelaunch_first_ack_seen
+          and self._prelaunch_backoff_retries < MAX_PRELAUNCH_BACKOFF_RETRIES):
+        self._prelaunch_set_pulses_emitted = 0
+        self._prelaunch_set_pulses_emitted_since_ack = 0
+        self._prelaunch_backoff_retries += 1
+      self._prelaunch_backoff_was_active = no_ack_backoff_active
       cap_reached = (self._prelaunch_set_pulses_emitted
                      >= self._prelaunch_set_pulse_cap)
 
@@ -1247,6 +1307,32 @@ class EVLimiter:
     )
     target_set = max(lower_bound, min(upper_bound, target_set))
 
+    # iter16a (C1): below-vEgo power-droop SIMULATION (log-only / default-off).
+    # When the control-side est power stays over the enter threshold for the sustain
+    # window with no driver input, simulate a droop target (vEgo - ramped droop) that
+    # would force a real slowdown to cut power on a grade — the case the headroom-gated
+    # SET path cannot handle. We publish what we WOULD do; we only actually lower
+    # target_set if EvLimiterPowerDroopEnable is on (default OFF — fail-safe). gpt-5.5
+    # blocked shipping this active until a real-power-instrumented drive validates it.
+    droop_no_driver = (not gas_pressed and not brake_pressed
+                       and not self._in_driver_override_set(frame)
+                       and not self._in_driver_override_res(frame))
+    power_ctl_kw = est_power_control_w / 1000.0
+    if power_ctl_kw >= POWER_DROOP_ENTER_KW and droop_no_driver and v_ego > RECOVERY_V_EGO_FLOOR_MS:
+      self._power_droop_sustain += 1
+    elif power_ctl_kw < POWER_DROOP_EXIT_KW or not droop_no_driver:
+      self._power_droop_sustain = 0
+    self._power_droop_would_enter = self._power_droop_sustain >= POWER_DROOP_SUSTAIN_FRAMES
+    if self._power_droop_would_enter:
+      self._power_droop_request_mph = min(POWER_DROOP_MAX_MPH,
+                                          self._power_droop_request_mph + POWER_DROOP_RAMP_MPH_PER_FRAME)
+    else:
+      self._power_droop_request_mph = 0.0
+    self._power_droop_active = self._power_droop_would_enter and self._read_bool(POWER_DROOP_ENABLE_PARAM, False)
+    if self._power_droop_active:
+      droop_target = v_ego - self._power_droop_request_mph * MPH_TO_MS
+      target_set = max(USER_TARGET_MIN_MS, min(target_set, droop_target))
+
     # iter11 Fix A: max-deficit violation forensic counter
     if governor_mode == GOVERNOR_MODE_NORMAL and not gas_pressed and not brake_pressed:
       if observed_set_speed < lower_bound - 0.5:   # any sustained dip below floor
@@ -1350,6 +1436,19 @@ class EVLimiter:
       and standstill_clear
     )
 
+    # iter16a (B2, gpt-5.5): hysteretic suppression of RES while set-vs-actual delta
+    # is already large. Never raise the set speed further from actual — that is the
+    # lead-clear-surge fuel observed on a8..b3. Blocks UP only (SET-down protection
+    # is untouched). Driver RES is unaffected (this only gates the limiter's own RES).
+    delta_mph = (observed_set_speed - v_ego) / MPH_TO_MS
+    if self._recovery_delta_block:
+      if delta_mph <= RECOVERY_MAX_DELTA_EXIT_MPH:
+        self._recovery_delta_block = False
+    elif delta_mph >= RECOVERY_MAX_DELTA_ENTER_MPH:
+      self._recovery_delta_block = True
+    if self._recovery_delta_block and not self._recovery_escape_active:
+      want_res = False
+
     # iter11 Fix A: rate-limited recovery — max 2 mph/sec elapsed-time-based.
     # When in escape mode, throttle RES so cluster gain never exceeds 2 mph/sec
     # since escape entry. Prevents jumpy recovery if SCC is responsive.
@@ -1399,8 +1498,16 @@ class EVLimiter:
     # BRAKE/DECEL/STANDSTILL_HOLD modes suppress BOTH SET and RES.
     # GAS_CATCHUP suppresses SET (driver wants UP, never SLOW), allows RES
     # (rate-capped, capped at vEgo+headroom — see iter10 GAS_CATCHUP rationale).
+    # iter16a (B3, gpt-5.5): enforce the rolling window through lead-follow decel.
+    # Previously MODE_DECEL fully deferred SET, so when SCC braked for a lead the
+    # set speed stayed pinned ≫ actual (windup) and surged on lead-clear. Allow
+    # SET-down in DECEL when set_too_high — target_set is already >= vEgo+margin,
+    # so this only tracks the set speed DOWN toward the window, never below vEgo.
+    # Driver BRAKE still fully defers; RES stays blocked in DECEL.
+    decel_enforce_set = (governor_mode == GOVERNOR_MODE_DECEL and set_too_high and not brake_pressed)
     mode_blocks_set = (governor_mode in (GOVERNOR_MODE_BRAKE, GOVERNOR_MODE_DECEL,
-                                          GOVERNOR_MODE_STANDSTILL, GOVERNOR_MODE_GAS_CATCHUP))
+                                          GOVERNOR_MODE_STANDSTILL, GOVERNOR_MODE_GAS_CATCHUP)
+                       and not decel_enforce_set)
     mode_blocks_res = (governor_mode in (GOVERNOR_MODE_BRAKE, GOVERNOR_MODE_DECEL,
                                           GOVERNOR_MODE_STANDSTILL))
     if mode_blocks_set:
@@ -1537,6 +1644,67 @@ class EVLimiter:
 
     if button != Buttons.NONE:
       self._record_tx(frame, button)
+
+    # iter16a (Phase A): live request-indicator signals.
+    #   request_dir = controller INTENT this tick (fail-closed if both true).
+    #   button_dir  = actual CAN button EMITTED this tick.
+    #   request_honored = did the SCC set speed move in the EMITTED direction within
+    #     ACK_WINDOW, NOT attributable to a recent driver/manual button.
+    if want_set and want_res:
+      self._request_dir = 0   # invariant violation — should be mutually exclusive
+    elif want_set:
+      self._request_dir = 2
+    elif want_res:
+      self._request_dir = 1
+    else:
+      self._request_dir = 0
+
+    if button == Buttons.SET_DECEL:
+      self._button_dir = 2
+    elif button == Buttons.RES_ACCEL:
+      self._button_dir = 1
+    else:
+      self._button_dir = 0
+
+    # Honored/ignored for the indicator. "Honored" = the SCC set speed moved in the
+    # last emitted direction (not attributable to a recent driver/manual button).
+    # "Ignored" = the limiter emitted but the SCC did not follow. For SET-down we
+    # reuse the validated no-ack tracker (`_consecutive_no_ack_emits`, reset on a
+    # cluster decrement) rather than a fixed timeout — a fixed timeout races with
+    # the SET cadence and never latches in the exact "repeated SET, no movement"
+    # case the driver cares about. For RES-up we fall back to a movement timeout.
+    physical_btn_recent = (
+      (frame - self._driver_set_last_frame) <= ACK_WINDOW_FRAMES
+      or (frame - self._driver_res_last_frame) <= ACK_WINDOW_FRAMES
+    )
+    QUANT_MS = 0.5 * MPH_TO_MS   # ignore sub-quantization jitter
+    new_dir = self._button_dir != 0 and self._button_dir != self._last_emit_dir
+    # A same-direction re-emit after the previous request already resolved/expired
+    # (an idle gap) should start a FRESH verdict, not inherit the stale one
+    # (gpt-5.5 review caution): otherwise a long-ago "honored" persists onto a new
+    # press, and repeated RES could keep deferring the "ignored" latch.
+    stale_reemit = (self._button_dir != 0 and not new_dir
+                    and (frame - self._last_emit_frame_for_honored) > ACK_WINDOW_FRAMES)
+    if new_dir or stale_reemit:
+      self._last_emit_dir = self._button_dir
+      self._last_emit_frame_for_honored = frame
+      self._cluster_at_emit_ms = observed_set_speed
+      self._request_honored = 0
+    elif self._button_dir != 0:
+      # Same-direction re-emit within the window — advance the timeout reference.
+      self._last_emit_frame_for_honored = frame
+    if self._last_emit_dir == 2:        # DOWN (SET)
+      moved_down = observed_set_speed <= self._cluster_at_emit_ms - QUANT_MS
+      if moved_down and not physical_btn_recent:
+        self._request_honored = 1
+      elif self._consecutive_no_ack_emits >= 2:
+        self._request_honored = 2       # repeated SET, SCC not following
+    elif self._last_emit_dir == 1:      # UP (RES)
+      moved_up = observed_set_speed >= self._cluster_at_emit_ms + QUANT_MS
+      if moved_up and not physical_btn_recent:
+        self._request_honored = 1
+      elif (frame - self._last_emit_frame_for_honored) > ACK_WINDOW_FRAMES:
+        self._request_honored = 2
 
     # iter10 Layer 2: dwell + hysteresis state derivation.
     # Update sustain counters every frame.
@@ -1967,6 +2135,14 @@ class EVLimiter:
     _SHARED_STATE["standstill_exited_by_achieved"] = int(self._standstill_exited_by_achieved)
     _SHARED_STATE["standstill_exited_by_no_ack_backoff"] = int(self._standstill_exited_by_no_ack_backoff)
     _SHARED_STATE["standstill_set_requested"] = int(self._standstill_set_requested)
+    # iter16a (Phase A) — live request-indicator signals.
+    _SHARED_STATE["request_dir"] = int(self._request_dir)
+    _SHARED_STATE["button_dir"] = int(self._button_dir)
+    _SHARED_STATE["request_honored"] = int(self._request_honored)
+    # iter16a (C1) — below-vEgo power-droop sim (log-only / default-off).
+    _SHARED_STATE["power_droop_would_enter"] = bool(self._power_droop_would_enter)
+    _SHARED_STATE["power_droop_request_mph"] = float(self._power_droop_request_mph)
+    _SHARED_STATE["power_droop_active"] = bool(self._power_droop_active)
     # iter14 v2 — RECOVERY power-gate counters + transition instrumentation.
     _SHARED_STATE["power_near_budget_sustain"] = int(self._power_near_budget_sustain)
     _SHARED_STATE["power_capped_control_sustain"] = int(self._power_capped_control_sustain)

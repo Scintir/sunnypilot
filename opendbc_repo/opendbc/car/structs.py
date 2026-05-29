@@ -274,3 +274,17 @@ class CarStateSP:
 
   # Post-RES informational override (Section D)
   evLimiterPostResHardOverrideEvents: int = auto_field()
+
+  # iter16a — live request indicator (intent vs emitted vs honored)
+  evLimiterRequestDir: int = auto_field()        # 0 NONE, 1 UP(want_res), 2 DOWN(want_set)
+  evLimiterButtonDir: int = auto_field()         # 0 NONE, 1 UP(RES), 2 DOWN(SET) — actual emitted
+  evLimiterRequestHonored: int = auto_field()    # 0 unknown, 1 honored, 2 ignored
+
+  # iter16a — real HEV power ground truth (passive)
+  evLimiterRealMotorPowerW: float = auto_field()   # W; NaN if unavailable
+  evLimiterRealPowerSource: int = auto_field()     # 0 invalid, 1 motor CAN, 2 battery VxI
+
+  # iter16a — C1 below-vEgo power droop LOG-ONLY (default-off)
+  evLimiterPowerDroopWouldEnter: bool = auto_field()
+  evLimiterPowerDroopRequestMph: float = auto_field()
+  evLimiterPowerDroopActive: bool = auto_field()

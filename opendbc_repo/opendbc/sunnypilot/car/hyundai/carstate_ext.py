@@ -178,6 +178,13 @@ class CarStateExt:
     # Last frame's raw (pre-clamp) grade power, published every frame for forensics.
     self._grade_power_raw_w_last = 0.0
 
+    # iter16a (Phase E1) — real HEV power ground truth (passive decode). Absent =>
+    # source 0 (INVALID) + NaN power (gpt-5.5 #7: never publish 0 W for an absent
+    # measurement — it would pollute estimator validation/retune). Populated by the
+    # passive decoder once the motor-power CAN message identity is confirmed.
+    self._real_motor_power_w = float("nan")
+    self._real_power_source = 0
+
   # iter11 Fix E: param loaders. Use raw .get() (returns None on absent)
   # so we can default to True/sensible-default when param missing.
   def _read_motor_cap_param(self) -> float:
@@ -252,6 +259,12 @@ class CarStateExt:
     self._assume_ev_only_param_read_ok = bool(getattr(self, 'assume_ev_only_param_read_ok', False))
 
     self.aBasis = cp.vl["TCS13"]["aBasis"]
+
+    # iter16a (Phase E1): passive real-power decode. Identity unconfirmed (gpt-5.5:
+    # passive-only, confirm before any control use) — stays NaN / source 0 until the
+    # motor-power / battery-VxI signal is verified against on-device raw CAN. This is
+    # the single wiring point: once confirmed, fill _real_motor_power_w + source here.
+    self._decode_real_power(cp)
 
     if self.CP_SP.flags & HyundaiFlagsSP.NON_SCC:
       cruise_msg = "LABEL11" if self.CP.flags & HyundaiFlags.EV else \
@@ -598,6 +611,21 @@ class CarStateExt:
     ret_sp.evLimiterLongStandstillSoftcapReasonCleared = int(pub.get("long_standstill_softcap_reason_cleared", 0))
     ret_sp.evLimiterPostResHardOverrideEvents = int(pub.get("post_res_hard_override_events", 0))
 
+    # iter16a (Phase A) — live request-indicator signals.
+    ret_sp.evLimiterRequestDir = int(pub.get("request_dir", 0))
+    ret_sp.evLimiterButtonDir = int(pub.get("button_dir", 0))
+    ret_sp.evLimiterRequestHonored = int(pub.get("request_honored", 0))
+
+    # iter16a (Phase E1) — real HEV power ground truth (passive). carstate_ext owns
+    # these (decoded in the power path). Absent => source 0 + NaN (gpt-5.5 #7).
+    ret_sp.evLimiterRealMotorPowerW = float(self._real_motor_power_w)
+    ret_sp.evLimiterRealPowerSource = int(self._real_power_source)
+
+    # iter16a (Phase C1) — below-vEgo power droop LOG-ONLY telemetry (default-off).
+    ret_sp.evLimiterPowerDroopWouldEnter = bool(pub.get("power_droop_would_enter", False))
+    ret_sp.evLimiterPowerDroopRequestMph = float(pub.get("power_droop_request_mph", 0.0))
+    ret_sp.evLimiterPowerDroopActive = bool(pub.get("power_droop_active", False))
+
     # iter15 v2 (Section B) — grade clamp telemetry. carstate_ext owns these;
     # they are not in _SHARED_STATE because they're computed in the power path
     # (above) before EVLimiter runs.
@@ -612,6 +640,35 @@ class CarStateExt:
       ret_sp.evLimiterLastBlockReason = int(BLOCK_REASON_ORDINAL.get(reason_str, 0))
       fault_reason_str = pub.get("fault_inhibit_reason", "none")
       ret_sp.evLimiterFaultInhibitReason = int(BLOCK_REASON_ORDINAL.get(fault_reason_str, 0))
+    except Exception:
+      pass
+
+  def _decode_real_power(self, cp) -> None:
+    """iter16a (Phase E1) — passive real HEV power decode. PASSIVE, no control use.
+
+    The 2022 Santa Fe PHEV exposes HV-battery / motor power on a CAN message whose
+    identity is not yet confirmed against the on-device raw CAN (iter14 flagged a
+    0x220 @100 Hz candidate). Until confirmed we publish NaN + source 0 (NEVER 0 W —
+    a 0 would pollute estimator validation). Each candidate is attempted defensively;
+    any miss leaves the value invalid. Wire the confirmed signal here, then iter16b
+    can validate estPowerControlW/estPowerW against it before any retune.
+    """
+    self._real_motor_power_w = float("nan")
+    self._real_power_source = 0
+    # Candidate A: HV battery V x I (if the bus DBC defines these on this fingerprint).
+    try:
+      v = float(cp.vl["BMS_INFO"]["HV_BATTERY_VOLTAGE"])
+      i = float(cp.vl["BMS_INFO"]["HV_BATTERY_CURRENT"])
+      if v > 0.0:
+        self._real_motor_power_w = v * i          # discharge positive
+        self._real_power_source = 2
+        return
+    except Exception:
+      pass
+    # Candidate B: direct motor power signal (0x220 candidate, name unconfirmed).
+    try:
+      self._real_motor_power_w = float(cp.vl["MOTOR_INFO"]["MOTOR_POWER_KW"]) * 1000.0
+      self._real_power_source = 1
     except Exception:
       pass
 

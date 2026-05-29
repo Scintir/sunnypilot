@@ -573,6 +573,20 @@ struct CarStateSP @0xb86e6369214c01c8 {
 
   # Post-RES informational override counter (Section D)
   evLimiterPostResHardOverrideEvents @69 :UInt32;       # frames where power_far_over_cap overrode quiet
+
+  # iter16a — live request indicator signals (intent vs emitted vs honored; gpt-5.5 review #2)
+  evLimiterRequestDir @70 :UInt8;        # controller INTENT this tick: 0 NONE, 1 UP(want_res), 2 DOWN(want_set)
+  evLimiterButtonDir @71 :UInt8;         # ACTUAL CAN button EMITTED this tick: 0 NONE, 1 UP(RES), 2 DOWN(SET)
+  evLimiterRequestHonored @72 :UInt8;    # 0 unknown/none, 1 honored (set moved in emitted dir, not driver-attributed), 2 ignored (emitted button timed out, no move)
+
+  # iter16a — real HEV power ground truth (Phase E1, passive decode; absent => source 0 + NaN power, gpt-5.5 #7)
+  evLimiterRealMotorPowerW @73 :Float32;     # decoded real motor/battery power, W; NaN if unavailable
+  evLimiterRealPowerSource @74 :UInt8;       # 0 INVALID/absent, 1 motor-power CAN (0x220 cand), 2 battery VxI
+
+  # iter16a — C1 below-vEgo power droop LOG-ONLY telemetry (default-off; gpt-5.5 #1/#6 — not active)
+  evLimiterPowerDroopWouldEnter @75 :Bool;       # would-enter droop this tick (log-only sim)
+  evLimiterPowerDroopRequestMph @76 :Float32;    # requested below-vEgo droop magnitude, mph (log-only)
+  evLimiterPowerDroopActive @77 :Bool;           # droop actually active (only if EvLimiterPowerDroopEnable param on)
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

@@ -49,6 +49,18 @@ BORDER_PX = 2
 RIGHT_MARGIN = 14      # distance from screen right edge
 TOP_MARGIN = 14        # distance from screen top edge
 
+# iter16a (Phase A): live request-direction arrow. Shows whether the comma device
+# is asking the SCC set speed to go DOWN (limiting) or UP (recovering) RIGHT NOW,
+# and whether the SCC is honoring it. Driven by carStateSP.evLimiterButtonDir
+# (actual emitted button, NOT mere intent) + evLimiterRequestHonored.
+ARROW_W = 56           # half-width of the triangle base (px)
+ARROW_H = 64           # height of the triangle (px)
+ARROW_GAP = 12         # gap between arrow and the text banner
+# button_dir: 0 NONE, 1 UP(RES), 2 DOWN(SET). honored: 0 unknown, 1 honored, 2 ignored.
+ARROW_COLOR_HONORED = rl.Color(0x30, 0xc0, 0x30, 0xff)   # green — SCC followed
+ARROW_COLOR_IGNORED = rl.Color(0xff, 0x40, 0x40, 0xff)   # red — comma asked, SCC didn't move
+ARROW_COLOR_PENDING = rl.Color(0xf0, 0xf0, 0xf0, 0xff)   # white — asking, not yet resolved
+
 STATE_NAMES = {
   0: "IDLE",
   1: "STANDSTILL",
@@ -76,6 +88,7 @@ class EVLimiterIndicator(Widget):
     super().__init__()
     self._font_big = gui_app.font(FontWeight.BOLD)
     self._font_small = gui_app.font(FontWeight.MEDIUM)
+    self._blink = 0   # frame counter for the "ignored" flash
 
   def _render(self, rect: rl.Rectangle) -> None:
     try:
@@ -93,6 +106,8 @@ class EVLimiterIndicator(Widget):
     state = int(getattr(cs_sp, "evLimiterState", 7))
     user_target_ms = float(getattr(cs_sp, "evLimiterUserTargetSpeed", 0.0))
     est_power_w = float(getattr(cs_sp, "estPowerW", 0.0))
+    button_dir = int(getattr(cs_sp, "evLimiterButtonDir", 0))      # 0 none, 1 up(RES), 2 down(SET)
+    request_honored = int(getattr(cs_sp, "evLimiterRequestHonored", 0))  # 0 unknown, 1 honored, 2 ignored
 
     # Don't draw at all if the limiter has never engaged on this trip
     # (user_target_ms == 0 means engage rising edge hasn't fired).
@@ -150,3 +165,40 @@ class EVLimiterIndicator(Widget):
     rl.draw_text_ex(self._font_small, state_str,
                     rl.Vector2(box.x + (box_w - s_state.x) / 2, y),
                     FONT_SIZE_SMALL, 0, border_color)
+
+    # iter16a: live request-direction arrow, to the LEFT of the banner.
+    self._draw_request_arrow(box, button_dir, request_honored)
+
+  def _draw_request_arrow(self, box: rl.Rectangle, button_dir: int, honored: int) -> None:
+    """Big ↑/↓ triangle showing the comma device's CURRENT set-speed request.
+    Green = SCC honored it, red (flashing) = comma asked but the set speed
+    didn't move, white = asking / not yet resolved. Hidden when not asking."""
+    self._blink = (self._blink + 1) % 40   # ~0.66 s period at 60 Hz UI
+    if button_dir == 0:
+      return
+
+    if honored == 1:
+      color = ARROW_COLOR_HONORED
+    elif honored == 2:
+      # Flash the "ignored" arrow so it draws the eye.
+      if self._blink >= 20:
+        return
+      color = ARROW_COLOR_IGNORED
+    else:
+      color = ARROW_COLOR_PENDING
+
+    cx = box.x - ARROW_GAP - ARROW_W
+    cy = box.y + box.height / 2.0
+    cx = max(ARROW_W, cx)   # keep the left vertex (cx - ARROW_W) on-screen
+
+    if button_dir == 2:   # DOWN (SET) — apex at bottom
+      apex = rl.Vector2(cx, cy + ARROW_H / 2.0)
+      left = rl.Vector2(cx - ARROW_W, cy - ARROW_H / 2.0)
+      right = rl.Vector2(cx + ARROW_W, cy - ARROW_H / 2.0)
+    else:                 # UP (RES) — apex at top
+      apex = rl.Vector2(cx, cy - ARROW_H / 2.0)
+      left = rl.Vector2(cx - ARROW_W, cy + ARROW_H / 2.0)
+      right = rl.Vector2(cx + ARROW_W, cy + ARROW_H / 2.0)
+    # pyray winding: draw both windings so the fill always shows regardless of orientation.
+    rl.draw_triangle(apex, left, right, color)
+    rl.draw_triangle(apex, right, left, color)
