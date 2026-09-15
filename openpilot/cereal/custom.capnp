@@ -470,7 +470,35 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   }
 }
 
-struct CustomReserved10 @0xcb9fd56c7057593a {
+struct EvBatteryStateSP @0xcb9fd56c7057593a {
+  # High-voltage battery state read from the BMS over UDS (EvBmsUdsPolling). Decoded fields follow the
+  # community HKMC BMS layout for DID 0x0101 and are only trusted when `decodeValid` is set.
+  valid @0 :Bool;                 # a response was received recently
+  decodeValid @1 :Bool;           # decoded values passed plausibility checks
+  service @2 :UInt8;              # UDS service used for the last response (0x22 or 0x21)
+  responseAgeMs @3 :UInt32;       # time since the last complete response
+  requestCount @4 :UInt32;
+  responseCount @5 :UInt32;
+  timeoutCount @6 :UInt32;
+  negativeResponseCount @7 :UInt32;
+
+  packVoltage @8 :Float32;        # V
+  packCurrent @9 :Float32;        # A, positive = discharge
+  packPower @10 :Float32;         # kW, packVoltage * packCurrent / 1000
+  soc @11 :Float32;               # %, BMS state of charge
+  availableChargePower @12 :Float32;     # kW, BMS regen/charge limit
+  availableDischargePower @13 :Float32;  # kW, BMS discharge limit
+  maxTemp @14 :Float32;           # degC
+  minTemp @15 :Float32;           # degC
+  maxCellVoltage @16 :Float32;    # V
+  minCellVoltage @17 :Float32;    # V
+  auxVoltage @18 :Float32;        # V, 12V battery as seen by the BMS
+  motorRpm1 @19 :Float32;
+  motorRpm2 @20 :Float32;
+  bmsMainRelay @21 :Bool;
+  charging @22 :Bool;
+
+  rawData @23 :Data;              # full reassembled response payload after the DID echo, for offline decoding
 }
 
 struct CustomReserved11 @0xc2243c65e0340384 {

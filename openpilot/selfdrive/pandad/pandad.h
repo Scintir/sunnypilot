@@ -30,6 +30,8 @@ private:
   bool log_once_ = false;
   bool safety_configured_ = false;
   bool prev_obd_multiplexing_ = false;
+  int can_discovery_mode_ = 0;  // sunnypilot: CanDiscoveryMode param, latched at onroad transition
+  bool discovery_logged_ = false;
   Panda *panda_;
   Params params_;
 };

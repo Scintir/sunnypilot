@@ -1,10 +1,27 @@
+#include <cstdlib>
+
 #include "selfdrive/pandad/pandad.h"
 #include "openpilot/cereal/messaging/messaging.h"
 #include "common/swaglog.h"
 
+// mirrors HYUNDAI_PARAM_SP_BMS_UDS in opendbc/safety/modes/hyundai_common.h
+static const uint16_t HYUNDAI_PARAM_SP_BMS_UDS = 16U;
+
 void PandaSafety::configureSafetyMode(bool is_onroad) {
   if (is_onroad && !safety_configured_) {
     updateMultiplexingMode();
+
+    // sunnypilot: CAN discovery mode keeps the panda passive (ELM327) for the whole drive so every
+    // frame on all three buses is captured to the rlog without the car safety model, relay intercept,
+    // or any TX. Mode 2 additionally routes bus 1 to the OBD-II port. openpilot cannot engage in this mode.
+    if (can_discovery_mode_ != 0) {
+      if (!discovery_logged_) {
+        LOGW("CanDiscoveryMode=%d: staying in ELM327 (bus 1 -> %s), car safety model will not be set",
+             can_discovery_mode_, can_discovery_mode_ == 2 ? "OBD-II port" : "harness CAN2");
+        discovery_logged_ = true;
+      }
+      return;
+    }
 
     auto car_params = fetchCarParams();
     if (!car_params.empty()) {
@@ -17,6 +34,7 @@ void PandaSafety::configureSafetyMode(bool is_onroad) {
     initialized_ = false;
     safety_configured_ = false;
     log_once_ = false;
+    discovery_logged_ = false;
   }
 }
 
@@ -24,15 +42,23 @@ void PandaSafety::updateMultiplexingMode() {
   // Initialize to ELM327 without OBD multiplexing for initial fingerprinting
   if (!initialized_) {
     prev_obd_multiplexing_ = false;
-    panda_->set_safety_model(cereal::CarParams::SafetyModel::ELM327, 1U);
+    // sunnypilot: latch the discovery mode once per onroad transition
+    const std::string mode_str = params_.get("CanDiscoveryMode");
+    can_discovery_mode_ = mode_str.empty() ? 0 : std::atoi(mode_str.c_str());
+    // discovery mode 2 pins bus 1 to the OBD-II port for the whole drive
+    const bool force_obd = can_discovery_mode_ == 2;
+    panda_->set_safety_model(cereal::CarParams::SafetyModel::ELM327, force_obd ? 0U : 1U);
     initialized_ = true;
   }
 
   // Switch between multiplexing modes based on the OBD multiplexing request
   bool obd_multiplexing_requested = params_.getBool("ObdMultiplexingEnabled");
   if (obd_multiplexing_requested != prev_obd_multiplexing_) {
-    const uint16_t safety_param = obd_multiplexing_requested ? 0U : 1U;
-    panda_->set_safety_model(cereal::CarParams::SafetyModel::ELM327, safety_param);
+    // in discovery mode 2 the OBD mux stays on regardless of card's request; still ack so card doesn't block
+    if (can_discovery_mode_ != 2) {
+      const uint16_t safety_param = obd_multiplexing_requested ? 0U : 1U;
+      panda_->set_safety_model(cereal::CarParams::SafetyModel::ELM327, safety_param);
+    }
     prev_obd_multiplexing_ = obd_multiplexing_requested;
     params_.putBool("ObdMultiplexingChanged", true);
   }
@@ -76,6 +102,17 @@ void PandaSafety::setSafetyMode(const std::vector<std::string> &params_string) {
   LOGW("setting safety model: %d, param: %d, alternative experience: %d, param_sp: %d", (int)safety_model, safety_param, alternative_experience, safety_param_sp);
   panda_->set_alternative_experience(alternative_experience, safety_param_sp);
   panda_->set_safety_model(safety_model, safety_param);
+
+  // sunnypilot: BMS UDS polling needs bus 1 on the OBD-II port. Setting the car safety model always returns
+  // bus 1 to the harness CAN2 pair, so re-select the OBD mux afterwards. Only Hyundai CAN platforms set this bit
+  // (see HYUNDAI_PARAM_SP_BMS_UDS in opendbc); on those harnesses the CAN2 pair carries nothing.
+  const bool bms_uds = (safety_model == cereal::CarParams::SafetyModel::HYUNDAI ||
+                        safety_model == cereal::CarParams::SafetyModel::HYUNDAI_LEGACY) &&
+                       (safety_param_sp & HYUNDAI_PARAM_SP_BMS_UDS);
+  if (bms_uds) {
+    LOGW("EvBmsUdsPolling: routing bus 1 to the OBD-II port");
+    panda_->set_obd(true);
+  }
 }
 
 bool PandaSafety::getOffroadMode() {

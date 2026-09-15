@@ -63,6 +63,7 @@ public:
   cereal::PandaState::PandaType get_hw_type();
   void set_safety_model(cereal::CarParams::SafetyModel safety_model, uint16_t safety_param=0U);
   void set_alternative_experience(uint16_t alternative_experience, uint16_t safety_param_sp=0U);
+  void set_obd(bool obd);  // route bus 1 to the OBD-II port (true) or the harness CAN2 pair (false)
   std::string serial_read(int port_number = 0);
   void set_uart_baud(int uart, int rate);
   void set_fan_speed(uint16_t fan_speed);

@@ -44,6 +44,10 @@ void Panda::set_alternative_experience(uint16_t alternative_experience, uint16_t
   handle->control_write(0xdf, alternative_experience, safety_param_sp);
 }
 
+void Panda::set_obd(bool obd) {
+  handle->control_write(0xdb, obd ? 1U : 0U, 0);
+}
+
 std::string Panda::serial_read(int port_number) {
   std::string ret;
   char buffer[USBPACKET_MAX_SIZE] = {};

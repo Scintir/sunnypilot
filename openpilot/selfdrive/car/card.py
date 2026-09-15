@@ -24,6 +24,8 @@ from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_cap
 
 from openpilot.sunnypilot.mads.helpers import set_alternative_experience, set_car_specific_params
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
+from openpilot.sunnypilot.selfdrive.car.hyundai.bms_uds import BmsUdsPoller
+from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 
 REPLAY = "REPLAY" in os.environ
 
@@ -72,7 +74,7 @@ class Car:
   def __init__(self, CI=None, RI=None) -> None:
     self.can_sock = messaging.sub_sock('can', timeout=20)
     self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents'] + ['carControlSP', 'longitudinalPlanSP'])
-    self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'radarTracks'] + ['carParamsSP', 'carStateSP'])
+    self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'radarTracks'] + ['carParamsSP', 'carStateSP', 'evBatteryStateSP'])
 
     self.can_rcv_cum_timeout_counter = 0
 
@@ -189,6 +191,9 @@ class Car:
     # log fingerprint in sentry
     sunnypilot_interfaces.log_fingerprint(self.CP)
 
+    # sunnypilot: read-only UDS polling of the HV battery BMS on the OBD-II port (EvBmsUdsPolling)
+    self.bms_poller = BmsUdsPoller() if self.CP_SP.flags & HyundaiFlagsSP.BMS_UDS_POLLING else None
+
   def state_update(self) -> tuple[car.CarState, custom.CarStateSP, structs.RadarDataT | None]:
     """carState update loop, driven by can"""
 
@@ -201,6 +206,9 @@ class Car:
 
     # Update radar tracks from CAN
     RD: structs.RadarDataT | None = self.RI.update(can_list)
+
+    if self.bms_poller is not None:
+      self.bms_poller.rx(can_list)
 
     self.sm.update(0)
 
@@ -267,6 +275,13 @@ class Car:
     cs_sp_send.carStateSP = CS_SP
     self.pm.send('carStateSP', cs_sp_send)
 
+    # evBatteryStateSP - 10 Hz
+    if self.bms_poller is not None and self.sm.frame % 10 == 0:
+      ev_send = messaging.new_message('evBatteryStateSP')
+      ev_send.valid = True
+      self.bms_poller.fill_msg(ev_send.evBatteryStateSP)
+      self.pm.send('evBatteryStateSP', ev_send)
+
   def controls_update(self, CS: car.CarState, CC: car.CarControl, CC_SP: custom.CarControlSP):
     """control update loop, driven by carControl"""
 
@@ -281,6 +296,8 @@ class Car:
       # send car controls over can
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
       self.last_actuators_output, can_sends = self.CI.apply(CC, convert_carControlSP(CC_SP), now_nanos)
+      if self.bms_poller is not None:
+        can_sends = list(can_sends) + self.bms_poller.tx()
       self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
 
       self.CC_prev = CC

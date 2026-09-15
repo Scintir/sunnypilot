@@ -115,6 +115,8 @@ class SelfdriveD(CruiseHelper):
 
     # read params
     self.is_metric = self.params.get_bool("IsMetric")
+    # sunnypilot: in CAN discovery mode pandad deliberately stays in ELM327 (passive capture, no engagement)
+    self.can_discovery_mode = (self.params.get("CanDiscoveryMode") or 0) != 0
     self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
     self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
 
@@ -385,6 +387,10 @@ class SelfdriveD(CruiseHelper):
                           pandaState.alternativeExperience != self.CP.alternativeExperience
       else:
         safety_mismatch = pandaState.safetyModel not in IGNORED_SAFETY_MODES
+
+      # sunnypilot: CAN discovery mode intentionally leaves the panda in ELM327; don't flag it as a mismatch
+      if self.can_discovery_mode and pandaState.safetyModel == SafetyModel.elm327:
+        safety_mismatch = False
 
       # safety mismatch allows some time for pandad to set the safety mode and publish it back from panda
       if (safety_mismatch and self.sm.frame*DT_CTRL > 10.) or pandaState.safetyRxChecksInvalid or self.mismatch_counter >= 200:
