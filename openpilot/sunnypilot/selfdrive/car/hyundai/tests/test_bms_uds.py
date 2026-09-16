@@ -191,10 +191,21 @@ class TestPoller:
 
 
 def test_rx_accepts_card_packet_shape():
-  """card passes [(nanos, [CanData, ...]), ...]; iterating the tuple itself crashed card on the first drive."""
+  """card passes exactly what can_capnp_to_list returns: [(nanos, [(address, dat, src), ...]), ...] with plain
+  tuples, not CanData. Both a wrong outer iteration and attribute access on the frames crashed card on real drives."""
   poller = BmsUdsPoller()
   poller.tx()  # send a request so a response is expected
-  frames = [CanData(0x2A0, bytes(8), 0), CanData(BMS_RX_ADDR, b"\x03\x7F\x22\x31\x00\x00\x00\x00", OBD_BUS)]
+  frames = [(0x2A0, bytes(8), 0), (BMS_RX_ADDR, b"\x03\x7F\x22\x31\x00\x00\x00\x00", OBD_BUS)]
   poller.rx([(123456789, frames), (123456790, [])])
   poller.rx([])
+  assert poller.state.negative_response_count == 1
+
+
+def test_rx_matches_real_can_capnp_to_list_output():
+  """Round-trip through the real serializer/deserializer card uses, so the test breaks if that shape changes."""
+  from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
+  poller = BmsUdsPoller()
+  poller.tx()
+  msg = can_list_to_can_capnp([CanData(BMS_RX_ADDR, b"\x03\x7F\x22\x31\x00\x00\x00\x00", OBD_BUS)], msgtype='can')
+  poller.rx(can_capnp_to_list([msg]))
   assert poller.state.negative_response_count == 1

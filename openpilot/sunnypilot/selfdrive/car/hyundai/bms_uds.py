@@ -182,12 +182,12 @@ class BmsUdsPoller:
   # ---- card hooks -------------------------------------------------------------------------------------------
 
   def rx(self, can_packets) -> None:
-    """Feed the CAN packets card drained this tick: `[(nanos, [CanData, ...]), ...]` as returned by
-    can_capnp_to_list."""
+    """Feed the CAN packets card drained this tick: `[(nanos, [(address, dat, src), ...]), ...]` as returned by
+    can_capnp_to_list. Frames are plain tuples, not CanData, so unpack positionally."""
     for _, frames in can_packets:
-      for f in frames:
-        if f.src == OBD_BUS and f.address == BMS_RX_ADDR:
-          self._on_bms_frame(bytes(f.dat))
+      for address, dat, src in frames:
+        if src == OBD_BUS and address == BMS_RX_ADDR:
+          self._on_bms_frame(bytes(dat))
 
   def tx(self) -> list[CanData]:
     """Frames to append to this tick's sendcan. Call once per card tick after rx()."""
