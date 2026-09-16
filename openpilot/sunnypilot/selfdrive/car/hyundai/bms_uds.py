@@ -181,9 +181,10 @@ class BmsUdsPoller:
 
   # ---- card hooks -------------------------------------------------------------------------------------------
 
-  def rx(self, can_list) -> None:
-    """Feed every received CAN frame for this card tick (list of lists of CanData, as card gets them)."""
-    for frames in can_list:
+  def rx(self, can_packets) -> None:
+    """Feed the CAN packets card drained this tick: `[(nanos, [CanData, ...]), ...]` as returned by
+    can_capnp_to_list."""
+    for _, frames in can_packets:
       for f in frames:
         if f.src == OBD_BUS and f.address == BMS_RX_ADDR:
           self._on_bms_frame(bytes(f.dat))

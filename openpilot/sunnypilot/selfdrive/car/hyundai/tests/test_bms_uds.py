@@ -57,7 +57,8 @@ class FakeBms:
     self.pending: list[bytes] = []
     self.requests = 0
 
-  def handle(self, tx: list[CanData]) -> list[list[CanData]]:
+  def handle(self, tx: list[CanData]) -> list[tuple[int, list[CanData]]]:
+    """Returns packets in the shape card feeds to the poller: [(nanos, frames)]."""
     out: list[CanData] = []
     for f in tx:
       assert f.address == BMS_TX_ADDR and f.src == OBD_BUS and len(f.dat) == 8
@@ -77,7 +78,7 @@ class FakeBms:
         frames = isotp_frames(echo + self.payload)
         out.append(CanData(BMS_RX_ADDR, frames[0], OBD_BUS))
         self.pending = frames[1:]
-    return [out] if out else []
+    return [(0, out)] if out else []
 
 
 class TestDecode:
@@ -125,7 +126,7 @@ class TestIsoTp:
 
 
 def run(poller: BmsUdsPoller, bms, ticks: int):
-  rx: list[list[CanData]] = []
+  rx: list[tuple[int, list[CanData]]] = []
   for _ in range(ticks):
     poller.rx(rx)
     tx = poller.tx()
@@ -178,7 +179,7 @@ class TestPoller:
     poller = BmsUdsPoller()
     bms = FakeBms(make_payload())
     sent: list[bytes] = []
-    rx: list[list[CanData]] = []
+    rx: list[tuple[int, list[CanData]]] = []
     for _ in range(100):
       poller.rx(rx)
       tx = poller.tx()
@@ -187,3 +188,13 @@ class TestPoller:
     assert sent
     for f in sent:
       assert f in (build_request(SERVICE_READ_DATA_BY_ID), build_request(SERVICE_READ_DATA_BY_LOCAL_ID), FLOW_CONTROL_FRAME)
+
+
+def test_rx_accepts_card_packet_shape():
+  """card passes [(nanos, [CanData, ...]), ...]; iterating the tuple itself crashed card on the first drive."""
+  poller = BmsUdsPoller()
+  poller.tx()  # send a request so a response is expected
+  frames = [CanData(0x2A0, bytes(8), 0), CanData(BMS_RX_ADDR, b"\x03\x7F\x22\x31\x00\x00\x00\x00", OBD_BUS)]
+  poller.rx([(123456789, frames), (123456790, [])])
+  poller.rx([])
+  assert poller.state.negative_response_count == 1
