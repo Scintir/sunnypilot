@@ -112,6 +112,10 @@ void PandaSafety::setSafetyMode(const std::vector<std::string> &params_string) {
   if (bms_uds) {
     LOGW("EvBmsUdsPolling: routing bus 1 to the OBD-II port");
     panda_->set_obd(true);
+    // The OBD mux command only re-routes the pins; the ELM327 path in the firmware follows it with a CAN core
+    // re-init (can_init_all). Without that, bus 1 came up dead after the switch on a comma four (no TX echoes,
+    // RX count frozen for the whole drive). Setting the bus speed is the host-side way to re-init one bus.
+    panda_->set_can_speed_kbps(1, 500);
   }
 }
 
