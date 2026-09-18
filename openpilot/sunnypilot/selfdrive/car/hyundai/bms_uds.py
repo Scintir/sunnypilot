@@ -4,7 +4,8 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-Read-only UDS polling of the Hyundai/Kia HV battery BMS (0x7E4 -> 0x7EC) on the OBD-II port (panda bus 1).
+Read-only UDS polling of the Hyundai/Kia HV battery BMS (0x7E4 -> 0x7EC) on C-CAN (bus 0, default) or the OBD-II
+port (bus 1, `EvBmsUdsBus=1`).
 
 card drives this at 100 Hz: `rx()` gets every CAN frame card already drains, `tx()` returns the frames to append
 to the next sendcan batch. The panda safety model only lets through single-frame read requests (0x22 / 0x21)
@@ -23,7 +24,9 @@ from opendbc.car.can_definitions import CanData
 
 BMS_TX_ADDR = 0x7E4
 BMS_RX_ADDR = 0x7EC
-OBD_BUS = 1
+CCAN_BUS = 0   # C-CAN via the harness; 7 ECUs answered UDS here during fingerprinting on the Santa Fe PHEV
+OBD_BUS = 1    # OBD-II port via the bus 1 mux; needs pandad to switch the mux and takes the radar tracks away
+DEFAULT_BUS = CCAN_BUS
 
 SERVICE_READ_DATA_BY_ID = 0x22
 SERVICE_READ_DATA_BY_LOCAL_ID = 0x21
@@ -170,7 +173,8 @@ class BmsPollerState:
 
 
 class BmsUdsPoller:
-  def __init__(self, period_frames: int = DEFAULT_PERIOD_FRAMES, timeout_frames: int = RESPONSE_TIMEOUT_FRAMES):
+  def __init__(self, bus: int = DEFAULT_BUS, period_frames: int = DEFAULT_PERIOD_FRAMES, timeout_frames: int = RESPONSE_TIMEOUT_FRAMES):
+    self.bus = bus
     self.period_frames = period_frames
     self.timeout_frames = timeout_frames
     self.state = BmsPollerState()
@@ -186,7 +190,7 @@ class BmsUdsPoller:
     can_capnp_to_list. Frames are plain tuples, not CanData, so unpack positionally."""
     for _, frames in can_packets:
       for address, dat, src in frames:
-        if src == OBD_BUS and address == BMS_RX_ADDR:
+        if src == self.bus and address == BMS_RX_ADDR:
           self._on_bms_frame(bytes(dat))
 
   def tx(self) -> list[CanData]:
@@ -197,7 +201,7 @@ class BmsUdsPoller:
 
     if self.rx_buf.need_flow_control:
       self.rx_buf.need_flow_control = False
-      out.append(CanData(BMS_TX_ADDR, FLOW_CONTROL_FRAME, OBD_BUS))
+      out.append(CanData(BMS_TX_ADDR, FLOW_CONTROL_FRAME, self.bus))
 
     if self.request_sent_frame is not None and self.frame - self.request_sent_frame > self.timeout_frames:
       st.timeout_count += 1
@@ -206,7 +210,7 @@ class BmsUdsPoller:
       self.rx_buf.reset()
 
     if self.request_sent_frame is None and self.frame >= self.next_request_frame:
-      out.append(CanData(BMS_TX_ADDR, build_request(st.service), OBD_BUS))
+      out.append(CanData(BMS_TX_ADDR, build_request(st.service), self.bus))
       st.request_count += 1
       self.request_sent_frame = self.frame
       self.next_request_frame = self.frame + self.period_frames

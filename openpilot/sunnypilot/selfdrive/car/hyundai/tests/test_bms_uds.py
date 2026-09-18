@@ -5,7 +5,7 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 from opendbc.car.can_definitions import CanData
-from openpilot.sunnypilot.selfdrive.car.hyundai.bms_uds import (BMS_RX_ADDR, BMS_TX_ADDR, FLOW_CONTROL_FRAME, OBD_BUS,
+from openpilot.sunnypilot.selfdrive.car.hyundai.bms_uds import (BMS_RX_ADDR, BMS_TX_ADDR, CCAN_BUS, DEFAULT_BUS, FLOW_CONTROL_FRAME, OBD_BUS,
                                                                 SERVICE_READ_DATA_BY_ID, SERVICE_READ_DATA_BY_LOCAL_ID,
                                                                 BmsUdsPoller, IsoTpReceiver, build_request, decode_bms_0101)
 
@@ -50,8 +50,9 @@ def isotp_frames(payload: bytes) -> list[bytes]:
 class FakeBms:
   """Answers 0x22 0101 (or 0x21 01 when `local_id`) with a multi-frame response, honoring flow control."""
 
-  def __init__(self, payload: bytes, local_id: bool = False, negative_for=()):
+  def __init__(self, payload: bytes, local_id: bool = False, negative_for=(), bus: int = OBD_BUS):
     self.payload = payload
+    self.bus = bus
     self.local_id = local_id
     self.negative_for = set(negative_for)
     self.pending: list[bytes] = []
@@ -61,22 +62,22 @@ class FakeBms:
     """Returns packets in the shape card feeds to the poller: [(nanos, frames)]."""
     out: list[CanData] = []
     for f in tx:
-      assert f.address == BMS_TX_ADDR and f.src == OBD_BUS and len(f.dat) == 8
+      assert f.address == BMS_TX_ADDR and f.src == self.bus and len(f.dat) == 8
       if f.dat[0] == 0x30:
-        out.extend(CanData(BMS_RX_ADDR, fr, OBD_BUS) for fr in self.pending)
+        out.extend(CanData(BMS_RX_ADDR, fr, self.bus) for fr in self.pending)
         self.pending = []
       elif f.dat[0] & 0xF0 == 0x00:
         self.requests += 1
         service = f.dat[1]
         if service in self.negative_for:
-          out.append(CanData(BMS_RX_ADDR, bytes([0x03, 0x7F, service, 0x31, 0, 0, 0, 0]), OBD_BUS))
+          out.append(CanData(BMS_RX_ADDR, bytes([0x03, 0x7F, service, 0x31, 0, 0, 0, 0]), self.bus))
           continue
         if (service == SERVICE_READ_DATA_BY_LOCAL_ID) != self.local_id:
-          out.append(CanData(BMS_RX_ADDR, bytes([0x03, 0x7F, service, 0x11, 0, 0, 0, 0]), OBD_BUS))
+          out.append(CanData(BMS_RX_ADDR, bytes([0x03, 0x7F, service, 0x11, 0, 0, 0, 0]), self.bus))
           continue
         echo = bytes([service + 0x40, 0x01, 0x01]) if service == SERVICE_READ_DATA_BY_ID else bytes([service + 0x40, 0x01])
         frames = isotp_frames(echo + self.payload)
-        out.append(CanData(BMS_RX_ADDR, frames[0], OBD_BUS))
+        out.append(CanData(BMS_RX_ADDR, frames[0], self.bus))
         self.pending = frames[1:]
     return [(0, out)] if out else []
 
@@ -135,7 +136,7 @@ def run(poller: BmsUdsPoller, bms, ticks: int):
 
 class TestPoller:
   def test_polls_and_decodes(self):
-    poller = BmsUdsPoller()
+    poller = BmsUdsPoller(bus=OBD_BUS)
     bms = FakeBms(make_payload(soc=55.0))
     run(poller, bms, 100)
     st = poller.state
@@ -151,7 +152,7 @@ class TestPoller:
     assert m.valid and m.decodeValid and m.soc == 55.0 and m.rawData == make_payload(soc=55.0)
 
   def test_falls_back_to_local_id(self):
-    poller = BmsUdsPoller()
+    poller = BmsUdsPoller(bus=OBD_BUS)
     bms = FakeBms(make_payload(), local_id=True)
     run(poller, bms, 200)
     st = poller.state
@@ -160,7 +161,7 @@ class TestPoller:
     assert st.response_count >= 5 and st.decoded.plausible
 
   def test_timeout_when_silent(self):
-    poller = BmsUdsPoller()
+    poller = BmsUdsPoller(bus=OBD_BUS)
 
     class Silent:
       def handle(self, tx):
@@ -176,7 +177,7 @@ class TestPoller:
     assert not m.valid and not m.decodeValid
 
   def test_only_requests_and_flow_control_are_sent(self):
-    poller = BmsUdsPoller()
+    poller = BmsUdsPoller(bus=OBD_BUS)
     bms = FakeBms(make_payload())
     sent: list[bytes] = []
     rx: list[tuple[int, list[CanData]]] = []
@@ -193,7 +194,7 @@ class TestPoller:
 def test_rx_accepts_card_packet_shape():
   """card passes exactly what can_capnp_to_list returns: [(nanos, [(address, dat, src), ...]), ...] with plain
   tuples, not CanData. Both a wrong outer iteration and attribute access on the frames crashed card on real drives."""
-  poller = BmsUdsPoller()
+  poller = BmsUdsPoller(bus=OBD_BUS)
   poller.tx()  # send a request so a response is expected
   frames = [(0x2A0, bytes(8), 0), (BMS_RX_ADDR, b"\x03\x7F\x22\x31\x00\x00\x00\x00", OBD_BUS)]
   poller.rx([(123456789, frames), (123456790, [])])
@@ -204,8 +205,22 @@ def test_rx_accepts_card_packet_shape():
 def test_rx_matches_real_can_capnp_to_list_output():
   """Round-trip through the real serializer/deserializer card uses, so the test breaks if that shape changes."""
   from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
-  poller = BmsUdsPoller()
+  poller = BmsUdsPoller(bus=OBD_BUS)
   poller.tx()
   msg = can_list_to_can_capnp([CanData(BMS_RX_ADDR, b"\x03\x7F\x22\x31\x00\x00\x00\x00", OBD_BUS)], msgtype='can')
   poller.rx(can_capnp_to_list([msg]))
   assert poller.state.negative_response_count == 1
+
+
+def test_default_bus_is_ccan_and_ignores_other_bus():
+  assert DEFAULT_BUS == CCAN_BUS == 0
+  poller = BmsUdsPoller()
+  bms = FakeBms(make_payload(soc=40.0), bus=CCAN_BUS)
+  run(poller, bms, 60)
+  assert poller.state.response_count >= 4 and poller.state.decoded.soc == 40.0
+  assert all(f.src == CCAN_BUS for f in BmsUdsPoller().tx())
+  # a response on the OBD bus must not be consumed by a C-CAN poller
+  other = BmsUdsPoller()
+  other.tx()
+  other.rx([(0, [(BMS_RX_ADDR, b"\x03\x7F\x22\x31\x00\x00\x00\x00", OBD_BUS)])])
+  assert other.state.negative_response_count == 0

@@ -192,7 +192,9 @@ class Car:
     sunnypilot_interfaces.log_fingerprint(self.CP)
 
     # sunnypilot: read-only UDS polling of the HV battery BMS on the OBD-II port (EvBmsUdsPolling)
-    self.bms_poller = BmsUdsPoller() if self.CP_SP.flags & HyundaiFlagsSP.BMS_UDS_POLLING else None
+    self.bms_poller = None
+    if self.CP_SP.flags & HyundaiFlagsSP.BMS_UDS_POLLING:
+      self.bms_poller = BmsUdsPoller(bus=int(self.params.get('EvBmsUdsBus') or 0))
 
   def state_update(self) -> tuple[car.CarState, custom.CarStateSP, structs.RadarDataT | None]:
     """carState update loop, driven by can"""

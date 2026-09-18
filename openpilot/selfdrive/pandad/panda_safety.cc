@@ -109,7 +109,8 @@ void PandaSafety::setSafetyMode(const std::vector<std::string> &params_string) {
   const bool bms_uds = (safety_model == cereal::CarParams::SafetyModel::HYUNDAI ||
                         safety_model == cereal::CarParams::SafetyModel::HYUNDAI_LEGACY) &&
                        (safety_param_sp & HYUNDAI_PARAM_SP_BMS_UDS);
-  if (bms_uds) {
+  const std::string bms_bus = params_.get("EvBmsUdsBus");
+  if (bms_uds && bms_bus == "1") {
     LOGW("EvBmsUdsPolling: routing bus 1 to the OBD-II port");
     panda_->set_obd(true);
     // The OBD mux command only re-routes the pins; the ELM327 path in the firmware follows it with a CAN core

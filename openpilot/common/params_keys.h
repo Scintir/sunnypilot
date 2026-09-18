@@ -155,7 +155,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"CarParamsSPPersistent", {PERSISTENT, BYTES}},
     {"CarPlatformBundle", {PERSISTENT | BACKUP, JSON}},
     {"CanDiscoveryMode", {PERSISTENT | BACKUP, INT, "0"}},
-    {"EvBmsUdsPolling", {PERSISTENT | BACKUP, BOOL, "0"}},  // poll the HV battery BMS over UDS on the OBD-II port while driving (Hyundai CAN)  // 0: off, 1: passive sniff (bus 1 = harness CAN2), 2: passive sniff (bus 1 = OBD-II port)
+    {"EvBmsUdsPolling", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"EvBmsUdsBus", {PERSISTENT | BACKUP, INT, "0"}},  // 0: C-CAN (bus 0), 1: OBD-II port (bus 1 mux; costs the radar tracks)  // poll the HV battery BMS over UDS on the OBD-II port while driving (Hyundai CAN)  // 0: off, 1: passive sniff (bus 1 = harness CAN2), 2: passive sniff (bus 1 = OBD-II port)
     {"ChevronInfo", {PERSISTENT | BACKUP, INT, "4"}},
     {"CompletedSunnylinkConsentVersion", {PERSISTENT, STRING, "0"}},
     {"CustomAccIncrementsEnabled", {PERSISTENT | BACKUP, BOOL, "0"}},

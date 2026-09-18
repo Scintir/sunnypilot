@@ -75,6 +75,21 @@ Commits on `ev-can-discovery` beyond origin/master (`a5f44653d7`):
   Bus 1 cannot be both the harness CAN2 pair and the OBD-II port; if radar tracks matter, the BMS has to be
   reached another way (bus 0 answered UDS from 7 ECUs during fingerprinting; the BMS was not among them).
 
+## Drive 4 (2026-09-18, route 00000008--4902dfe79f) and the bus change
+
+- Drive 4 ran the OLD pandad binary (scons cache; device clock was wrong at first build) and the old opendbc, so
+  it tested nothing new. Same result: bus 1 error-passive, REC 127, tx frozen, 0 responses.
+- Later analysis: the ELM327/OBD fingerprint phase never produced any UDS reply on bus 1 either (all 7 ECU
+  responses were on bus 0). The OBD-II CAN path on this install looks dead electrically; the bus 1 traffic seen
+  is the harness CAN2 pair in NORMAL mode (radar tracks etc.).
+- Change: `EvBmsUdsBus` param (int, default 0). Default polls the BMS on **bus 0 (C-CAN)**: safety allowlists
+  0x7E4 on bus 0 too (opendbc 47ed2a20 -> next commit), pandad only switches the OBD mux when the param is 1,
+  radar tracks stay intact. Whether the BMS answers 0x7E4 on C-CAN is unknown; the FW query got no 0x7EC reply
+  there, but it asked different DIDs.
+- Device gotcha: `git submodule update` did not move opendbc; pin it by hand (`cd opendbc_repo && git fetch
+  origin ev-bms-uds && git checkout <sha>`). pandad rebuilds at boot only if scons decides so; force with
+  `rm -f openpilot/selfdrive/pandad/panda_safety.o openpilot/selfdrive/pandad/pandad && scons openpilot/selfdrive/pandad`.
+
 ## Open items, in order
 
 1. (done 2026-09-18, drive 3 happened) Verify the install on the bench before driving. The bench script in the last chat turn had a

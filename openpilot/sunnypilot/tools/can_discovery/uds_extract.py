@@ -17,10 +17,10 @@ import argparse
 import csv
 import sys
 
-from openpilot.sunnypilot.selfdrive.car.hyundai.bms_uds import BMS_RX_ADDR, OBD_BUS, IsoTpReceiver, decode_bms_0101
+from openpilot.sunnypilot.selfdrive.car.hyundai.bms_uds import BMS_RX_ADDR, IsoTpReceiver, decode_bms_0101
 
 
-def extract(identifier: str, rx_addr: int = BMS_RX_ADDR, bus: int = OBD_BUS):
+def extract(identifier: str, rx_addr: int = BMS_RX_ADDR, bus: int | None = None):
   from openpilot.tools.lib.logreader import LogReader, ReadMode
 
   lr = LogReader(identifier, default_mode=ReadMode.RLOG, sort_by_time=True)
@@ -33,7 +33,7 @@ def extract(identifier: str, rx_addr: int = BMS_RX_ADDR, bus: int = OBD_BUS):
     t = msg.logMonoTime * 1e-9
     t0 = t if t0 is None else t0
     for c in msg.can:
-      if c.src != bus or c.address != rx_addr:
+      if c.address != rx_addr or (bus is not None and c.src != bus) or c.src > 2:
         continue
       rx.push(bytes(c.dat))
       if rx.complete is None:
@@ -55,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
   ap.add_argument("route")
   ap.add_argument("--csv", help="write rows here (default stdout)")
   ap.add_argument("--rx-addr", type=lambda x: int(x, 0), default=BMS_RX_ADDR)
-  ap.add_argument("--bus", type=int, default=OBD_BUS)
+  ap.add_argument("--bus", type=int, default=None, help="restrict to one bus (default: any vehicle bus)")
   args = ap.parse_args(argv)
 
   rows = extract(args.route, args.rx_addr, args.bus)
