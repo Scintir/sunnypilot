@@ -90,6 +90,19 @@ Commits on `ev-can-discovery` beyond origin/master (`a5f44653d7`):
   origin ev-bms-uds && git checkout <sha>`). pandad rebuilds at boot only if scons decides so; force with
   `rm -f openpilot/selfdrive/pandad/panda_safety.o openpilot/selfdrive/pandad/pandad && scons openpilot/selfdrive/pandad`.
 
+## Drive 5 (2026-09-18, route 0000000a--2f3f7ee675, bus 0 polling)
+
+- Software chain verified end to end: 455 requests, 455 TX echoes on bus 0 (src 128), safetyTxBlocked flat,
+  radar tracks intact (~1200 radarTracks/segment), no commIssue, openpilot engaged (pcmEnable).
+- BMS result: 0 responses, 0 negative responses. Nothing at 0x7E4 answers on C-CAN. The 7 ECUs that answered the
+  FW query on bus 0 are all chassis/ADAS (0x7B1 ABS, 0x7B7 MDPS, 0x7C4, 0x7C6 cluster, 0x7D0 radar, 0x7D4,
+  0x730); no powertrain ECU (0x7E0 ECM, 0x7E2 HCU, 0x7E4 BMS) is reachable from bus 0. The powertrain domain sits
+  behind the gateway and is only exposed on the OBD-II port.
+- The OBD-II port path (bus 1 mux) is dead on this install (error-passive, REC pegged, no replies even during the
+  firmware's own OBD phase). Next step is physical: identify the OBD-C cable (comma power version / CAN
+  passthrough) and check continuity of OBD pins 6 and 14 into the harness box. Until the OBD path works, the
+  BMS is not reachable from the comma four on this car.
+
 ## Open items, in order
 
 1. (done 2026-09-18, drive 3 happened) Verify the install on the bench before driving. The bench script in the last chat turn had a
