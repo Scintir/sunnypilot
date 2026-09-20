@@ -114,6 +114,19 @@ Commits on `ev-can-discovery` beyond origin/master (`a5f44653d7`):
 - Software status: complete and verified. Polling works end to end on either bus; no ECU at 0x7E4 on C-CAN;
   OBD path blocked by hardware. Params restored (CanDiscoveryMode=0, EvBmsUdsPolling=True, EvBmsUdsBus=0).
 
+## Alex's own branch, ported (2026-09-19)
+
+Alex's daily-driver branch was `2022_hyundai_sf_phev` on the fork: sunnypilot v2026.001.000 prebuilt (AGNOS 17.2,
+old layout, vendored submodules) + 19 of his commits: EV power limiter (estimator-based, in opendbc Hyundai
+longitudinal controller), Stopped Vehicle Approach (planner override), T_FOLLOW changes, calibration box-check
+bypass, and UI toggles. Ported onto origin/master a5f44653d7 (AGNOS 19.7, new layout) as:
+- sunnypilot `2022_hyundai_sf_phev-2026.09` on https://github.com/Scintir/sunnypilot
+- opendbc `sf-phev-2026.09` on https://github.com/Scintir/opendbc (from f95f996f, the master pointer)
+Old branch left untouched. Not merged with `ev-can-discovery`; both are independent of origin/master.
+Verified off-device: py_compile, ruff, limiter/SVA tests (25), sunnylink schema tests (43) with params built
+from the ported params_keys.h. Not verified: on-device build and behaviour. Install like the ev-can-discovery
+branch (SSH checkout + submodule pin from the Scintir opendbc fork); no AGNOS change since the device is on 19.7.
+
 ## Open items, in order
 
 1. (done 2026-09-18, drive 3 happened) Verify the install on the bench before driving. The bench script in the last chat turn had a
