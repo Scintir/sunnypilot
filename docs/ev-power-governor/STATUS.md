@@ -103,6 +103,17 @@ Commits on `ev-can-discovery` beyond origin/master (`a5f44653d7`):
   passthrough) and check continuity of OBD pins 6 and 14 into the harness box. Until the OBD path works, the
   BMS is not reachable from the comma four on this car.
 
+## Drive 6 (2026-09-19, route 0000000f--fb87d2ef33, CanDiscoveryMode=2 passive OBD test)
+
+- Panda in ELM327 param 0 (the firmware's own OBD mux + can_init_all path) for 10 minutes: **0 frames received on
+  bus 1**, REC climbed 33 -> 127, error-passive, for the whole drive. Not a software sequencing problem: the
+  firmware's own OBD configuration sees nothing on the port.
+- Conclusion: the OBD-II CAN pair (pins 6/14) is not reaching the panda on this install. comma power is
+  documented to carry OBD CAN, so suspect the 4-pin comma power plug seating in the harness box, the comma power
+  unit itself, or the OBD-C cable. (Remote possibility: OBD CAN at a bit rate other than 500 kbps; not tested.)
+- Software status: complete and verified. Polling works end to end on either bus; no ECU at 0x7E4 on C-CAN;
+  OBD path blocked by hardware. Params restored (CanDiscoveryMode=0, EvBmsUdsPolling=True, EvBmsUdsBus=0).
+
 ## Open items, in order
 
 1. (done 2026-09-18, drive 3 happened) Verify the install on the bench before driving. The bench script in the last chat turn had a
