@@ -15,7 +15,9 @@ from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
+from openpilot.common.params import Params
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
+from opendbc.sunnypilot.car.hyundai.longitudinal.stopped_vehicle_approach import StoppedVehicleApproach
 
 A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
@@ -73,8 +75,24 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.a_desired_trajectory = np.zeros(CONTROL_N)
     self.j_desired_trajectory = np.zeros(CONTROL_N)
 
+    # Stopped Vehicle Approach
+    self.sva = StoppedVehicleApproach(dt=self.dt)
+    self._sva_params = Params()
+    self._sva_param_counter = 0
+
   def update(self, sm):
     LongitudinalPlannerSP.update(self, sm)
+
+    # Read SVA params periodically (~1Hz at 20Hz planner rate)
+    self._sva_param_counter += 1
+    if self._sva_param_counter >= 20:
+      self._sva_param_counter = 0
+      try:
+        sva_enabled = self._sva_params.get_bool("StoppedVehicleApproachEnabled")
+        sva_logging = self._sva_params.get_bool("StoppedVehicleApproachLogging")
+        self.sva.update_params(sva_enabled, sva_logging)
+      except (ValueError, TypeError):
+        pass
 
     if len(sm['carControl'].orientationNED) == 3:
       accel_coast = get_coast_accel(sm['carControl'].orientationNED[1])
@@ -152,6 +170,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
+
+    # Stopped Vehicle Approach: override acceleration target for stopped leads
+    lead = sm['radarState'].leadOne
+    output_a_target, self.output_should_stop = self.sva.update(lead, v_ego, output_a_target, self.output_should_stop)
+
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0

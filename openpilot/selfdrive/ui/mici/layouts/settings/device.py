@@ -174,6 +174,8 @@ class DeviceLayoutMici(NavScroller):
       params.remove("LiveTorqueParameters")
       params.remove("LiveParametersV2")
       params.remove("LiveDelay")
+      # Fix C: tell calibrationd this is a user-requested reset so it starts in the recalibrating state
+      params.put_bool("CalibrationResetRequested", True)
       params.put_bool("OnroadCycleRequested", True, block=True)
 
     reset_calibration_btn = EngagedConfirmationButton("reset calibration", "reset", gui_app.texture("icons_mici/settings/device/lkas.png", 122, 64),

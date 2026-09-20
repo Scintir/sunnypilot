@@ -57,6 +57,50 @@ sections:
         type: capability
         field: has_longitudinal_control
         equals: true
+- id: ev_power_limit
+  title: EV Power Limit
+  description: ''
+  items:
+  - key: EVPowerLimitEnabled
+    widget: toggle
+    title: EV Power Limit
+    description: Limit positive longitudinal power to keep the vehicle in EV mode. The vehicle may slow down on grades to stay within the power limit.
+  - key: EVPowerLimitKW
+    widget: option
+    title: Power Limit (kW)
+    description: Maximum positive propulsion power allowed before limiting acceleration.
+    min: 20
+    max: 55
+    step: 5
+    unit: kW
+    enablement:
+    - type: param
+      key: EVPowerLimitEnabled
+      equals: true
+  - key: EVPowerLimitLogging
+    widget: toggle
+    title: EV Power Limit Logging
+    description: Log power limiter activity to /data/logs/ for diagnostics.
+    enablement:
+    - type: param
+      key: EVPowerLimitEnabled
+      equals: true
+- id: stopped_vehicle_approach
+  title: Stopped Vehicle Approach
+  description: ''
+  items:
+  - key: StoppedVehicleApproachEnabled
+    widget: toggle
+    title: Stopped Vehicle Approach
+    description: More aggressive braking when approaching stopped vehicles. Prioritizes safe stopping distance over ride comfort.
+  - key: StoppedVehicleApproachLogging
+    widget: toggle
+    title: SVA Logging
+    description: Log stopped vehicle approach events to /data/logs/ for diagnostics.
+    enablement:
+    - type: param
+      key: StoppedVehicleApproachEnabled
+      equals: true
 - id: custom_acc_increments
   title: Custom ACC Speed Intervals
   description: ''

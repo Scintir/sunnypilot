@@ -3,11 +3,40 @@ from collections.abc import Callable
 from openpilot.cereal import log
 
 from openpilot.system.ui.widgets.scroller import NavScroller
-from openpilot.selfdrive.ui.mici.widgets.button import BigParamControl, BigMultiParamToggle, BigToggle, GreyBigButton
+from openpilot.common.params import Params
+from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigParamControl, BigMultiParamToggle, BigToggle, GreyBigButton
 from openpilot.selfdrive.ui.mici.widgets.dialog import BigConfirmationCircleButton
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.selfdrive.ui.layouts.settings.common import restart_needed_callback
 from openpilot.selfdrive.ui.ui_state import ui_state
+
+
+
+class EVPowerLimitKWButton(BigButton):
+  """Cycling button for EV power limit kW setting. Tapping cycles 20->25->...->55->20."""
+  KW_VALUES = list(range(20, 60, 5))  # [20, 25, 30, 35, 40, 45, 50, 55]
+
+  def __init__(self):
+    super().__init__("EV power limit", "")
+    self._params = Params()
+    self._load_value()
+
+  def _load_value(self):
+    kw = self._params.get("EVPowerLimitKW", return_default=True)
+    if kw not in self.KW_VALUES:
+      kw = 35
+    self.set_value(f"{kw} kW")
+
+  def _handle_mouse_release(self, mouse_pos):
+    super()._handle_mouse_release(mouse_pos)
+    kw = self._params.get("EVPowerLimitKW", return_default=True)
+    if kw not in self.KW_VALUES:
+      kw = 35
+    idx = self.KW_VALUES.index(kw)
+    next_kw = self.KW_VALUES[(idx + 1) % len(self.KW_VALUES)]
+    self._params.put("EVPowerLimitKW", next_kw)
+    self.set_value(f"{next_kw} kW")
+
 
 PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
 
@@ -51,6 +80,23 @@ class TogglesLayoutMici(NavScroller):
     record_mic = BigParamControl("record & upload mic audio", "RecordAudio", toggle_callback=restart_needed_callback)
     enable_openpilot = BigParamControl("enable sunnypilot", "OpenpilotEnabledToggle", toggle_callback=restart_needed_callback)
 
+    # EV Power Limit
+    self._ev_power_limit_toggle = BigParamControl("EV power limit", "EVPowerLimitEnabled",
+                                                   toggle_callback=self._on_ev_power_toggle)
+    self._ev_kw_btn = EVPowerLimitKWButton()
+    self._ev_power_limit_logging = BigParamControl("EV power limit logging", "EVPowerLimitLogging")
+
+    # Stopped Vehicle Approach
+    self._sva_toggle = BigParamControl("stopped vehicle approach", "StoppedVehicleApproachEnabled",
+                                        toggle_callback=self._on_sva_toggle)
+    self._sva_logging = BigParamControl("SVA logging", "StoppedVehicleApproachLogging")
+
+    # Calibration box-check bypass (Fix C).
+    # Off by default: the box check runs normally. Toggling on disables the
+    # pitch/yaw limit check so openpilot won't soft-disengage on transient
+    # calibration bias (e.g. the bumpy commute stretch). Spread check still runs.
+    self._calib_bypass_toggle = BigParamControl("disable calibration box check", "CalibrationBoxCheckDisabled")
+
     self._scroller.add_widgets([
       self._personality_toggle,
       self._experimental_btn,
@@ -60,6 +106,12 @@ class TogglesLayoutMici(NavScroller):
       record_front,
       record_mic,
       enable_openpilot,
+      self._ev_power_limit_toggle,
+      self._ev_kw_btn,
+      self._ev_power_limit_logging,
+      self._sva_toggle,
+      self._sva_logging,
+      self._calib_bypass_toggle,
     ])
 
     # Toggle lists
@@ -71,6 +123,7 @@ class TogglesLayoutMici(NavScroller):
       ("RecordFront", record_front),
       ("RecordAudio", record_mic),
       ("OpenpilotEnabledToggle", enable_openpilot),
+      ("CalibrationBoxCheckDisabled", self._calib_bypass_toggle),
     )
 
     enable_openpilot.set_enabled(lambda: not ui_state.engaged)
@@ -91,6 +144,13 @@ class TogglesLayoutMici(NavScroller):
       if personality != ui_state.personality and ui_state.started:
         self._personality_toggle.set_value(self._personality_toggle._options[personality])
       ui_state.personality = personality
+
+  def _on_ev_power_toggle(self, checked):
+    self._ev_kw_btn.set_visible(checked)
+    self._ev_power_limit_logging.set_visible(checked)
+
+  def _on_sva_toggle(self, checked):
+    self._sva_logging.set_visible(checked)
 
   def show_event(self):
     super().show_event()
@@ -114,6 +174,18 @@ class TogglesLayoutMici(NavScroller):
     # Refresh toggles from params to mirror external changes
     for key, item in self._refresh_toggles:
       item.set_checked(ui_state.params.get_bool(key))
+
+    # Sync EV power limit visibility
+    ev_enabled = ui_state.params.get_bool("EVPowerLimitEnabled")
+    self._ev_power_limit_toggle.set_checked(ev_enabled)
+    self._ev_kw_btn.set_visible(ev_enabled)
+    self._ev_power_limit_logging.set_visible(ev_enabled)
+    self._ev_kw_btn._load_value()
+
+    # Sync SVA visibility
+    sva_enabled = ui_state.params.get_bool("StoppedVehicleApproachEnabled")
+    self._sva_toggle.set_checked(sva_enabled)
+    self._sva_logging.set_visible(sva_enabled)
 
   def _on_experimental_mode(self, state: bool):
     if state and not ui_state.params.get_bool("ExperimentalModeConfirmed"):
