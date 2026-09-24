@@ -127,6 +127,20 @@ Verified off-device: py_compile, ruff, limiter/SVA tests (25), sunnylink schema 
 from the ported params_keys.h. Not verified: on-device build and behaviour. Install like the ev-can-discovery
 branch (SSH checkout + submodule pin from the Scintir opendbc fork); no AGNOS change since the device is on 19.7.
 
+## Correction (2026-09-24): the real daily branch was `staging-mici`, now ported
+
+Alex's on-screen EV limiter HUD and the working limiter live on `staging-mici` (39 commits, "ev_limiter iter16a",
+2026-05-29): a button-injection limiter for stock longitudinal (CLU11 SET/RES injection, ClusterButtonRateLimiter
+wire-side gate, carstate_ext power estimator, CarStateSP telemetry @1-@77, log uploader daemon). The April
+`2022_hyundai_sf_phev` port was the older openpilot-long-based approach without the HUD; Alex confirmed the
+staging-mici port replaces it. Ported as:
+- sunnypilot `staging-mici-2026.09` (824e63acef) on https://github.com/Scintir/sunnypilot
+- opendbc `sf-phev-limiter-2026.09` (9c1c269c) on https://github.com/Scintir/opendbc
+Verified off-device: 264 ported tests, lint, params build, CarStateSP capnp round trip, process_config import.
+The earlier `2022_hyundai_sf_phev-2026.09` / `sf-phev-2026.09` branches are left in place (not deleted).
+Alex reported an ICE activation on the April port with sunnypilot in longitudinal control; the staging-mici
+limiter is the one tuned over ~19 drives and is designed for stock longitudinal.
+
 ## Open items, in order
 
 1. (done 2026-09-18, drive 3 happened) Verify the install on the bench before driving. The bench script in the last chat turn had a
