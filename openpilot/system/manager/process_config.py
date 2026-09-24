@@ -4,7 +4,7 @@ import platform
 
 from opendbc.car.structs import car
 from openpilot.cereal import custom
-from openpilot.common.params import Params
+from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.hardware import PC, COMMA_HARDWARE
 from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
 from openpilot.common.hardware.hw import Paths
@@ -100,6 +100,23 @@ def uploader_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
 
   return always_run(started, params, CP)
 
+def log_uploader_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
+  # On release/staging branches the prebuilt params_pyx.so has a compiled-in
+  # allowlist of param keys that doesn't know about our custom keys yet;
+  # reading an unregistered key raises UnknownKeyName and would crash the
+  # manager on boot. Trap it here so the daemon simply stays dormant until
+  # the .so is rebuilt.
+  if started:
+    return False
+  try:
+    if not params.get_bool("LogUploadEnabled"):
+      return False
+    if not params.get("LogUploadDestination"):
+      return False
+  except UnknownKeyName:
+    return False
+  return True
+
 def or_(*fns):
   return lambda *args: operator.or_(*(fn(*args) for fn in fns))
 
@@ -180,6 +197,11 @@ procs += [
 
   # locationd
   NativeProcess("locationd_llk", "openpilot/sunnypilot/selfdrive/locationd", ["./locationd"], only_onroad),
+]
+
+# CAN log uploader (offroad rsync to a user-managed server; dormant until LogUploadDestination is set)
+procs += [
+  PythonProcess("log_uploader", "openpilot.sunnypilot.log_uploader.rsync_uploader", log_uploader_ready),
 ]
 
 if os.path.exists("../../sunnypilot/sunnylink/uploader.py"):

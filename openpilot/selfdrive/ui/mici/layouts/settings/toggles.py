@@ -5,6 +5,7 @@ from openpilot.cereal import log
 from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.mici.widgets.button import BigParamControl, BigMultiParamToggle, BigToggle, GreyBigButton
 from openpilot.selfdrive.ui.mici.widgets.dialog import BigConfirmationCircleButton
+from openpilot.selfdrive.ui.sunnypilot.mici.widgets.cycling_int_button import CyclingIntButton
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.selfdrive.ui.layouts.settings.common import restart_needed_callback
 from openpilot.selfdrive.ui.ui_state import ui_state
@@ -73,6 +74,88 @@ class TogglesLayoutMici(NavScroller):
       ("OpenpilotEnabledToggle", enable_openpilot),
     )
 
+    # EV limiter + log upload — only rendered if params_pyx.so has been
+    # rebuilt to know about our custom keys. On a stock prebuilt library
+    # any probe raises UnknownKeyName, and any OTHER exception (stale
+    # .so, corrupted widget, missing upstream dep) should ALSO not wipe
+    # out the Toggles panel. Catch broadly and keep going — user can
+    # still reach experimental/metric/record/etc.
+    self._cycling_refresh = ()
+    try:
+      ui_state.params.get_bool("EVLimiterEnabled")
+      ev_widgets_ok = True
+    except Exception:
+      ev_widgets_ok = False
+
+    if ev_widgets_ok:
+      try:
+        log_upload = BigParamControl("upload CAN logs", "LogUploadEnabled")
+        ev_limiter = BigParamControl("EV power limiter", "EVLimiterEnabled")
+        ev_power_thr = CyclingIntButton(
+          "EV limiter power threshold",
+          "EVLimiterPowerThresholdKW",
+          # iter7: finer 2 kW step from 20 → 50, wraps at 50 → 20.
+          # Drive #6 user feedback: 10 kW step was too coarse for tuning.
+          values=list(range(20, 51, 2)),
+          suffix=" kW",
+          default=40,
+        )
+        ev_dte_floor = CyclingIntButton(
+          "EV limiter DTE floor",
+          "EVLimiterDTEFloor",
+          values=[1, 3, 5, 10, 20, 50],
+          suffix="",
+          default=5,
+        )
+        ev_max_gap = CyclingIntButton(
+          "EV limiter max gap",
+          "EVLimiterMaxGapMph",
+          values=[3, 5, 7, 10, 15],
+          suffix=" mph",
+          default=5,
+        )
+        # iter10 Layer 1: max-deficit cap on (user_target - cluster_set).
+        # Bounded reference governor uses this as the floor on cluster set
+        # speed during NORMAL mode at highway. Drive #8 had 13 mph deficit;
+        # 7 default is a balance between EV protection and driver UX.
+        ev_max_deficit = CyclingIntButton(
+          "EV limiter max deficit",
+          "EvLimiterMaxDeficitMph",
+          values=[5, 6, 7, 8, 10],
+          suffix=" mph",
+          default=7,
+        )
+        self._scroller.add_widgets([log_upload, ev_limiter, ev_power_thr, ev_dte_floor, ev_max_gap, ev_max_deficit])
+        self._refresh_toggles = self._refresh_toggles + (
+          ("LogUploadEnabled", log_upload),
+          ("EVLimiterEnabled", ev_limiter),
+        )
+        self._cycling_refresh = (ev_power_thr, ev_dte_floor, ev_max_gap, ev_max_deficit)
+      except Exception as e:  # widget constructors must not take down the panel
+        print(f"[toggles] EV-limiter widget init failed: {type(e).__name__}: {e}")
+
+    # Calibration box-check bypass (re-applied from older branch).
+    # Off by default: the upstream PITCH/YAW box check runs normally.
+    # Toggling on disables only the box check — the spread check still runs,
+    # so genuine mount shifts will still trigger recalibrating.
+    # Same defensive try/except pattern as the EV widgets above.
+    try:
+      ui_state.params.get_bool("CalibrationBoxCheckDisabled")
+      cal_widget_ok = True
+    except Exception:
+      cal_widget_ok = False
+
+    if cal_widget_ok:
+      try:
+        calib_bypass = BigParamControl("disable calibration box check",
+                                       "CalibrationBoxCheckDisabled")
+        self._scroller.add_widgets([calib_bypass])
+        self._refresh_toggles = self._refresh_toggles + (
+          ("CalibrationBoxCheckDisabled", calib_bypass),
+        )
+      except Exception as e:
+        print(f"[toggles] calibration-bypass widget init failed: {type(e).__name__}: {e}")
+
     enable_openpilot.set_enabled(lambda: not ui_state.engaged)
     record_front.set_enabled(False if ui_state.params.get_bool("RecordFrontLock") else (lambda: not ui_state.engaged))
     record_mic.set_enabled(lambda: not ui_state.engaged)
@@ -113,7 +196,17 @@ class TogglesLayoutMici(NavScroller):
 
     # Refresh toggles from params to mirror external changes
     for key, item in self._refresh_toggles:
-      item.set_checked(ui_state.params.get_bool(key))
+      try:
+        item.set_checked(ui_state.params.get_bool(key))
+      except Exception:
+        pass
+
+    # Refresh cycling-int displays (EV limiter tunables set via SSH etc.)
+    for btn in getattr(self, "_cycling_refresh", ()):
+      try:
+        btn._refresh_display()
+      except Exception:
+        pass
 
   def _on_experimental_mode(self, state: bool):
     if state and not ui_state.params.get_bool("ExperimentalModeConfirmed"):

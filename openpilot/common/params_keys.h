@@ -274,6 +274,29 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"RoadName", {CLEAR_ON_ONROAD_TRANSITION, STRING}},
     {"RoadNameToggle", {PERSISTENT | BACKUP, BOOL, "0"}},
 
+    // --- EV limiter + log upload (Scintir project, local to device) ---
+    {"LogUploadEnabled", {PERSISTENT, BOOL, "1"}},
+    {"LogUploadDestination", {PERSISTENT, STRING, ""}},
+    {"LogUploadWifiOnly", {PERSISTENT, BOOL, "1"}},
+    {"LogKeepLocalRoutes", {PERSISTENT, INT, "10"}},
+    {"EVLimiterEnabled", {PERSISTENT, BOOL, "1"}},
+    {"EVLimiterPowerThresholdKW", {PERSISTENT, INT, "40"}},
+    {"EVLimiterDTEFloor", {PERSISTENT, INT, "5"}},
+    {"EVLimiterMaxGapMph", {PERSISTENT, INT, "5"}},
+    {"EvLimiterMaxDeficitMph", {PERSISTENT, INT, "7"}},   // iter10 Layer 1: bounded governor max-deficit floor
+    {"EvLimiterAssumeEvOnly", {PERSISTENT, BOOL, "1"}},   // iter11 Fix E: assume EV-only operation; cap est power at motor max
+    {"EvLimiterMotorCapKW", {PERSISTENT, INT, "60"}},     // iter11 Fix E: EV motor max power (Santa Fe PHEV ~60kW)
+
+    // Calibration box-check bypass + reset signaling (re-applied from older branch).
+    // CalibrationBoxCheckDisabled: when true, is_calibration_valid() returns True
+    //   unconditionally (skips PITCH/YAW box check). Spread check still runs, so
+    //   genuine mount shifts still trip the recalibrating path.
+    // CalibrationResetRequested: one-shot flag set by the mici "Reset Calibration"
+    //   button. Consumed by calibrationd at startup to initialize cal_status as
+    //   "recalibrating" rather than first-time "calibrating".
+    {"CalibrationBoxCheckDisabled", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"CalibrationResetRequested", {PERSISTENT, BOOL, "0"}},
+
     // Speed Limit
     {"SpeedLimitMode", {PERSISTENT | BACKUP, INT, "1"}},
     {"SpeedLimitOffsetType", {PERSISTENT | BACKUP, INT, "0"}},

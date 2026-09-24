@@ -445,8 +445,160 @@ struct BackupManagerSP @0xf98d843bfd7004a3 {
   }
 }
 
+# iter13 v4: block-reason enum for EV limiter button-injection diagnostics.
+# Ordinals must match BLOCK_REASON_PRIORITY order in
+# opendbc/sunnypilot/car/hyundai/car_controller_button_limiter.py.
+# Stage-1 (unconditional): @1-@19 (D2 reorder: physical state @8-@10 BEFORE latch @11)
+# Stage-2 (sliding-window rate limits): @20-@25 (sameFrame highest, then all-button, then SET-specific)
+enum EvLimiterBlockReason {
+  none @0;
+  invalidButtonRequest @1;
+  busFailsafe @2;
+  clusterInvalid @3;
+  gearNotDrive @4;
+  doorOpen @5;
+  seatbeltUnbuckled @6;
+  systemUnavailable @7;
+  brakePressed @8;
+  gasPressed @9;
+  driverButtonConflict @10;
+  sccCancelInhibit @11;
+  cruiseDisabled @12;
+  modeForbidden @13;
+  evModeAssumedFalse @14;
+  paramReadFailed @15;
+  minIntervalNotMet @16;
+  cooldownActive @17;
+  standstillNoAckBackoff @18;
+  standstillCapReached @19;
+  rateLimitSameFrame @20;
+  rateLimitAll100ms @21;
+  rateLimitAll1s @22;
+  rateLimit100ms @23;
+  rateLimit500ms @24;
+  rateLimit1s @25;
+  other @26;
+  # iter14 v2 — power-gated RECOVERY block reasons (drive 18 RECOVERY-while-capped)
+  recoveryYieldedToSoftCap @27;       # state machine forced down by power guard
+  powerOverBudget @28;                # est_power_control_w >= cap (not specifically the yield itself)
+  recoveryReentryLocked @29;          # lockout active, RECOVERY re-entry blocked
+  # iter15 v2 — post-RES quiet period (Section D) + grade clamp (Section B) informational
+  softcapDecrementSuppressedPostRes @30;  # SOFT_CAP decrement blocked during RES quiet
+  gradeContributionCapped @31;            # grade power above cap (informational)
+}
+
 struct CarStateSP @0xb86e6369214c01c8 {
   speedLimit @0 :Float32;
+
+  # EV power limiter signals (Hyundai Santa Fe PHEV)
+  evLimiterActive @1 :Bool;                       # limiter is commanding a set-speed offset
+  evLimiterSetSpeedOffset @2 :Float32;            # user target minus effective set speed, m/s (UI converts to mph/kph)
+  accelDemand @3 :Float32;                        # TCS13.aBasis, m/s^2 (aggregated: driver + SCC + control overlay)
+  dteRaw @4 :UInt16;                              # CLU13.CF_Clu_DTE, 10-bit raw cluster distance-to-empty
+  estPowerW @5 :Float32;                          # mass * max(0, aBasis + uphill_grade_accel) * vEgo, W -- grade-aware propulsion power demand proxy
+  evLimiterUserTargetSpeed @6 :Float32;           # m/s — driver's intended set speed (what HUD should say "recover to")
+  evLimiterState @7 :UInt8;                       # state-machine enum: 0 IDLE, 1 STANDSTILL_HOLD, 2 SOFT_CAP_ACTIVE, 3 RECOVERY_ACTIVE, 4 DRIVER_OVERRIDE_SET, 5 DRIVER_OVERRIDE_RES, 6 BUS_FAULT_HOLD, 7 DISABLED
+  evLimiterGradeAccel @8 :Float32;                # m/s^2, signed; LP-filtered (LONG_ACCEL - aEgo). Positive = uphill. Used to grade-correct estPowerW.
+  # iter11 telemetry additions (drive #9-13 forensics, post-hoc visibility)
+  estPowerRawW @9 :Float32;                       # Pre-cap, pre-saturation power. Forensic.
+  estPowerCapped @10 :Bool;                       # True when EV cap clipped power this frame
+  estPowerSaturated @11 :Bool;                    # True when abasis>>aEgo saturation substitution active
+  evModeAssumed @12 :Bool;                        # EvLimiterAssumeEvOnly param value
+  evLimiterGradeAccelSource @13 :UInt8;           # 0=NONE, 1=LEGACY_ACCEL, 2=LLK_CALIBRATED
+  evLimiterKalmanRejectReason @14 :UInt8;         # bitmask: 1=status, 2=inputsOK, 4=sensorsOK, 8=cal_valid, 16=pitch_oob
+  evLimiterIneffectiveResEvents @15 :UInt16;      # cumulative count of ineffective-RES escape attempts
+  evLimiterMaxDeficitViolationFrames @16 :UInt32; # cumulative frames where cluster < lower_bound (engaged-no-override)
+  evLimiterTransitionsBlockedByDwell @17 :UInt32; # cumulative transitions blocked by min-dwell
+  evLimiterTransitionsBlockedBySustain @18 :UInt32; # cumulative transitions blocked by sustain
+  evLimiterPowerHighPendingFrames @19 :UInt32;    # cumulative frames power_too_high while in highway cooldown
+  abasisFiltered @20 :Float32;                    # LP-filtered abasis, forensic
+  aEgoFiltered @21 :Float32;                      # LP-filtered aEgo, forensic
+  evLimiterRecentTransitions @22 :Text;           # Compact log of last ~10 transitions for forensic. ≤200 chars.
+
+  # iter13 v4 telemetry additions (drive 17 SCC auto-cancel root cause + reset)
+  evLimiterLastBlockReason @23 :EvLimiterBlockReason;  # last reason a desired button was blocked at CarController limiter
+  evModeParamReadOk @24 :Bool;                          # True iff Params().get_bool("EvLimiterAssumeEvOnly") succeeded
+  evLimiterSetRequested @25 :UInt32;                    # cumulative SETs requested by EVLimiter (decision-side)
+  evLimiterSetEmitted @26 :UInt32;                      # cumulative SETs emitted onto CAN by CarController (wire-side)
+  evLimiterSetDropped @27 :UInt32;                      # cumulative SETs blocked at CarController rate limiter
+  evLimiterSetClusterDecrementAcked @28 :UInt32;        # cumulative 1-to-1 cluster-decrement ACKs after emitted SET
+  evLimiterSetNoAckEvents @29 :UInt32;                  # cumulative ≥3-emitted-without-ack sequences
+  evLimiterStandstillEntered @30 :UInt32;               # cumulative STANDSTILL_PRELAUNCH_SET state entries
+  evLimiterStandstillExitedByAchieved @31 :UInt32;      # exits because cluster reached launch_target
+  evLimiterStandstillExitedByNoAckBackoff @32 :UInt32;  # exits because of no-ack backoff
+  evLimiterStandstillSetRequested @33 :UInt32;          # standstill-slice of evLimiterSetRequested
+  evLimiterStandstillSetEmitted @34 :UInt32;            # standstill-slice of evLimiterSetEmitted
+  evLimiterStandstillSetDropped @35 :UInt32;            # standstill-slice of evLimiterSetDropped
+  evLimiterSuspectedSccCancelEvents @36 :UInt32;        # cumulative suspected limiter-induced SCC cancels
+  evLimiterFaultInhibitActive @37 :Bool;                # circuit-breaker latched (blocks all button injection)
+  evLimiterFaultInhibitReason @38 :EvLimiterBlockReason;  # reason associated with the fault inhibit
+  evLimiterAllBtnEmitted @39 :UInt32;                   # cumulative all-button (SET/RES/CANCEL/GAP) emissions
+  evLimiterCarControllerLimiterTickRate @40 :UInt8;     # diagnostic: CarController frame rate (typ. 100 Hz)
+
+  # iter14 v2 telemetry additions (drive 18 RECOVERY-while-capped + estimator decoupling)
+  estPowerInstantW @41 :Float32;                        # truly raw, no LP, no cap — forensic / diagnosis only
+  estPowerControlW @42 :Float32;                        # short-tau LP (rise=50ms, fall=300ms), uncapped — state arbiter input
+  evLimiterPowerCappedSustainFrames @43 :UInt32;        # diagnostic counter: frames at est_power_control_w >= cap (sustained-capped trigger removed)
+  evLimiterPowerNearBudgetSustainFrames @44 :UInt32;    # debounce counter: frames at est_power_control_w >= 0.95*cap
+  evLimiterEstPowerRawIsFiltered @45 :Bool;             # = true; clarifies that estPowerRawW @9 is filtered, not raw
+
+  # iter14 v2 transition-decision instrumentation (every-frame for replay forensics).
+  # Renumbered from plan's @50-@56 to @46-@52 for capnp sequential-ordinal requirement.
+  evLimiterStatePriorTransition @46 :UInt8;             # state at start of update()
+  evLimiterStateCandidateBeforeGuard @47 :UInt8;        # what state arbiter wanted before power guard
+  evLimiterStateAfterPowerGuard @48 :UInt8;             # what the guard forced (= published evLimiterState)
+  evLimiterPowerGuardYieldReason @49 :Text;             # "none" | "immediate" | "debounced"
+  evLimiterPowerGuardLockoutActive @50 :Bool;           # softcap_from_recovery_lockout active (lockout time + headroom not satisfied)
+  evLimiterRecoveryYieldEvents @51 :UInt32;             # cumulative RECOVERY → SOFT_CAP yields by power guard
+  evLimiterRecoveryLockoutsEntered @52 :UInt32;         # cumulative frames where RECOVERY blocked by lockout
+
+  # iter15 v2 telemetry — must lockstep with structs.py CarStateSP @53-@69.
+  # Hard-preempt fix (Section A): the guard ACTUALLY changed state away from RECOVERY this frame.
+  evLimiterGuardForcedTransition @53 :Bool;             # True iff guard forced new_state != prior_state THIS frame
+  evLimiterGuardForcedTransitionEvents @54 :UInt32;     # cumulative frames where guard forced transition
+
+  # Grade clamp (Section B): anti-overread CLAMP; raw may exceed cap (R2-MF-2)
+  evLimiterGradePowerRawW @55 :Float32;                 # pre-clamp grade contribution (raw — may exceed cap)
+  evLimiterGradePowerCappedFrames @56 :UInt32;          # frames where grade_power_raw > cap (clamp fired)
+
+  # Long-standstill narrow reset event counter (Section C)
+  evLimiterLongStandstillResets @57 :UInt32;            # narrow reset events (anything cleared)
+
+  # Post-RES quiet (Section D)
+  evLimiterPostResQuietActive @58 :Bool;                # this frame is within POST_RES_QUIET_PERIOD_FRAMES
+  evLimiterSoftcapDecrementSuppressedFrames @59 :UInt32;  # frames where softcap-driven SET decrement was suppressed
+  evLimiterSoftcapDecrementSuppressedEvents @60 :UInt32;  # edge-detected episodes (R1-MF-D)
+
+  # @61-@62 RESERVED for iter16 HEV CAN passive (do NOT use in iter15 — R2-MF-4)
+  evLimiterReservedIter16A @61 :UInt32;                 # RESERVED iter16: evLimiterRealMotorPowerW
+  evLimiterReservedIter16B @62 :UInt32;                 # RESERVED iter16: evLimiterRealMotorPowerSignalSource
+
+  # Edge-detected recovery yield episodes (Section A — supplements frame counter @51)
+  evLimiterRecoveryYieldEpisodes @63 :UInt32;           # EDGE-DETECTED RECOVERY→SOFT_CAP episodes (strict R2-MF-1)
+
+  # Long-standstill state vector telemetry (Section C R1-MF-C)
+  evLimiterStandstillExitStateSnapshot @64 :Text;       # JSON-or-delimited state vector at exit (<=200 chars)
+  evLimiterStandstillExitTimeS @65 :Float32;            # last standstill duration in seconds
+  evLimiterStandstillExitToFirstResLatencyFrames @66 :UInt32;  # post-exit count until first RES emit
+  evLimiterLongStandstillPrelaunchBackoffCleared @67 :UInt32;  # cumulative narrow-reset PRELAUNCH backoff clears
+  evLimiterLongStandstillSoftcapReasonCleared @68 :UInt32;     # cumulative narrow-reset stale softcap reason clears
+
+  # Post-RES informational override counter (Section D)
+  evLimiterPostResHardOverrideEvents @69 :UInt32;       # frames where power_far_over_cap overrode quiet
+
+  # iter16a — live request indicator signals (intent vs emitted vs honored; gpt-5.5 review #2)
+  evLimiterRequestDir @70 :UInt8;        # controller INTENT this tick: 0 NONE, 1 UP(want_res), 2 DOWN(want_set)
+  evLimiterButtonDir @71 :UInt8;         # ACTUAL CAN button EMITTED this tick: 0 NONE, 1 UP(RES), 2 DOWN(SET)
+  evLimiterRequestHonored @72 :UInt8;    # 0 unknown/none, 1 honored (set moved in emitted dir, not driver-attributed), 2 ignored (emitted button timed out, no move)
+
+  # iter16a — real HEV power ground truth (Phase E1, passive decode; absent => source 0 + NaN power, gpt-5.5 #7)
+  evLimiterRealMotorPowerW @73 :Float32;     # decoded real motor/battery power, W; NaN if unavailable
+  evLimiterRealPowerSource @74 :UInt8;       # 0 INVALID/absent, 1 motor-power CAN (0x220 cand), 2 battery VxI
+
+  # iter16a — C1 below-vEgo power droop LOG-ONLY telemetry (default-off; gpt-5.5 #1/#6 — not active)
+  evLimiterPowerDroopWouldEnter @75 :Bool;       # would-enter droop this tick (log-only sim)
+  evLimiterPowerDroopRequestMph @76 :Float32;    # requested below-vEgo droop magnitude, mph (log-only)
+  evLimiterPowerDroopActive @77 :Bool;           # droop actually active (only if EvLimiterPowerDroopEnable param on)
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

@@ -71,7 +71,8 @@ class Car:
 
   def __init__(self, CI=None, RI=None) -> None:
     self.can_sock = messaging.sub_sock('can', timeout=20)
-    self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents'] + ['carControlSP', 'longitudinalPlanSP'])
+    # ev_limiter: liveLocationKalman gives the fused pitch used for the grade-aware power estimate (carstate_ext)
+    self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents'] + ['carControlSP', 'longitudinalPlanSP', 'liveLocationKalman'])
     self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'radarTracks'] + ['carParamsSP', 'carStateSP'])
 
     self.can_rcv_cum_timeout_counter = 0
@@ -194,6 +195,57 @@ class Car:
 
     can_strs = messaging.drain_sock_raw(self.can_sock, wait_for_one=True)
     can_list = can_capnp_to_list(can_strs)
+
+    # iter10 Layer 3a / iter11 Fix C: feed kalman pitch into CarState for
+    # ev_limiter grade estimation. Set BEFORE CI.update() so carstate_ext
+    # sees it during this tick. None = use legacy LONG_ACCEL-aEgo fallback.
+    # iter11: pycapnp returns enum NAME ('valid'), not int. Compare to string.
+    # Also publish kalman rejection reason as bitmask for forensics.
+    grade_accel_external = None
+    kalman_reject_reason = 0   # bitmask: 1=status, 2=inputsOK, 4=sensorsOK, 8=cal_valid, 16=pitch_oob
+    grade_source = 0           # 0=NONE, 1=LEGACY_ACCEL, 2=LLK_CALIBRATED
+    if self.sm.valid['liveLocationKalman'] and self.sm.alive['liveLocationKalman']:
+      llk = self.sm['liveLocationKalman']
+      cal_ned = llk.calibratedOrientationNED
+      status_ok = str(llk.status) == 'valid'
+      if not status_ok:
+        kalman_reject_reason |= 1
+      if not llk.inputsOK:
+        kalman_reject_reason |= 2
+      if not llk.sensorsOK:
+        kalman_reject_reason |= 4
+      if not cal_ned.valid:
+        kalman_reject_reason |= 8
+      if status_ok and llk.inputsOK and llk.sensorsOK and cal_ned.valid \
+         and len(cal_ned.value) >= 2:
+        import math
+        pitch_rad = float(cal_ned.value[1])  # NED euler [roll, pitch, yaw]
+        if -math.pi/4 < pitch_rad < math.pi/4:
+          grade_accel_external = 9.81 * math.sin(pitch_rad)
+          grade_source = 2  # LLK_CALIBRATED
+        else:
+          kalman_reject_reason |= 16
+    if grade_accel_external is None:
+      # legacy fallback path active inside carstate_ext
+      grade_source = 1  # LEGACY_ACCEL
+    self.CI.CS.grade_accel_external_ms2 = grade_accel_external
+    self.CI.CS.kalman_reject_reason = kalman_reject_reason
+    self.CI.CS.grade_accel_source = grade_source
+
+    # iter13 v4 — fail-closed param plumbing for EvLimiterAssumeEvOnly.
+    # Drive 17 forensics: param=1 on device but carstate_ext returned False
+    # because the opendbc side cannot reliably reach openpilot.common.params.
+    # Read here (openpilot side, has Params access) and pass via attribute setter,
+    # mirroring grade_accel_external_ms2 plumbing above. Default is FAIL-CLOSED
+    # (False) on any exception — the EV-only assumption powers the motor cap;
+    # silently re-enabling it after a plumbing error would mask a regression.
+    try:
+      self.CI.CS.assume_ev_only = self.params.get_bool("EvLimiterAssumeEvOnly")
+      self.CI.CS.assume_ev_only_param_read_ok = True
+    except Exception as e:
+      self.CI.CS.assume_ev_only = False
+      self.CI.CS.assume_ev_only_param_read_ok = False
+      cloudlog.warning(f"EvLimiterAssumeEvOnly param read failed: {e!r}")
 
     # Update carState from CAN
     CS, CS_SP = self.CI.update(can_list)
