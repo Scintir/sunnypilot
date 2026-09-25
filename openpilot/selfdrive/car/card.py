@@ -76,6 +76,7 @@ class Car:
     self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'radarTracks'] + ['carParamsSP', 'carStateSP'])
 
     self.can_rcv_cum_timeout_counter = 0
+    self._aux_param_unavailable = False  # iter17 EvLimiterAuxPowerW plumbing
 
     self.CC_prev = car.CarControl.new_message()
     self.CS_prev = car.CarState.new_message()
@@ -246,6 +247,17 @@ class Car:
       self.CI.CS.assume_ev_only = False
       self.CI.CS.assume_ev_only_param_read_ok = False
       cloudlog.warning(f"EvLimiterAssumeEvOnly param read failed: {e!r}")
+
+    # iter17 — aux baseline for the power estimate (EvLimiterAuxPowerW). Same
+    # plumbing shape; carstate_ext bounds-clamps and falls back to its default.
+    # A prebuilt params lib that predates the key raises UnknownKeyName: log
+    # once and stop asking (the estimator then uses AUX_POWER_DEFAULT_W).
+    if self.sm.frame % 100 == 0 and not self._aux_param_unavailable:
+      try:
+        self.CI.CS.aux_power_w = float(self.params.get("EvLimiterAuxPowerW", return_default=True))
+      except Exception as e:
+        self._aux_param_unavailable = True
+        cloudlog.warning(f"EvLimiterAuxPowerW param read failed, using estimator default: {e!r}")
 
     # Update carState from CAN
     CS, CS_SP = self.CI.update(can_list)

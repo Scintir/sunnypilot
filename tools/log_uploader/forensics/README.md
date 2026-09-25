@@ -43,3 +43,13 @@ data arrives:
   `evLimiterLongStandstillSoftcapReasonCleared` (Section C)
 - `evLimiterPostResQuietActive` / `evLimiterSoftcapDecrementSuppressedFrames` /
   `evLimiterSoftcapDecrementSuppressedEvents` / `evLimiterPostResHardOverrideEvents` (Section D)
+
+## 2026-09-24 additions (staging-mici-2026.09 port, drive 00000015--99c9d4c0d0)
+
+| Script | Purpose |
+|---|---|
+| `comm_fault_scan.py` | For each `commIssue`, which services were not-alive / off-frequency; deviceState & CAN gaps; alert transitions |
+| `estimator_decomposition.py` | Per-speed HUD power distribution vs an aEgo+grade / efficiency / aux alternative estimator |
+| `hardwared_stall_scan.py` | deviceState gap table, co-stalling services, hardwared CPU/iowait per gap from procLog, and every `hardwared slow tick` (StallWatchdog phases + thread stacks) |
+
+Findings from that drive: `docs/ev-limiter/drive-2026-09-24-forensics.md`.
